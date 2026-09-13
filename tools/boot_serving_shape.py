@@ -169,6 +169,15 @@ def main(argv=None):
                          "bar derivation reads (tools/kld_bar.py: F_ref from "
                          "the writer transcription, the floor pair from two "
                          "forwards)")
+    ap.add_argument("--expert-ports", action="store_true",
+                    help="SEGMENTED ROUTE: the expert bodies are u8 PORTS "
+                         "(q4e.serving_shape.ExpertPortSink, the in-graph "
+                         "nibble unpack) bound from host memory -- USM host "
+                         "on a GPU -- instead of u4 constants; measures the "
+                         "forward's own cost of that route (the unpack "
+                         "materialisation) with GPU_MEMORY_STATISTICS before "
+                         "and after a forward. Bytes: the filler's if --shards, "
+                         "else zeros")
     ap.add_argument("--tiny", action="store_true",
                     help="TEST GEOMETRY: the suite's reduced config "
                          "(q4e.serving_shape.tiny_config: hidden 256, vocab "
@@ -213,6 +222,7 @@ def main(argv=None):
         say("shards", f"feed over {args.shards} in {time.time() - t0:.1f}s; "
                       f"REAL WEIGHTS for every layer built")
     t0 = time.time()
+    sink = None
     if args.artifact:
         # the served binary's own bytes: read, not built. The report is
         # composed from the model and the artifact's manifest so every later
@@ -252,9 +262,11 @@ def main(argv=None):
                      f"the served binary's bytes, not a build")
     else:
         try:
+            sink = ss.ExpertPortSink() if args.expert_ports else None
             model, rep = ss.build_serving_shape_ir(config=cfg if args.tiny else None,
                                                    arena=arena, n_layers=args.layers,
-                                                   filler=filler, feed=feed_)
+                                                   filler=filler, feed=feed_,
+                                                   expert_ports=sink)
         except Exception as exc:                                  # noqa: BLE001
             say("build", "FAIL " + one_line(exc))
             arena.close()
@@ -443,6 +455,33 @@ def main(argv=None):
                      f"{'USM host' if tctx else 'host'} memory in "
                      f"{time.time() - t0:.2f}s peak_host_GiB={peak_rss_gib():.2f}")
         gpu_mem("after table")
+
+    # ---- the expert bodies as PORTS (the segmented route) ---------------------
+    if sink is not None and sink.bodies:
+        gpu_mem("before expert ports")
+        bctx = core.get_default_context(dev) if dev.startswith("GPU") else None
+        t0 = time.time()
+        nbytes = 0
+        for name, shp, packed in sink.bodies:
+            if name not in declared:
+                say("experts", f"{name}: declared by the sink, not by the compiled model")
+                continue
+            t = (bctx.create_host_tensor(ov.Type.u8, ov.Shape(list(shp))) if bctx
+                 else ov.Tensor(ov.Type.u8, ov.Shape(list(shp))))
+            if packed is not None:
+                np.copyto(t.data, packed.reshape(shp))
+            else:
+                t.data[...] = 0                          # zeros, said so
+            nbytes += int(np.prod(shp))
+            if feed(name, t) is not None:
+                arena.close()
+                return 0
+        say("experts", f"bodies bound as PORTS: {len(sink.bodies)} u8 port(s), "
+                       f"{nbytes:,} B ({nbytes / 2 ** 30:.2f} GiB) of "
+                       f"{'USM host' if bctx else 'host'} memory in {time.time() - t0:.2f}s; "
+                       f"bytes {'from the filler' if feed_ is not None else 'ZEROS'}; "
+                       f"the unpack runs in-graph")
+        gpu_mem("after expert ports")
 
     if not args.no_pass:
         ctx = core.get_default_context(dev) if dev.startswith("GPU") else None
@@ -803,6 +842,9 @@ def main(argv=None):
         req2 = compiled.create_infer_request()
         for name in table_ports:
             req2.set_tensor(name, req.get_tensor(name))
+        for name, _shp, _b in (sink.bodies if sink is not None else []):
+            if name in declared:
+                req2.set_tensor(name, req.get_tensor(name))
         la_i = 0
         for name, portp in declared.items():
             if name.startswith("conv_state_table."):

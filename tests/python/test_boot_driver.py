@@ -121,3 +121,19 @@ def test_a_cut_builds_and_compiles_device_free_up_to_the_request():
     # dim and the element type dynamic -- the port cc28ce3 skips on the GPU,
     # and the undefined type the CPU plugin refuses one stage later
     assert re.search(r"key_cache\.\d+\[-1, -1, -1, -1\]:dynamic", out), out[-1500:]
+
+
+def test_expert_ports_bind_every_body_and_the_forward_repeats_bit_identically():
+    """`--expert-ports` (the segmented route's expert bodies as u8 PORTS with
+    the in-graph unpack): every body the sink declares is bound by name --
+    3 kinds x 4 MoE layers at the tiny geometry -- and the forward runs and
+    repeats bit-identically on the CPU plugin. What stays device-only: the
+    USM-host sharing and the unpack's device memory (GPU_MEMORY_STATISTICS
+    lines), which the card leg reads. Red first: `--expert-ports` unknown."""
+    out = run("--repeat", "2", "--expert-ports")
+    m = re.search(r"bodies bound as PORTS: (\d+) u8 port\(s\), ([\d,]+) B", out)
+    assert m and int(m.group(1)) == 12, out[-2000:]
+    assert "bytes ZEROS; the unpack runs in-graph" in out
+    assert "declared by the sink, not by the compiled model" not in out
+    assert "BOOT [forward] INFER OK" in out
+    assert re.search(r"#2 \(same request\) INFER OK [\d.]+s: BIT-IDENTICAL to #1", out), out[-2000:]
