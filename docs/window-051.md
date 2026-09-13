@@ -184,6 +184,94 @@ B60, cold and warm.
 > [AMENDED 2026-09-13, REVIEW HIGH-1: "settled" here and in the A770 floor row means the OBSERVED floor pair of THIS run, never a cache-state claim from any earlier run - see window-050 §4.11.1 review amendment.]
 
 
+### (b′) THE STAGING-VS-DEPTH CURVE — A.1, measured 2026-09-13 21:13–21:41Z, B60 (GPU.0), `RUN@87d0ae5` (tools byte-identical to b689d6d), fresh process per cell
+
+The question the monster session left open: depth 12 staged 4.2 GB host-side
+in 15-s samples while depth 48 died at 37 GiB of shmem — 4× the layers, 9×
+the staging. The instrument here: the python driver's `--stage compile` on
+the sparse-arena (zeros) graph at --layers 4/8/12/16/20/24, the real d4 and
+d12 artifacts as controls, and a sampler on the PHYSICAL host (root, every
+2 s): the driver process's `fdinfo` (`drm-resident-gtt` / `-vram0` summed
+over its DRM clients), its VmRSS/VmHWM, and the host's own MemAvailable /
+Shmem / MemFree — never a cgroup counter (mneme 372).
+
+| cell | layers | bytes | compile | device_resident (plugin GPU_MEMORY_STATISTICS) | peak gtt (host) during compile | vram0 after transfer | host Shmem peak | host MemFree min | outcome |
+|---|---|---|---|---|---|---|---|---|---|
+| c01 | 4 (zeros) | declared 13.51 GiB | 8.8 s (pass 2: 9.1 s) | 6.72 GiB | 8.4 GiB (pass 2) | 2.1 GiB sampled (transfer missed at 2 s) | 0.7 GiB | 38.9 GiB | OK |
+| c02 | 4 (real d4) | .bin 9.43 GB | 42.9 s (pass 2: 57.0 s) | 6.79 GiB | 8.1 GiB (pass 2) | 2.2 GiB sampled | 1.1 GiB | 31.3 GiB | OK |
+| c03 | 8 (zeros) | declared 24.37 GiB | 21.3 s (pass 2: 14.1 s) | 12.11 GiB | 7.8 GiB (pass 2, 9 samples — the plateau missed) | 10.1 GiB | 0.4 GiB | 18.7 GiB | OK |
+| c04 | 12 (zeros) | declared 35.23 GiB | 40.9 s (pass 2: 21.3 s) | 17.51 GiB | **20.7 GiB** (pass 2) | 18.0 GiB | 0.7 GiB | 13.5 GiB | OK |
+| c05 | 12 (real d12) | .bin 22.61 GB | 202.1 s (a concurrent CPU job of mine on the host, pass 2 alone: 180.6 s) | 17.73 GiB | **13.2 GiB** (pass 2; pass 1 caught 8.6 → 3.5 mid-transfer) | 17.8 GiB | 9.0–10.8 GiB | 11.4–15.6 GiB | OK |
+| c06 | 16 (zeros) | ≈ 46 GiB declared | 57.2 s | **22.90 GiB** (over the 22.71 GiB the card reports) | **18.3 GiB** | **23.5 GiB** (the physical 24 GiB) | 10.97 GiB | 4.1 GiB | OK — fits the physical card, not the reported one |
+| c07 | 20 (zeros) | ≈ 57 GiB declared | 55.1 s | **28.30 GiB** | **28.6 GiB** (= the whole compiled set, one sample before the transfer) | 24.4 GiB + **13.3 GiB left in host gtt** | 4.8 GiB | 0.26 GiB | OK — **SPILLED**: the compile completes with the card full and the rest host-resident |
+| c08 | 24 (zeros) | ≈ 68 GiB declared | 62.0 s | **33.69 GiB** | **32.8 GiB** (plateau 12 s at 32.8 with vram0 5.7) | 24.4 GiB + **10.2 GiB in host gtt** | 9.9 GiB | 1.1 GiB | OK — spilled |
+
+**What the sampler saw, every cell alike (three phases).** (1) The build and
+the pass read the constants: the process RSS climbs to the arena's pages
+(c06 24.5 GiB, c08 26.2 GiB — file-backed, reclaimable; the host's MemFree
+falls to 0.26–4 GiB while MemAvailable stays 15–27 GiB); no DRM client holds
+anything yet (gtt ≈ 0, vram0 16 MiB). (2) The compile accumulates the
+converted constants in **host GTT** (`drm-resident-gtt`), ~1.4 GiB per layer,
+up to a plateau that equals the compiled size (c07 28.6 GiB for 28.3 compiled;
+c08 32.8 GiB with 5.7 GiB already on the card); the host's Shmem column
+follows only part of it (peaks 4.8–11 GiB), so USM-host staging here is
+mostly userptr in the process, and the physical host's shmem at the 48-layer
+death (37.3 GiB) was a lower bound on the staging, not the whole of it.
+(3) A transfer of ≤ 10 s moves the GTT set into VRAM — **up to the physical
+24 GiB, past the 22.71 GiB the OpenCL device reports** (c06 23.5 GiB resident
+and OK) — and what does not fit **stays in host GTT and the compile
+COMPLETES** (c07: 13.3 GiB host-side, c08: 10.2 GiB; the plugin's statistics
+count it as `usm_device`, hence 28.30 and 33.69 "device-resident" on a 24 GiB
+card). The "UNTESTED alternative" of window-050 §4.10 F2 — that the driver
+spills device allocations to system memory — is therefore MEASURED TRUE on
+the B60 at 20 and 24 layers; its forward cost is not measured here (`--stage
+compile`), and a spilled graph binds its n-gram table on top of the spill.
+
+**The 9× was a sampling artefact, and the curve is linear.** The 12-layer
+"4.22 GB peak" of row (b) came from 15-s samples that missed a transfer
+which takes seconds; at 2 s the same rung's gtt peak is **13.2 GiB (real d12) / 20.7 GiB (zeros)** — the artifact and the graph agree to within the f32→f16 conversion's transient. Per
+layer the staged GTT is 1.3–1.5 GiB (c04→c06→c07→c08: 20.7 / 18.3 / 28.6 / 32.8 GiB; the
+c06 reading is a sample inside the transfer, c04 one above the compiled 17.5 — the conversion's transient), which is the compiled size —
+f16 dense + u4 expert bodies — of the layers; extrapolated to 48 layers the
+plateau is **~66–69 GiB of host GTT before the transfer starts**, against a
+host of 48 GiB (62.7 physical, 48 for the container): that is the death
+window-050 §4.10 F2 recorded (gtt 11.8 GiB and shmem 37.3 GiB at a page
+allocation failure), now with its mechanism — the compile needs the WHOLE
+constant set host-resident once, whatever the card.
+
+**VERDICT (A.1).** Single-graph 48 layers does NOT reopen: the compile's
+host-side staging is linear in depth at ≈ the compiled bytes and crosses the
+host at ~30 layers (the 24-layer cell already drove MemFree to 1.1 GiB
+with its 26 GiB of arena pages next to 32.8 GiB of GTT); the n-gram table's
+26.8 GiB is bound after that and the spill would have to live beside it.
+Segmentation is confirmed as the only route to 48 on this host. Two things
+re-price WP-B: (i) a SEGMENT may be compiled larger than the card — the
+plugin spills and completes — so the cut is priced by host GTT at compile
+(segment compiled bytes ≤ host headroom − table − buffer set), not by VRAM;
+(ii) the per-layer GTT term measured here (1.3–1.5 GiB) is the
+SINGLE-graph term — u4 bodies plus f16 dense; a segment of the WP4.1 emitter
+carries its bodies as u8 PORTS, so its compile stages the dense f16 term
+only (row (a)'s 3.66 GB at 12 layers, unmeasured here — B.3 measures it
+beside the table and the buffer set); the host term that decides the cut is
+therefore table + buffer set + dense staging, as row (a) prices it, and
+nothing in this curve moves C3/C4 — they stay for B.3.
+
+**Shared-process variant** (`~/wp/wpA1-shared.py`, 4 → 8 → 12 layers in one
+process, compiled model dropped between depths, 21:40–21:41Z): compiled in
+7.8 / 19.1 / 21.1 s, resident 6.72 / 12.11 / 17.51 GiB as in the fresh
+processes; gtt 1.29 GiB flat throughout (the plugin's own working set),
+vram0 after each drop 0.95 → 1.68 → 1.94 GiB — a residual of ~0.5 GiB per
+compile-and-drop, no staging accumulation. "shmem accumulates across
+compiles in one host session" is NOT the mechanism.
+
+**Not measured here**: a forward on a spilled graph (its cost over PCIe),
+the A770 (whose reported 15.11 GiB vs physical 16 GiB may hold the same
+~1 GiB of headroom c06 found on the B60), and the segmented compile's
+dense-only staging term (B.3). Contaminations on record: the host sampler
+sampled the `timeout` wrapper for pass 1's c01–c05 (host columns valid,
+fdinfo re-measured in pass 2), and a CPU tiny-geometry driver job of mine
+ran on the host during c05/c06 (ZFS contention; killed 21:24Z).
+
 ### (c) Cold-boot determinism
 
 Two cold boots of the segmented 48-layer service (process restarted, page
