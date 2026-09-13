@@ -94,14 +94,27 @@ def ple_ordinal(config, layer_idx):
     hashes with ordinal 0. The parity cells use 1 on both of their sides,
     which is consistent there and wrong here -- the boot driver fed 1 in its
     first real-weight run and that run is retracted on that point
-    (window-050 §4.8)."""
-    ids = getattr(config, "ple_layer_ids", None)
-    if ids:
-        ids = list(ids)
-        if layer_idx + 1 in ids:
-            return ids.index(layer_idx + 1)
-        raise ValueError(f"decoder layer {layer_idx} is not a PLE layer: ple_layer_ids={ids}")
-    return 0
+    (window-050 §4.8).
+
+    AMENDED 2026-09-13 (REVIEW 3b5df79..6743ffb, F1): in run 2 of §4.8 this
+    function returned 0 through a `return 0` fallback for a config WITHOUT
+    ple_layer_ids -- `piecewise_export.real_config()` did not pass the field
+    through -- so the index rule above never ran there. The value was right
+    anyway: the GGUF stores the PLE hash constants it was built with
+    (`qwen4exp.ple.layer_multipliers` / `head_vocab_sizes` / `head_offsets`)
+    and the ordinal-0 derivation reproduces all of them bit for bit while
+    ordinal 1 reproduces none (tests/python/test_gguf_feed.py,
+    test_the_gguf_stores_the_ordinal_0_hash_constants). The fallback is gone:
+    an empty ple_layer_ids is refused, as the served loader refuses it."""
+    ids = list(getattr(config, "ple_layer_ids", None) or [])
+    if not ids:
+        raise ValueError(
+            "config carries no ple_layer_ids: the hash ordinal cannot be derived "
+            "(the reference reads an empty list as 'no PLE at all'; the served "
+            "loader refuses such an artifact -- src/core/artifact.cpp)")
+    if layer_idx + 1 in ids:
+        return ids.index(layer_idx + 1)
+    raise ValueError(f"decoder layer {layer_idx} is not a PLE layer: ple_layer_ids={ids}")
 
 
 def split_by_partition(global_ids, rows_per_chunk):

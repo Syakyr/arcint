@@ -1372,7 +1372,14 @@ depend on the PLE rows stands.
 ### Measured, run 2 — `RUN@2413cab` (tree `3e50948c…`), 2026-09-13 11:24–11:42Z, both cards — THE MEASUREMENT
 
 The same ladder with the hash ordinal derived from the config
-(`q4e.ngram_ids.ple_ordinal` → 0). The row ids moved (min 7,226,134, max
+(`q4e.ngram_ids.ple_ordinal` → 0). *(Amended 2026-09-13, REVIEW
+3b5df79..6743ffb F1: "derived from the config" did not happen in this run —
+`real_config()` carried no `ple_layer_ids` and `ple_ordinal` returned 0 from
+a fallback branch, for every layer index. The 0 is right by an independent
+witness: the GGUF stores its own PLE hash constants and the ordinal-0
+derivation matches all of them bit for bit, ordinal 1 matches none; the
+fallback is removed and the witness is a shards cell in the F1 commit. No
+number in this table moves.)* The row ids moved (min 7,226,134, max
 316,425,755 against run 1's 4,023,550 / 317,350,792), the logits moved with
 them, and both cards agree at the last position to the third decimal.
 

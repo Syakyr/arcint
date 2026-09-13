@@ -179,15 +179,16 @@ TEST(ngram_ports_refuses_a_source_that_is_not_the_ports_format) {
 TEST(ngram_ports_splits_ids_at_the_partition_like_the_python_twin) {
     const auto plan = ngram::plan_ngram_ports(real_ports());
     // both edges of chunk 0, the first row of chunk 1, the last row of the
-    // table, and the two ids the first real-weight boot printed as its
-    // min/max (window-050 §4.8)
-    const std::vector<int64_t> global = {0, kPerChunk - 1, kPerChunk, kRows - 1, 4023550, 317350792};
+    // table, and the min/max ids of the real-weight MEASUREMENT (window-050
+    // §4.8 run 2, hash ordinal 0). Run 1's 4,023,550 / 317,350,792 were the
+    // retracted ordinal-1 reading and are not cited here (REVIEW F2).
+    const std::vector<int64_t> global = {0, kPerChunk - 1, kPerChunk, kRows - 1, 7226134, 316425755};
     std::vector<int32_t> chunk;
     std::vector<int64_t> local;
     ngram::split_by_partition(global, plan, chunk, local);
     const std::vector<int32_t> want_chunk = {0, 0, 1, 6, 0, 6};
-    const std::vector<int64_t> want_local = {0, kPerChunk - 1, 0, kLastChunk - 1, 4023550,
-                                             317350792 - 6 * kPerChunk};
+    const std::vector<int64_t> want_local = {0, kPerChunk - 1, 0, kLastChunk - 1, 7226134,
+                                             316425755 - 6 * kPerChunk};
     CHECK_EQ(chunk, want_chunk);
     CHECK_EQ(local, want_local);
     // and every local row is inside its chunk

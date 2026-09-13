@@ -957,3 +957,85 @@ def test_refusal_residency_figures_are_recomputed_from_the_file(raw_index):
     # and the QSA block list the refusal names
     assert sorted(qsa) == list(range(3, 48, 4)), sorted(qsa)
     assert f"blk {min(qsa)},{sorted(qsa)[1]},...,{max(qsa)}" in msg.replace(", ", ",")
+
+
+# --- the PLE hash ordinal: the index rule, and the file as its oracle ------- #
+# REVIEW 3b5df79..6743ffb (2026-09-13), finding F1. The first real-weight boot
+# fed hash ordinal 1 (the parity cells' value) and was retracted; the second
+# fed 0 and was recorded as "derived from the config" -- but real_config()
+# carried no ple_layer_ids and q4e.ngram_ids.ple_ordinal returned 0 through a
+# fallback, for every layer index. Right number, narrated mechanism. These two
+# cells make the mechanism a fact: the rule is the index in ple_layer_ids of
+# layer_idx + 1 (pin 1268), an empty list is refused, and the GGUF's own stored
+# constants (`qwen4exp.ple.layer_multipliers` / `head_vocab_sizes` /
+# `head_offsets`) are what ordinal 0 derives, bit for bit -- ordinal 1 derives
+# none of them. RED before the F1 commit on the first cell (ple_layer_ids was
+# [] and the empty-list refusal did not exist); the second is the witness.
+def test_the_ple_hash_ordinal_is_the_index_in_ple_layer_ids():
+    from q4e import ngram_ids as nid
+    from q4e import piecewise_export as pwe
+    from transformers.models.qwen4_exp import configuration_qwen4_exp as pin_cfg
+
+    real = pwe.real_config()
+    assert list(real.ple_layer_ids) == [2], (
+        "real_config() must carry REAL_GEOMETRY's ple_layer_ids (GGUF ple.layers "
+        f"[1], 1-indexed [2]); got {list(real.ple_layer_ids)}")
+    assert nid.ple_ordinal(real, 1) == 0          # decoder layer 1 -> the first PLE layer
+    with pytest.raises(ValueError, match="not a PLE layer"):
+        nid.ple_ordinal(real, 0)
+    # the rule is the INDEX, not the decoder layer: with two PLE layers the
+    # second (decoder layer 4) hashes with ordinal 1
+    two = pin_cfg.Qwen4ExpTextConfig(ple_layer_ids=[2, 5], eos_token_id=real.eos_token_id)
+    assert nid.ple_ordinal(two, 1) == 0
+    assert nid.ple_ordinal(two, 4) == 1
+    # an empty list is refused, as the served loader refuses it -- no silent 0
+    none = pin_cfg.Qwen4ExpTextConfig(ple_layer_ids=[], eos_token_id=real.eos_token_id)
+    with pytest.raises(ValueError, match="no ple_layer_ids"):
+        nid.ple_ordinal(none, 1)
+
+
+@_skip
+def test_the_gguf_stores_the_ordinal_0_hash_constants():
+    """The file is the oracle: the shipped GGUF carries the PLE hash constants
+    it was converted with. The ordinal-0 derivation (the pin's own
+    `_build_layer_multipliers` / `_find_nth_prime_after`, through
+    q4e.ngram_ids.derive) must reproduce every one of them exactly, and the
+    ordinal-1 derivation -- the retracted run's -- must reproduce none."""
+    from gguf import GGUFReader
+    from q4e import ngram_ids as nid
+    from q4e import piecewise_export as pwe
+
+    if os.path.isdir(_SHARDS):
+        paths = sorted(glob.glob(os.path.join(_SHARDS, "*.gguf")))
+    else:
+        paths = sorted(glob.glob(_SHARDS))
+    assert paths, f"no shards for {_SHARDS!r}"
+    fields = GGUFReader(paths[0]).fields
+
+    def ints(key):
+        f = fields[key]
+        return [int(f.parts[i][0]) for i in f.data]
+
+    stored_mult = ints("qwen4exp.ple.layer_multipliers")
+    stored_sizes = ints("qwen4exp.ple.head_vocab_sizes")
+    stored_offs = ints("qwen4exp.ple.head_offsets")
+    assert ints("qwen4exp.ple.layers") == [1]          # 0-indexed decoder layer 1
+
+    real = pwe.real_config()
+    assert len(stored_mult) == real.ngram_size
+    assert len(stored_sizes) == (real.ngram_size - 1) * real.heads_per_ngram
+    assert stored_offs[0] == 0 and stored_offs == [sum(stored_sizes[:i]) for i in range(len(stored_sizes))]
+
+    def derived(ordinal):
+        mult, sizes, offs = nid.derive(real.vocab_size, real.ngram_size, real.heads_per_ngram,
+                                       real.ngram_vocab_size_base, ordinal)
+        return [int(m) for m in mult], list(sizes), list(offs)
+
+    ord0 = derived(nid.ple_ordinal(real, 1))
+    assert ord0 == (stored_mult, stored_sizes, stored_offs), (
+        "ordinal 0 must reproduce the GGUF's stored PLE hash constants exactly")
+    mult1, sizes1, offs1 = derived(1)
+    assert mult1 != stored_mult and sizes1 != stored_sizes and offs1 != stored_offs, (
+        "ordinal 1 (the retracted run's) must not reproduce the stored constants")
+    assert not set(mult1) & set(stored_mult)
+    assert not set(sizes1) & set(stored_sizes)

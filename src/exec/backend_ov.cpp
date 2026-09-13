@@ -7998,6 +7998,16 @@ private:
         // The IR carries ONE PLE layer; its hash constants are the ordinal-0
         // derivation, as the reference derives them for the first entry of
         // ple_layer_ids (modeling_qwen4_exp.py: ple_layer_ids.index(layer_idx+1)).
+        // Ordinal 0 is hard-coded, so a config declaring more than one PLE
+        // layer is refused by name rather than bound with the wrong constants
+        // for every layer but the first (REVIEW 3b5df79..6743ffb, F3).
+        if (nc.ple_layer_ids.size() != 1) {
+            throw std::runtime_error(log::format(
+                "the IR carries one PLE layer and binds its ngram ports with hash ordinal 0, "
+                "but the artifact's config declares %zu PLE layers (ple_layer_ids); refused "
+                "until the IR can name which of them it carries",
+                nc.ple_layer_ids.size()));
+        }
         ngram::HashParams hp = ngram::derive_hash_constants(
             nc.vocab_size, nc.ngram_size, nc.heads_per_ngram, nc.ngram_vocab_size_base,
             /*ple_layer_index=*/0);

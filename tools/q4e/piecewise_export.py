@@ -213,6 +213,7 @@ def real_config(transformers_config_cls=None):
         ngram_vocab_size_base=g["ngram_vocab_size_base"],
         make_ngram_vocab_size_divisible_by=g["make_ngram_vocab_size_divisible_by"],
         eos_token_id=g["eos_token_id"],
+        ple_layer_ids=g["ple_layer_ids"],
         indexer_n_heads=g["indexer_n_heads"],
         indexer_kv_heads=g["indexer_kv_heads"],
         indexer_head_dim=g["indexer_head_dim"],
