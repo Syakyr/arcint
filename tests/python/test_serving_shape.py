@@ -610,7 +610,16 @@ ABSENT, PRESENT = "absent", "present"
 _BY_SDPA = ("ScaledDotProductAttention over a rank-4 KV Variable"
             " -> PagedAttentionExtension")
 _BY_CONV = "a rank-3 Variable (GDN short-conv state) -> PagedCausalConv1D"
-_BY_GDN = "a rank-4 Variable (GDN recurrent state) -> PagedGatedDeltaNet"
+# READ OUT OF THE PASS (fuse_gated_delta_net.cpp + paged_gated_delta_net_
+# fusion.cpp, pinned commit). Unlike the other two this is a TWO-STAGE chain
+# and the first stage is not a transcription: PagedGatedDeltaNetFusion matches
+# an `ov::op::internal::GatedDeltaNet` NODE, which only exists because
+# FuseGDNLoop has already fused a v5::Loop -- one whose body is the
+# TOKEN-SEQUENTIAL delta rule, one timestep per iteration -- into it. The
+# emitter writes the CHUNKED delta rule, which is a different computation and
+# not a near-miss of this pattern.
+_BY_GDN = ("a rank-4 Variable behind a token-sequential v5::Loop"
+           " -> FuseGDNLoop -> GatedDeltaNet -> PagedGatedDeltaNet")
 _BY_PA_INDEX = "PagedAttentionExtension's own index ports"
 # READ OUT OF THE PASS, not inferred from which ports appeared together. Both
 # linear-attention fusions call `pa_params.add` for all four of these and for

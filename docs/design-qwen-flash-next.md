@@ -2159,3 +2159,69 @@ fails in two directions and only one of them throws:
 A missing port throws at `set_tensor` and is loud. An unfed port is silent,
 which is why it now has a cell that asserts the set is *exactly* this one and
 fails if it grows or shrinks.
+
+#### The last port, specified: what `gated_delta_state_table.N` actually requires (read 2026-09-13)
+
+The thirteenth row is not one more transcription, and this is what it is
+instead — read out of the transformation sources at the pinned OpenVINO commit
+so that the next attempt is construction rather than discovery.
+
+**It is a two-stage chain.** `PagedGatedDeltaNetFusion` matches
+
+```
+ReadValue → optional Gather → GatedDeltaNet(query, key, value, state, gate, beta)
+```
+
+where `GatedDeltaNet` is `ov::op::internal::GatedDeltaNet` — a single internal
+op. Nothing emits that op directly. It exists only because `FuseGDNLoop` has
+already fused a `v5::Loop` into it, and that Loop must satisfy
+`matches_linear_attention_loop`: **at least 9 inputs, exactly 2 outputs**, input
+4 the `value` at `[?, head_num, ?, v_head_size]`, input 7 a rank-4 init state.
+
+**The Loop body must be the TOKEN-SEQUENTIAL delta rule** — one timestep per
+iteration, which the pattern fixes by shaping `value`, `key` and `query` as
+`[?, head_num, 1, …]` inside the body:
+
+```
+gated_state   = recurrent_state * Unsqueeze(Exp(gate), −1)
+key_unsq      = Unsqueeze(Squeeze(key, 2), −1)
+projected_sum = ReduceSum(gated_state * key_unsq, −2, keep_dims=false)
+delta         = Squeeze(value, 2) − projected_sum
+updated_state = gated_state + key_unsq * Unsqueeze(delta * beta, −2)
+output        = ReduceSum(updated_state * Unsqueeze(Squeeze(query, 2), −1),
+                          −2, keep_dims=true)
+body_results[2] = Result(ScatterUpdate(out_buffer, Unsqueeze(step, 0), output, 2))
+body_results[1] = Result(updated_state)          (each optionally behind Convert)
+```
+
+Two companion matchers matter for scoping. `RemoveConcatSliceAfterLoop` strips
+the `Reshape(−1) / Concat(axis 0) / Slice / Reshape` epilogue that the upstream
+export emits around the Loop — so that epilogue is **optional** for us, and a
+graph can hand the Loop's two outputs on directly. A second matcher wants the
+query scaled as `query / head_size^0.5` with `head_size` taken from a `ShapeOf`
+chain; whether it is required or opportunistic is not yet established and must
+be read before it is relied on.
+
+**This is the fork, and it is the operator's, not the emitter's.**
+`q4e.gdn` writes the *chunked* gated delta rule — CHUNK-sized blocks and the
+forward-substitution inverse — which is a different computation from the
+sequential recurrence above, not a near miss of it. So the choices are:
+
+1. **Emit the sequential Loop in the serving-shape path only**, leaving the
+   chunked emitter as the parity-gated default (the same containment
+   `emit_stateful_attention` and `stateful_short_conv` already use). The
+   sequential and chunked forms are not bitwise equal — DESIGN §3.2 already
+   records that a k-token pass computes bitwise-different state from k
+   one-token passes — so the serving graph's recurrence would not be the one
+   the piecewise suites gate, and that divergence needs its own gate.
+2. **Ship twelve of thirteen.** The C++ tolerates it *as read* — `load_paged`'s
+   classify loop advances `gdn_i` only when it meets a
+   `gated_delta_state_table.` port and throws only when there are more ports
+   than prototypes (`backend_ov.cpp:3195-3198`), so a model without them does
+   not trip it, and all nine fed names exist. **This is a reading of the C++,
+   not a measurement**, and what it would cost is not in doubt: the GDN
+   recurrent state stays graph-internal, so it does not carry across forwards —
+   which is the whole point of a chunked prefill and of decode.
+
+Option 2 is not a way to skip the port; it is a way to boot something that
+cannot answer at depth. Recorded so the choice is made deliberately.
