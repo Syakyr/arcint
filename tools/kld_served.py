@@ -335,7 +335,7 @@ def main(argv=None):
     ap.add_argument("--repeat", type=int, default=1,
                     help="replay every window this many times (2 = the floor)")
     ap.add_argument("--warmup", type=int, default=0,
-                    help="post every window this many extra times first, not "
+                    help="post every window this many extra times first, NOT COUNTED, "
                          "so the kernel set settles (§4.11). --compare cannot "
                          "tell a warmup from a replay in the dump: it pairs "
                          "EVERY replayed window against the last, so a step "
