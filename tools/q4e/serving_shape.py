@@ -114,17 +114,21 @@ module emits byte-identical in STRUCTURE to the ones the parity suites gate.
   2026-09-13; the reading is in `tests/python/test_serving_shape.py` beside
   the ports table.
 
-  ONE OF THE THREE IS EMITTED (2026-09-13): the full-attention layers carry a
-  KV Variable and a ScaledDotProductAttention (`emit_stateful_attention`), so
-  the pass converts them and the contract's `key_cache.N`, `value_cache.N`,
-  `past_lens`, `subsequence_begins`, `block_indices`,
-  `block_indices_begins` and `max_context_len` exist. The GDN layers are
-  still the static full-sequence form the piecewise work validates: no
-  rank-3 short-conv Variable and no rank-4 recurrent-state Variable, so
-  `conv_state_table.N`, `gated_delta_state_table.N` and the four `la.*`
-  ports do not. The contract test carries the remaining gap as a STRICT
-  xfail over the whole port table, so it fails loudly the day the last row
-  closes rather than passing silently while any of them is open.
+  TWO OF THE THREE ARE EMITTED (2026-09-13): the full-attention layers carry
+  a KV Variable and a ScaledDotProductAttention (`emit_stateful_attention`),
+  and every GDN layer's short conv carries its K-column state in a rank-3
+  Variable (`stateful_short_conv`, through `emit_gdn`'s `conv_emitter` hook).
+  The pass converts both, so `key_cache.N`, `value_cache.N`,
+  `conv_state_table.N`, the five PagedAttention index ports and all four
+  `la.*` ports exist.
+
+  WHAT IS LEFT is `gated_delta_state_table.N`: the rank-4 recurrent state.
+  Its fusion matches an `ov::op::internal::GatedDeltaNet` node -- a single
+  internal op, not the op-by-op recurrence this module emits -- so it is a
+  different kind of job from the other two, which were transcriptions. The
+  contract test carries the gap as a STRICT xfail over the whole port table,
+  so it fails loudly the day the last row closes rather than passing
+  silently while any of them is open.
 * The PLE n-gram table is declared as a Constant here so that the gather has
   something to index. In SERVING it is the host-mmap tier, read through
   `src/exec/ngram_table.h` (Link 3) and `src/exec/ngram_gather.h`, never an
@@ -731,8 +735,9 @@ def build_serving_shape_ir(config=None, seq_len=64, arena=None, n_layers=None,
                 h, hyper, inj = _split_combine(hidden, cfg, st,
                                                "attn_hyper_connection.", T)
                 if kind == "gdn":
-                    g = qgdn.emit_gdn(h, conv_mask, cfg,
-                                      _strip(st, "linear_attn."), T)
+                    g = qgdn.emit_gdn(
+                        h, conv_mask, cfg, _strip(st, "linear_attn."), T,
+                        conv_emitter=stateful_short_conv(i, beam, sinks))
                 else:
                     g = emit_stateful_attention(
                         h, pid, cfg, _strip(st, "self_attn."), T, i, beam,
@@ -878,6 +883,75 @@ def _additive_causal_mask(T, total, past):
         visible, op.constant(np.array(0.0, np.float32)),
         op.constant(np.finfo(np.float32).min.astype(np.float32)))
     return op.unsqueeze(blocked, i64([0, 1]))                       # [1,1,T,TOT]
+
+
+def stateful_short_conv(layer, beam, sinks):
+    """The GDN depthwise causal conv with its K-column state in a Variable.
+
+    Returns a drop-in for `q4e.gdn._causal_conv_silu` -- same arguments, same
+    [1, conv_dim, T] result -- so `emit_gdn`'s `conv_emitter` hook is the only
+    thing that changes in the parity-gated emitter.
+
+    The shape is not a design; it is what `PagedCausalConv1DFusion` matches,
+    read out of the pass's own source at the pinned OpenVINO commit:
+
+        ReadValue (rank 3)  ->  optional Gather  ->  Concat(axis = -1)
+          ->  GroupConvolution (rank-4 STATIC weights)  ->  optional Add
+          ->  Slice                                      <- the match root
+
+    Four of those are load-bearing in a way that is easy to get wrong, and each
+    cost a refusal before it was read rather than guessed:
+
+      * the Concat's `axis` ATTRIBUTE must be -1. On a rank-3 tensor axis 2 is
+        the same tensor and a different attribute, and the matcher compares the
+        attribute. That single value was the difference between no match and
+        twelve of the thirteen ports.
+      * the conv weights must be rank 4 and STATICALLY shaped. The checkpoint
+        carries [conv_dim, 1, K]; GroupConvolution wants
+        [groups, out/groups, in/groups, kernel], which for a depthwise conv is
+        [conv_dim, 1, 1, K].
+      * the state's dim 1 must equal the weights' dim 0 and its dim 2 the
+        kernel; the callback returns false rather than matching otherwise.
+      * the root is the Slice on the conv OUTPUT. The Slice that cuts the new
+        state out of the joined sequence is not part of the pattern -- the pass
+        drops the Variable by id.
+
+    The arithmetic, which is also why the result is causally identical to the
+    unrolled default: the state holds the last K inputs, so the joined sequence
+    is K + T long and the valid convolution over it is T + 1 long. Output j
+    covers joined[j .. j+K-1], so the output for x_i is at j = i + 1 and the
+    slice starts at 1. On the first forward the state is zeros, which is the
+    same left-pad `_causal_conv_silu` bakes as K-1 explicit zero columns.
+    """
+    def emit(x, conv_w, T, conv_dim, K):
+        i64 = lambda v: op.constant(np.array(v, np.int64))
+        info = ovutil.VariableInfo()
+        info.data_shape = ov.PartialShape([-1, conv_dim, K])
+        info.data_type = Type.f32
+        info.variable_id = f"cache_params.past.conv.{layer}"
+        var = ovutil.Variable(info)
+
+        init = op.broadcast(op.constant(np.array(0.0, np.float32)),
+                            i64([1, conv_dim, K]))
+        past = op.gather(op.read_value(init, var), beam, i64(0))
+        joined = op.concat([past, x], axis=-1)          # [1, conv_dim, K+T]
+
+        total = op.gather(op.shape_of(joined, output_type="i64"), i64([2]),
+                          i64(0))
+        sinks.append(op.assign(
+            op.slice(joined, op.subtract(total, i64([K])), total, i64([1]),
+                     i64([2])), var))
+
+        weights = qgdn._c(np.ascontiguousarray(conv_w, np.float32)
+                          .reshape(conv_dim, 1, 1, K))
+        conv = op.group_convolution(joined, weights, strides=[1],
+                                    pads_begin=[0], pads_end=[0], dilations=[1])
+        out_len = op.gather(op.shape_of(conv, output_type="i64"), i64([2]),
+                            i64(0))
+        body = op.slice(conv, i64([1]), out_len, i64([1]), i64([2]))
+        return qgdn._silu(body)
+
+    return emit
 
 
 def emit_stateful_attention(hidden, pid, config, state, T, layer, beam,
@@ -1080,6 +1154,7 @@ def _expert_slot_bytes(num_expert, ratio_pct, per_expert_bytes, moe_layers):
 
 __all__ = [
     "SparseArena", "shared_constants", "build_serving_shape_ir",
-    "emit_moe_tiled", "emit_stateful_attention", "slot_pool_from_ir",
+    "emit_moe_tiled", "emit_stateful_attention", "stateful_short_conv",
+    "slot_pool_from_ir",
     "EXPERT_DECLARED_TYPE", "NGRAM_DECLARED_TYPE", "EXPERT_GROUP_SIZE",
 ]

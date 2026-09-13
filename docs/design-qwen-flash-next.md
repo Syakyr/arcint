@@ -2082,3 +2082,80 @@ nodes (from 84,372), the same 183.07 GiB declared, the same 0 KiB on disk,
 **peak RSS 4.52 GiB — unchanged, against an unchanged 5.31 GiB ceiling**. So
 this increment is not the reshape CF-KEYSTONERSS was deferred to ride, and that
 fix stays where it was.
+
+#### The second construct: stateful GDN short conv (2026-09-13)
+
+Twelve of the thirteen rows, and the remaining one is a different kind of job.
+
+`q4e.serving_shape.stateful_short_conv` carries the GDN depthwise causal conv's
+K-column state in a rank-3 Variable. It reaches the parity-gated emitter
+through one new hook — `emit_gdn(..., conv_emitter=...)`, defaulting to the
+unrolled `_causal_conv_silu`, so the emitter emits no different op when nobody
+passes it.
+
+**This one was read out of the pass's own source rather than transcribed from
+the artifact**, which is why it landed on the second attempt instead of the
+fifth. `PagedCausalConv1DFusion` matches:
+
+```
+ReadValue (rank 3) → optional Gather → Concat(axis = −1)
+  → GroupConvolution (rank-4 STATIC weights) → optional Add → Slice   ← root
+```
+
+Four constraints are load-bearing and easy to miss:
+
+* **The Concat's `axis` attribute must be −1.** On a rank-3 tensor, axis 2 is
+  the identical tensor and a different attribute, and the matcher compares the
+  attribute. That one value was the whole difference between no match and
+  twelve ports; a red case pins it.
+* the conv weights must be rank 4 and statically shaped — the checkpoint's
+  `[conv_dim, 1, K]` reshaped to GroupConvolution's
+  `[groups, out/groups, in/groups, kernel]`, depthwise so `groups = conv_dim`;
+* the state's dim 1 must equal the weights' dim 0 and its dim 2 the kernel, or
+  the callback declines the match;
+* the root is the Slice on the conv **output**; the Slice that cuts the new
+  state out of the joined sequence is not in the pattern — the pass drops the
+  Variable by id.
+
+Causally identical to the unrolled default: the state holds the last K inputs,
+the joined sequence is K + T long, the valid convolution over it is T + 1 long,
+output *j* covers `joined[j … j+K−1]`, so the output for `x_i` sits at `j =
+i+1` and the slice starts at 1. On the first forward the state is zeros, the
+same left pad the unrolled form bakes as K−1 explicit zero columns.
+
+**The `la.*` attribution is now separated, and the earlier "unseparated" note
+retired.** Both linear-attention fusions call `pa_params.add` for all four
+`la.*` ports and for `subsequence_begins`
+(`paged_causal_conv1d_fusion.cpp`, `paged_gated_delta_net_fusion.cpp`), so
+either construct alone declares the whole group. Measured: the conv construct
+on its own produces all four.
+
+**Measured, 8 layers at T=8** (6 GDN, 2 full-attention): 10 Variables, 10
+Assigns; after the pass `PagedCausalConv1D` 6 and `PagedAttentionExtension` 2,
+with `conv_state_table.0…5` at `[?, 10240, 4]` — the same conv geometry the
+served hybrid artifact carries — plus all four `la.*` ports. Node count at 48
+layers drops to **84,158** (one GroupConvolution replaces a K-way unrolled
+slice/multiply/add chain per layer); **peak RSS 4.52 GiB, unchanged**, so this
+is again not the reshape CF-KEYSTONERSS waits on.
+
+#### What is left, stated from both sides
+
+**One port.** `gated_delta_state_table.N`. Its fusion matches an
+`ov::op::internal::GatedDeltaNet` node — a single internal op, which an earlier
+pass fuses out of the recurrence — not the op-by-op chunked delta rule this
+emitter writes. The other two constructs were transcriptions; this one is not,
+and saying so now is cheaper than discovering it mid-attempt.
+
+**And three ports the table never covered**, now gated by their own cell
+(`test_the_converted_surface_against_every_tensor_the_forward_feeds`). Feeding
+fails in two directions and only one of them throws:
+
+| declared, never fed | why it is a gap |
+|---|---|
+| `input_ids` | the forward feeds `inputs_embeds` — the embedding is its own compiled model; this emitter gathers it inline, so the name the forward reaches for is not the name declared |
+| `ngram_row_ids` | the hashed n-gram row ids: no serving forward has ever fed them |
+| `conv_mask` | the GDN/PLE padding mask; left at whatever the runtime allocates, and an all-zero mask annihilates the GDN input rather than passing it |
+
+A missing port throws at `set_tensor` and is loud. An unfed port is silent,
+which is why it now has a cell that asserts the set is *exactly* this one and
+fails if it grows or shrinks.

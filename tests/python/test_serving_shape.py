@@ -612,8 +612,15 @@ _BY_SDPA = ("ScaledDotProductAttention over a rank-4 KV Variable"
 _BY_CONV = "a rank-3 Variable (GDN short-conv state) -> PagedCausalConv1D"
 _BY_GDN = "a rank-4 Variable (GDN recurrent state) -> PagedGatedDeltaNet"
 _BY_PA_INDEX = "PagedAttentionExtension's own index ports"
-_BY_LA_INDEX = ("the linear-attention conversions' index ports"
-                " (PagedCausalConv1D / PagedGatedDeltaNet)")
+# READ OUT OF THE PASS, not inferred from which ports appeared together. Both
+# linear-attention fusions call `pa_params.add` for all four of these and for
+# `subsequence_begins`: paged_causal_conv1d_fusion.cpp and
+# paged_gated_delta_net_fusion.cpp, at the pinned OpenVINO commit. So EITHER
+# construct alone declares the whole `la.*` group -- this file first recorded
+# the attribution as unseparated, and it is separated now: the conv construct
+# on its own was measured producing all four.
+_BY_LA_INDEX = ("declared by EITHER linear-attention fusion"
+                " (PagedCausalConv1D / PagedGatedDeltaNet), both add all four")
 
 # port prefix | status | site | anchor: the CODE that classifies or feeds it |
 # produced by | how many of it the served IR carries (census below).
@@ -621,7 +628,7 @@ _BY_LA_INDEX = ("the linear-attention conversions' index ports"
 # `cite`, never typed.
 _PAGED_PORT_TABLE = (
     # classified by name prefix at load time
-    ("conv_state_table.", ABSENT, "classify",
+    ("conv_state_table.", PRESENT, "classify",
      'name.rfind("conv_state_table.", 0) == 0', _BY_CONV, 48),
     ("gated_delta_state_table.", ABSENT, "classify",
      'name.rfind("gated_delta_state_table.", 0) == 0', _BY_GDN, 48),
@@ -642,13 +649,13 @@ _PAGED_PORT_TABLE = (
      'set_i32("block_indices_begins"', _BY_PA_INDEX, 1),
     ("max_context_len", PRESENT, "feed",
      'set_i32("max_context_len"', _BY_PA_INDEX, 1),
-    ("la.block_indices", ABSENT, "feed",
+    ("la.block_indices", PRESENT, "feed",
      'set_i32("la.block_indices"', _BY_LA_INDEX, 1),
-    ("la.block_indices_begins", ABSENT, "feed",
+    ("la.block_indices_begins", PRESENT, "feed",
      'set_i32("la.block_indices_begins"', _BY_LA_INDEX, 1),
-    ("la.past_lens", ABSENT, "feed",
+    ("la.past_lens", PRESENT, "feed",
      'set_i32("la.past_lens"', _BY_LA_INDEX, 1),
-    ("la.cache_interval", ABSENT, "feed",
+    ("la.cache_interval", PRESENT, "feed",
      'set_i32("la.cache_interval"', _BY_LA_INDEX, 1),
 )
 
@@ -925,10 +932,15 @@ def test_the_kv_variables_are_the_shape_the_load_path_reads_prototypes_from(
     print("\n[contract-kv] variables on the stateful graph:")
     for v in paged_census["variables"]:
         print(f"  {v['id']:34s} {v['dims']}  {v['type']}")
-    assert len(paged_census["variables"]) == 2 * attn_layers, (
-        f"{len(paged_census['variables'])} variable(s) for {attn_layers} "
-        f"full-attention layer(s); expected one key and one value each")
-    for v in paged_census["variables"]:
+    # The rank-4 ones are the attention KV. The GDN short conv's are rank 3 and
+    # have their own cell -- :2557-2569 splits them by exactly this rank, so
+    # splitting them by rank here is reading the C++ rather than the ids.
+    rank4 = [v for v in paged_census["variables"]
+             if v["dims"] is not None and len(v["dims"]) == 4]
+    assert len(rank4) == 2 * attn_layers, (
+        f"{len(rank4)} rank-4 variable(s) for {attn_layers} full-attention "
+        f"layer(s); expected one key and one value each")
+    for v in rank4:
         assert v["dims"] == [-1, kv, -1, d], (
             f"{v['id']}: {v['dims']} is not [batch?, {kv}, seq?, {d}] -- "
             f"rank 4 with a dynamic sequence dim is what :2557-2569 reads")
@@ -958,6 +970,114 @@ def test_one_paged_attention_op_and_one_cache_pair_per_full_attention_layer(
     for r in _PAGED_PORTS:
         if r["produced_by"] is _BY_PA_INDEX:
             assert counts[r["port"]] == 1, (r["port"], counts[r["port"]])
+
+
+def test_the_conv_state_is_one_table_per_gdn_layer_at_the_conv_geometry(
+        paged_census):
+    """The rank-3 short-conv Variable, one per GDN layer, at
+    `[batch?, conv_dim, kernel]`.
+
+    `conv_dim` is not a number written here: it is the checkpoint's own
+    `2 * key_dim + value_dim` over the linear-attention geometry, and the
+    fusion refuses the match unless the state's dim 1 equals the conv weights'
+    dim 0 and its dim 2 the kernel width. So this cell asserts the shape the
+    pass itself checks, at the geometry `piecewise_export.real_config` reads
+    from the checkpoint.
+    """
+    cfg = pwe.real_config()
+    conv_dim = (cfg.linear_key_head_dim * cfg.linear_num_key_heads * 2
+                + cfg.linear_value_head_dim * cfg.linear_num_value_heads)
+    K = cfg.linear_conv_kernel_dim
+    gdn_layers = _CONTRACT_LAYERS - _CONTRACT_LAYERS // 4
+    rank3 = [v for v in paged_census["variables"]
+             if v["dims"] is not None and len(v["dims"]) == 3]
+    print(f"\n[contract-conv] {len(rank3)} rank-3 variable(s) for "
+          f"{gdn_layers} GDN layer(s); conv_dim {conv_dim}, kernel {K}")
+    assert len(rank3) == gdn_layers, [v["id"] for v in rank3]
+    for v in rank3:
+        assert v["dims"] == [-1, conv_dim, K], (v["id"], v["dims"])
+    assert paged_census["paged_ops"].get("PagedCausalConv1D") == gdn_layers, \
+        paged_census["paged_ops"]
+    assert paged_census["counts"]["conv_state_table."] == gdn_layers, \
+        paged_census["counts"]
+
+
+def test_the_la_index_ports_come_with_the_linear_attention_conversion(
+        paged_census):
+    """All four `la.*` ports, exactly one of each, and the conversion that
+    declares them is present. The pass adds them from EITHER linear-attention
+    fusion, so they arrive with the first one that matches -- which is why they
+    are here beside the conv state and not waiting on the recurrent one."""
+    la = {r["port"]: paged_census["counts"][r["port"]]
+          for r in _PAGED_PORTS if r["port"].startswith("la.")}
+    print(f"[contract-conv] {la}")
+    assert all(n == 1 for n in la.values()), la
+    assert paged_census["paged_ops"].get("PagedCausalConv1D"), \
+        "the la.* ports are here with no linear-attention conversion to " \
+        "declare them; something else produced them and the table's " \
+        "`produced_by` column is wrong"
+
+
+# The two tensors the forward feeds that are NOT paged ports and so are not in
+# the table above: they are not the transformation's output, they are the
+# parameter surface it preserves. They are fed by the same unconditional
+# `set_tensor` calls, immediately above the nine, so `set_tensor` on a name the
+# compiled model does not declare throws for these exactly as it does for those.
+_FORWARD_ALSO_FEEDS = tuple(
+    (name, cite(anchor)) for name, anchor in (
+        ("inputs_embeds", "lane.req.set_tensor(kInputsEmbeds, embeds);"),
+        ("position_ids", "lane.req.set_tensor(kPositionIds, pos);"),
+    ))
+
+
+def test_the_converted_surface_against_every_tensor_the_forward_feeds(
+        paged_census):
+    """WHAT STILL STANDS BETWEEN THE CONVERTED IR AND A FORWARD, counted from
+    both sides and printed, because the ports table answers only half of it.
+
+    Feeding is unconditional in both directions' worth of trouble:
+
+      * a name the forward feeds that the model does NOT declare throws at
+        `set_tensor` -- that is the table's business, and the table says which
+        are still missing.
+      * a port the model declares that the forward NEVER feeds is the other
+        half, and nothing was watching it. It does not throw; it is left at
+        whatever the runtime allocates, which for `conv_mask` is a zero mask
+        that annihilates the GDN input rather than passing it.
+
+    This cell names the second set. It is expected to be NON-EMPTY today and
+    the assertion is that it is EXACTLY the recorded set, so the day one is
+    closed -- or a new one appears -- the cell fails and the list gets read
+    again instead of drifting.
+    """
+    fed = {n for n, _ in _FORWARD_ALSO_FEEDS} | {
+        r["port"] for r in _PAGED_PORTS if not r["port"].endswith(".")}
+    families = tuple(r["port"] for r in _PAGED_PORTS if r["port"].endswith("."))
+    declared = paged_census["after"]
+    unfed = sorted(n for n in declared
+                   if n not in fed and not n.startswith(families))
+
+    # The recorded set, with WHY each one is here. Every entry is a gap, not a
+    # decision: none of them is something the serving path knows how to feed.
+    expected = {
+        # the forward feeds `inputs_embeds` (the embedding is its own compiled
+        # model); this emitter gathers the embedding inline off `input_ids`,
+        # so the name the forward reaches for is not the name declared.
+        "input_ids",
+        # this emitter's own ports, which no serving forward has ever fed:
+        # the hashed n-gram row ids and the GDN/PLE padding mask.
+        "ngram_row_ids",
+        "conv_mask",
+    }
+    print("\n[contract-feed] the forward feeds, unconditionally:")
+    for name, c in _FORWARD_ALSO_FEEDS:
+        print(f"  {name:26s} {c:22s} "
+              f"{'declared' if name in declared else 'NOT DECLARED'}")
+    print(f"[contract-feed] declared but never fed: {unfed}")
+    assert set(unfed) == expected, (
+        f"the never-fed set moved: {sorted(set(unfed) ^ expected)}. Every "
+        f"name here is a port the compiled model carries that no forward "
+        f"writes to -- read the list, do not widen it.")
 
 
 def test_the_transformation_consumes_attention_mask_and_beam_idx(paged_census):

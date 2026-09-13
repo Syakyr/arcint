@@ -276,13 +276,22 @@ def _rmsnorm_gated(core, z, weight_vec, eps, last_axis):
 
 
 # --- top-level emitter -----------------------------------------------------
-def _gdn_subgraph(hidden, amask, config, state, T, ut_mode=None):
+def _gdn_subgraph(hidden, amask, config, state, T, ut_mode=None,
+                  conv_emitter=None):
     """The GDN block body: hidden [1,T,H] f32 + amask [1,T] f32 -> out [1,T,H].
     Shared by build_gdn_model (standalone) and emit_gdn (the assembled
     backbone); the emitted ops are unchanged from the inc1 monolith.
 
     `ut_mode` selects how the chunk axis reaches the forward-substitution
-    unroll -- see UT_EMIT_MODE. None takes the module default."""
+    unroll -- see UT_EMIT_MODE. None takes the module default.
+
+    `conv_emitter` replaces the depthwise causal conv, and ONLY that step. It
+    is called exactly as `_causal_conv_silu` is and must return the same
+    [1, conv_dim, T]. It exists so the serving-shape emitter can carry the
+    conv's state in an ov Variable -- the construct the serving path's own
+    SDPAToPagedAttention turns into `conv_state_table.N` and the four `la.*`
+    index ports -- WITHOUT this module, which the parity suites gate, emitting
+    one different op when nobody passes it. None takes the unrolled default."""
     mode = UT_EMIT_MODE if ut_mode is None else ut_mode
     H = config.hidden_size
     HK = config.linear_num_key_heads
@@ -313,7 +322,8 @@ def _gdn_subgraph(hidden, amask, config, state, T, ut_mode=None):
 
     # depthwise causal conv over the qkv channels, then split
     qkv_t = _transpose(qkv, [0, 2, 1])                    # [1,conv_dim,T]
-    conv = _causal_conv_silu(qkv_t, w("conv1d.weight"), T, conv_dim, K)
+    conv = (conv_emitter or _causal_conv_silu)(
+        qkv_t, w("conv1d.weight"), T, conv_dim, K)
     conv_t = _transpose(conv, [0, 2, 1])                  # [1,T,conv_dim]
     query = _slice(conv_t, 0, key_dim, 1, 2)
     key = _slice(conv_t, key_dim, 2 * key_dim, 1, 2)
@@ -469,9 +479,11 @@ def _gdn_subgraph(hidden, amask, config, state, T, ut_mode=None):
     return out
 
 
-def emit_gdn(hidden, amask, config, state, seq_len, ut_mode=None):
+def emit_gdn(hidden, amask, config, state, seq_len, ut_mode=None,
+             conv_emitter=None):
     """The GDN subgraph for the assembled backbone (E2 inc5b)."""
-    return _gdn_subgraph(hidden, amask, config, state, int(seq_len), ut_mode)
+    return _gdn_subgraph(hidden, amask, config, state, int(seq_len), ut_mode,
+                         conv_emitter)
 
 
 def build_gdn_model(config, state, seq_len, ut_mode=None):
