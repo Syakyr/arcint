@@ -571,6 +571,33 @@ def main(argv=None):
     unfed = sorted(set(declared) - set(fed))
     say("forward", f"fed {len(fed)}: {fed}")
     say("forward", f"declared, never fed {len(unfed)}: {unfed}")
+
+    # THE STATE ROWS ARE ZEROED BEFORE EVERY SEQUENCE, as the runtime does it
+    # (backend_ov.cpp zero_paged_rows: a resident zero row copied into every
+    # lane row with copy_from). A device tensor from create_tensor holds
+    # whatever the allocator hands out, and a re-used request holds the
+    # previous forward's state -- the first leg of this driver's --repeat
+    # mode (2026-09-13, RUN@fca00a2) read every row of the second forward
+    # different from the first with 887 of 1,024 argmaxes moved, which was
+    # the carried state, not the floor. Without this step no repeat and no
+    # first forward is the served path's.
+    state_names = [nm for nm in declared
+                   if nm.startswith(("conv_state_table.", "gated_delta_state_table."))]
+
+    def zero_state(rq, label):
+        n_z = 0
+        for nm in state_names:
+            t = rq.get_tensor(nm)
+            host = ov.Tensor(np.zeros(list(t.get_shape()), dtype=np.float16))
+            try:
+                t.copy_from(host)                       # RemoteTensor: the plugin's copy
+            except AttributeError:
+                t.data[...] = 0                         # a host tensor (CPU device)
+            n_z += 1
+        say("state", f"{label}: {n_z} state table(s) zeroed before the forward "
+                     f"(copy_from a zero host tensor, as zero_paged_rows does)")
+
+    zero_state(req, "forward #1")
     t0 = time.time()
     try:
         req.infer()
@@ -628,6 +655,7 @@ def main(argv=None):
 
     for k in range(2, int(args.repeat) + 1):
         rk = fresh_request() if args.fresh else req
+        zero_state(rk, f"repeat #{k}")
         t0 = time.time()
         try:
             rk.infer()
