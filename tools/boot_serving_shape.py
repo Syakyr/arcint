@@ -604,6 +604,14 @@ def main(argv=None):
         n_z = 0
         for nm in state_names:
             t = rq.get_tensor(nm)
+            try:
+                et_static = t.get_element_type().is_static()
+            except Exception:                                     # noqa: BLE001
+                et_static = False
+            if not et_static or nm not in fed:
+                # a state port left unbound by a --cut (undefined element
+                # type): nothing to zero; the cut legs died here once
+                continue
             # the request's own element type: f16 by default, f32 under an
             # f32 INFERENCE_PRECISION_HINT (the first f32 leg died here on a
             # hard-coded f16 zero row: "src: f16 != dst: f32")
