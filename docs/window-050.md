@@ -1286,6 +1286,67 @@ runtime has no site that binds the mapping to a compiled model's ports).
 Feeding them is the next increment, and every one of them is now reachable
 by a forward on a card.
 
+## 4.8 FEED-THE-PORTS — THE FIRST REAL-WEIGHT FORWARD, PREDICTED BEFORE IT RAN (2026-09-13)
+
+Written with **no real-weight output in existence** for this tree. What the
+increment changed before any card was touched, each with its device-free gate:
+
+- **dynamic in T across the class.** No port, reshape or slice of the
+  serving-shape graph carries the block length: the parity emitters take
+  `seq_len=None` and build with `-1`, the PLE conv's taps end in negative
+  stops, the GDN Loop's trip count and buffer come off `ShapeOf`, the SDPA
+  operands are token-major and dynamic (§4.7), the conv construct slices its
+  state with negative indices and NO `ShapeOf` (the pass's
+  `TotalSequenceLengthPattern` matched the old `ShapeOf → Gather` over the
+  conv concat and threw once the length went dynamic). Every parity suite is
+  green under the same emitters — the change is structure-only there.
+- **`inputs_embeds` is the port** the served forward feeds
+  (backend_ov.cpp:6141), embedded on the host; the embedding weight left the
+  graph. The served feed order is accepted end to end now.
+- **one rope table pair for the full context**, `rope/cos` and `rope/sin`,
+  `[262144, rotary]`, shared by every full-attention layer; the cell that
+  pinned the T-only table went red and was replaced by the cell that gates the
+  shared one.
+- **the table rows are the GGUF's own IQ4_NL bytes** (90 a row: five blocks
+  of an f16 scale and 16 nibble bytes), decoded AFTER the gather with exact
+  ops (integers below 2²⁴, a 32-entry power-of-two table, the codebook by
+  Gather). `test_the_in_graph_iq4nl_decode_is_gguf_pys_bit_for_bit`: equal
+  to gguf-py's `dequantize(raw, IQ4_NL)` on 128 rows including subnormal and
+  negative scales, no tolerance. The chunk partition follows: 47,718,400 rows
+  (4,294,656,000 B) a chunk, **seven** ports, 26.82 GiB in all.
+- **the dense fill.** `build_serving_shape_ir(feed=GgufFeed)` writes every
+  dense weight of the built layers, the PLE, the final mixer and the head
+  from the shards through `feed.fitted` (the same keys the parity suites feed
+  by), the expert bodies through the existing `ExpertFiller`; the driver
+  embeds the prompt from `token_embd` and binds the table from the shard's
+  memmap, one copy into the USM-host chunks.
+- **the driver feeds what the runtime cannot yet**: the two id ports from
+  `q4e.ngram_ids` (the generator moved out of the PLE parity cell; validated
+  there against the committed Link-3 vectors) split at the port partition,
+  and `conv_mask` = ones. Labelled as the driver's on every line.
+
+### The prediction — the France prompt at depth 4, real weights
+
+| # | leg | prediction (written before the run) | dies if |
+|---|---|---|---|
+| R1 | build with `--shards`, depth 4 | dense fill writes **95** tensors (3 GDN layers × 22 + 1 attention layer × 19 + PLE 6 + final mixer 3 + head 1); expert fill 4 layers × 3 kinds; build completes | a key the feed cannot map (raises by name), or a shape the buffer refuses |
+| R2 | compile, A770, served props | **OK** — the same graph as the zero-weight boot; weights do not change the structure | a refusal |
+| R3 | table bind | seven USM-host chunks, 28,800,138,240 B, copied from the shard memmap; `usm_device` unchanged | an allocation refused, or the host OOM-kills the process (the budget: ~27 GiB pinned + the compile peak + the arena's dirty pages against 48 GiB) |
+| R4 | the France prompt, served feed order + the driver's id/mask feeds | `INFER OK`, logits `(1, 5, 248320)`, **finite, not all zero, absmax > 0** | any non-finite, or all-zero logits (a fill that did not land) |
+| R5 | the greedy token | **NOT `Paris`** and not predicted: four of forty-eight layers produce a real distribution, not the model's. The id and its string are recorded raw | — (nothing here is falsifiable except finiteness) |
+| R6 | a 1-token decode block on the same request | `INFER OK`, logits `(1, 1, 248320)`, finite | a shape refusal anywhere: the graph would still be static somewhere |
+| R7 | one long block on a fresh request: **`--long 1600` on the A770, `--long 2100` on the B60** | `INFER OK`, finite; positions up to 1,599 / 2,099 gather inside the shared rope table. (R7 was first written as 2,100 on both cards and was FALSIFIED by the zero-weight run before this section was committed: the A770 refuses a 2,100-token block at `engine.cpp:319`, `requested 5505024000 bytes` = the tiled MoE's `[512, 2100, 2560]` f16 intermediate, over the 4,294,959,104 B cap. That makes the A770's prefill-block ceiling under this lowering **1,638 tokens**; 1,024 and 1,600 ran, 2,100 did not. The B60 ran 2,100. Rewritten here rather than edited away — the increment's first measurement was the prediction's own falsification, on the record.) | a refusal, or a non-finite logit |
+| R8 | the B60 | the same as R2–R6 | a difference between the cards |
+
+**What R4/R5 are and are not.** The first real-weight logits of this IR on
+the served path's own compiled graph. Not the model's answer: forty-four
+layers are missing, so the argmax is a number with a face and no meaning.
+The KLD gate does not read them (served path only).
+
+**Not predicted**: every timing, the host peak, the fill's wall time.
+
+### Measured — `UNTESTED`, filled by the measurement commit
+
 ## 5. Residency — the SIZE LEDGER, and the number that decides the window
 
 `RUN@wt+2e99661`, 2026-09-12, real checkpoint geometry, T=64, CPU, every row either built

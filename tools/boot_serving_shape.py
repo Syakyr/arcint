@@ -381,16 +381,30 @@ def main(argv=None):
         return i64(values, (m,) if d is not None and len(d) == 1 else (1, m))
 
     # the prompt's embedding, on the host as the served path does it
-    embed_w = None
+    # every row this run will need is cut out now and the 2.5 GB f32 table
+    # dropped: the host budget is the table's 26.8 GiB of pinned USM plus the
+    # compile peak, and a second copy of token_embd is not in it
+    _emb_rows = {}
     if feed_ is not None:
         t0 = time.time()
         embed_w = feed_.fitted("embed_tokens.weight", (rep_vocab(), H))
         say("shards", f"embed_tokens {embed_w.shape} dequantised in {time.time() - t0:.1f}s")
+        need = set(ids)
+        if args.long:
+            need |= set(range(1000, 1000 + int(args.long)))
+        for tid in need:
+            _emb_rows[int(tid)] = np.array(embed_w[int(tid)], np.float32)
+        del embed_w
 
     def embeds_for(tokens):
-        if embed_w is None:
+        if feed_ is None:
             return np.zeros((len(tokens), H), np.float32)
-        return np.ascontiguousarray(embed_w[np.asarray(tokens, np.int64)], np.float32)
+        out = np.empty((len(tokens), H), np.float32)
+        for j, tid in enumerate(tokens):
+            out[j] = _emb_rows.get(int(tid), 0.0)   # a token no leg asked for: zero, said so
+            if int(tid) not in _emb_rows:
+                say("shards", f"token {tid} had no cut row; fed zero")
+        return out
 
     # THE DRIVER'S OWN FEEDS (feed-the-ports): the hashed row ids, split at
     # the port partition by the host, and the padding mask. Computed once for
