@@ -103,6 +103,23 @@ def read_capture(path):
     return n_ctx, n_vocab, n_chunk, tokens, rows
 
 
+def llama_row(logits):
+    """llama.cpp perplexity.cpp `log_softmax(int, const float*, uint16_t*, int)`,
+    transcribed: the writer of every recorded row."""
+    logits = np.asarray(logits, dtype=np.float32)
+    max_logit = float(logits.max())
+    min_logit = max(float(logits.min()), max_logit - 16)
+    log_sum_exp = float(np.log(np.exp(logits - max_logit).sum()))
+    min_log_prob = min_logit - max_logit - log_sum_exp
+    scale = (max_logit - min_logit) / 65535.0
+    row = np.zeros(2 * ((len(logits) + 1) // 2) + 4, dtype=np.uint16)
+    row[:4] = np.array([scale, min_log_prob], dtype=np.float32).view(np.uint16)
+    if scale:
+        q = np.where(logits > min_logit, np.rint((logits - min_logit) / scale), 0)
+        row[4:4 + len(logits)] = q.astype(np.uint16)
+    return row
+
+
 def reference_log_probs(row_u16, n_vocab):
     """One recorded row -> log P_ref over the vocab, f64. The writer stores
     scale (f32), min_log_prob (f32), then q[i] = round((logit_i - min_logit)

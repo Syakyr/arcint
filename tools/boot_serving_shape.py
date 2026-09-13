@@ -163,6 +163,12 @@ def main(argv=None):
                          "the pinned plugin's own switch for the asynchronous "
                          "static-shape kernel swap); a key the plugin refuses "
                          "fails the compile by name")
+    ap.add_argument("--dump-logits", default=None,
+                    help="DIRECTORY: every forward's f32 logits rows are saved "
+                         "as forward_K.npy ([T, vocab]) -- the rows the KLD "
+                         "bar derivation reads (tools/kld_bar.py: F_ref from "
+                         "the writer transcription, the floor pair from two "
+                         "forwards)")
     ap.add_argument("--tiny", action="store_true",
                     help="TEST GEOMETRY: the suite's reduced config "
                          "(q4e.serving_shape.tiny_config: hidden 256, vocab "
@@ -656,6 +662,15 @@ def main(argv=None):
                    f"finite={bool(np.isfinite(lg).all())} "
                    f"absmax={float(np.abs(lg).max()):.4e}")
     say("forward", f"argmax per position: {[int(r.argmax()) for r in rows]}")
+
+    def dump_rows(k, arr):
+        if not args.dump_logits:
+            return
+        d = Path(args.dump_logits); d.mkdir(parents=True, exist_ok=True)
+        f = d / f"forward_{k}.npy"
+        np.save(f, np.ascontiguousarray(arr, dtype=np.float32))
+        say("dump", f"forward #{k} rows {tuple(arr.shape)} f32 -> {f}")
+    dump_rows(1, rows)
     say("forward", f"RAW OUTPUT (greedy, last position): {int(rows[-1].argmax())}")
     if feed_ is not None:
         # the token strings, from the GGUF's own vocabulary, so the id has a face
@@ -712,6 +727,7 @@ def main(argv=None):
         dt = time.time() - t0
         outk = rk.get_output_tensor(0).data if args.cut else rk.get_tensor("logits").data
         cur = np.array(outk, dtype=np.float32).reshape(-1, outk.shape[-1])
+        dump_rows(k, cur)
         if cur.shape != base.shape:
             say("repeat", f"#{k} shape {cur.shape} != #1 {base.shape}")
             break
