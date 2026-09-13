@@ -437,6 +437,12 @@ def main(argv=None):
                 sh = list(gdn_proto[la_i % max(len(gdn_proto), 1)]) if gdn_proto else None
             elif name.startswith(("key_cache.", "value_cache.")):
                 d = dims(port)
+                if d is None or any(x < 0 for x in d[1:]):
+                    # a --cut before the attention layer leaves the KV ports
+                    # declared but unreachable, their tails dynamic; nothing
+                    # to bind (the first cut legs died here on Shape([65,-1,..]))
+                    say("request", f"{name}: tail {d} dynamic after the cut; not bound")
+                    continue
                 sh = [nblk] + d[1:]
                 t = (ctx.create_tensor(port.get_element_type(), ov.Shape(sh), {})
                      if ctx else ov.Tensor(port.get_element_type(), ov.Shape(sh)))
