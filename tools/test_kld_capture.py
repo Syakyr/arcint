@@ -34,11 +34,11 @@ class Args:
         self.__dict__.update(kw)
 
 
-class BoundaryRefusal(unittest.TestCase):
-    # THE TWO MEASURED POINTS, and the formula is pinned to them rather than to
-    # anybody's reasoning about index arithmetic. The first draft of the tool
-    # used `T - 1 - boundary` and a test asserted it; both were wrong by one
-    # against these rows, and both looked right.
+class ThePriceFormula(unittest.TestCase):
+    """How many rows of a T-token window the QSA price TOUCHES. Pinned to the
+    two measured points, because reasoning about index arithmetic produced the
+    wrong answer here once (`T - 1 - boundary`, which gives 0 and 28)."""
+
     MEASURED_ROWS = {2052: 1, 2080: 29}
 
     def test_the_formula_reproduces_both_measured_rows(self):
@@ -47,39 +47,77 @@ class BoundaryRefusal(unittest.TestCase):
                              f"T={T}: the recorded measurement is "
                              f"{affected}/{T} rows")
 
-    def test_the_smallest_window_the_price_touches_is_the_boundary_plus_one(self):
-        self.assertEqual(kc.check_context_crosses_boundary(
-            kc.QSA_BOUNDARY_TOKENS + 1), 1)
-        with self.assertRaises(kc.CaptureRefusal):
-            kc.check_context_crosses_boundary(kc.QSA_BOUNDARY_TOKENS)
-
-    def test_a_window_below_the_boundary_is_refused(self):
-        for n_ctx in (1, 512, 2048, kc.QSA_BOUNDARY_TOKENS):
-            with self.assertRaises(kc.CaptureRefusal):
-                kc.check_context_crosses_boundary(n_ctx)
-
-    def test_the_refusal_names_the_boundary_and_a_usable_value(self):
-        try:
-            kc.check_context_crosses_boundary(2048)
-        except kc.CaptureRefusal as exc:
-            msg = str(exc)
-        self.assertIn(str(kc.QSA_BOUNDARY_TOKENS), msg)
-        self.assertIn(str(kc.QSA_BOUNDARY_TOKENS + 1), msg)
-        self.assertIn("2.385560e-02", msg)
-
-    def test_the_touched_count_at_the_capture_width(self):
-        """4096 - 2051 = 2045 rows carry the price and 2051 sit below it.
-        Derived from the same formula the measured rows pin."""
-        self.assertEqual(kc.check_context_crosses_boundary(4096),
-                         4096 - kc.QSA_BOUNDARY_TOKENS)
-        self.assertEqual(kc.rows_past_boundary(4096), 2045)
-
     def test_the_boundary_is_not_the_budget(self):
-        """2048 is the QSA budget; 2051 is the measured boundary. A tool that
-        confused them would take captures that look right and are not."""
+        """2048 is the QSA budget; 2051 is the measured boundary."""
         self.assertEqual(kc.QSA_BOUNDARY_TOKENS, 2051)
+        self.assertEqual(kc.rows_past_boundary(2048), 0)
+
+
+class WhatACaptureContains(unittest.TestCase):
+    """`llama-perplexity` records only the SECOND HALF of each window. These
+    figures come from a real capture, not from the source alone."""
+
+    # MEASURED: a `-c 4096 --chunks 2` capture of the shipped artifact.
+    # File layout is "_logits_" + n_ctx + n_vocab + n_chunk + token ids, then
+    # one row of 2*((n_vocab+1)//2)+4 uint16 per recorded token.
+    CAPTURE_BYTES = 2_033_309_700
+    CAPTURE_N_CTX = 4096
+    CAPTURE_N_CHUNK = 2
+    CAPTURE_N_VOCAB = 248_320
+
+    def test_the_recorded_row_count_matches_the_measured_file_exactly(self):
+        nv = 2 * ((self.CAPTURE_N_VOCAB + 1) // 2) + 4
+        header = 8 + 4 + 4 + 4 + self.CAPTURE_N_CHUNK * self.CAPTURE_N_CTX * 4
+        body = self.CAPTURE_BYTES - header
+        self.assertEqual(body % (nv * 2), 0,
+                         "the file does not divide into whole rows; the "
+                         "layout assumed here is wrong")
+        rows_in_file = body // (nv * 2)
+        per_window = kc.recorded_rows(self.CAPTURE_N_CTX)[2]
+        self.assertEqual(rows_in_file, self.CAPTURE_N_CHUNK * per_window,
+                         f"the file holds {rows_in_file} rows; the model says "
+                         f"{self.CAPTURE_N_CHUNK} x {per_window}")
+
+    def test_the_recorded_range_is_the_second_half(self):
+        first, last, count = kc.recorded_rows(4096)
+        self.assertEqual((first, last, count), (2048, 4094, 2047))
+
+    def test_the_capture_width_that_looks_fine_and_is_not(self):
+        """THE DEFECT THIS MODEL EXISTS FOR. A 4096 window obviously crosses
+        the boundary, so a check on the WINDOW passes it -- and the capture
+        holds three usable rows below the boundary against 2044 above."""
+        below, at_or_above = kc.rows_by_side(4096)
+        self.assertEqual((below, at_or_above), (3, 2044))
         with self.assertRaises(kc.CaptureRefusal):
-            kc.check_context_crosses_boundary(2048)
+            kc.check_capture_serves_both_sides(4096, 256)
+
+    def test_a_window_that_records_nothing_above_the_boundary(self):
+        below, at_or_above = kc.rows_by_side(2048)
+        self.assertEqual(at_or_above, 0)
+        with self.assertRaises(kc.CaptureRefusal):
+            kc.check_capture_serves_both_sides(2048, 1)
+
+    def test_the_balanced_width_really_maximises_the_scarcer_side(self):
+        best_n, best_rows = kc.balanced_n_ctx()
+        self.assertEqual(min(kc.rows_by_side(best_n)), best_rows)
+        for n in range(kc.QSA_BOUNDARY_TOKENS + 2, 2 * kc.QSA_BOUNDARY_TOKENS):
+            self.assertLessEqual(min(kc.rows_by_side(n)), best_rows,
+                                 f"n_ctx={n} beats the balanced width")
+
+    def test_a_balanced_width_is_accepted_and_reports_both_sides(self):
+        best_n, _ = kc.balanced_n_ctx()
+        below, at_or_above = kc.check_capture_serves_both_sides(best_n, 256)
+        self.assertGreaterEqual(below, 256)
+        self.assertGreaterEqual(at_or_above, 256)
+
+    def test_the_refusal_names_the_boundary_and_a_usable_width(self):
+        with self.assertRaises(kc.CaptureRefusal) as caught:
+            kc.check_capture_serves_both_sides(4096, 256)
+        msg = str(caught.exception)
+        self.assertIn(str(kc.QSA_BOUNDARY_TOKENS), msg)
+        self.assertIn(str(kc.balanced_n_ctx()[0]), msg)
+        self.assertIn("2.385560e-02", msg)
+        self.assertIn("SECOND HALF", msg)
 
 
 class Command(unittest.TestCase):
@@ -96,8 +134,8 @@ class Command(unittest.TestCase):
         self.assertNotIn("--kl-divergence", kc.build_command(Args()))
 
     def test_every_knob_reaches_the_command(self):
-        cmd = kc.build_command(Args(n_ctx=2053, chunks=3, batch=256, threads=4))
-        for flag, want in (("-c", "2053"), ("--chunks", "3"),
+        cmd = kc.build_command(Args(n_ctx=2736, chunks=3, batch=256, threads=4))
+        for flag, want in (("-c", "2736"), ("--chunks", "3"),
                            ("-b", "256"), ("-t", "4")):
             self.assertEqual(cmd[cmd.index(flag) + 1], want, flag)
 
@@ -114,14 +152,16 @@ class Manifest(unittest.TestCase):
             args = Args(reference_bin=os.path.join(d, "bin"),
                         corpus=os.path.join(d, "corpus"),
                         out=os.path.join(d, "out"))
-            man = kc.manifest(args, 2045, 0.0, 1.5, 0, "tail")
+            man = kc.manifest(args, (3, 2044), 0.0, 1.5, 0, "tail")
             self.assertEqual(man["capture"]["bytes"], len(b"logits"))
             self.assertEqual(len(man["capture"]["sha256"]), 64)
             self.assertEqual(len(man["corpus"]["sha256"]), 64)
             self.assertEqual(len(man["reference"]["binary_sha256"]), 64)
             self.assertIsNone(man["model"]["sha256"])   # --hash-model off
             self.assertEqual(man["qsa_boundary_tokens"], 2051)
-            self.assertEqual(man["rows_past_boundary_per_window"], 2045)
+            self.assertEqual(man["recorded_rows_below_boundary"], 3)
+            self.assertEqual(man["recorded_rows_at_or_above_boundary"], 2044)
+            self.assertEqual(man["recorded_rows_per_window"], 2047)
             json.dumps(man)                              # must be serialisable
 
     def test_a_missing_capture_file_is_recorded_as_absent_not_as_zero_hash(self):
@@ -132,27 +172,77 @@ class Manifest(unittest.TestCase):
             args = Args(reference_bin=os.path.join(d, "bin"),
                         corpus=os.path.join(d, "corpus"),
                         out=os.path.join(d, "never-written"))
-            man = kc.manifest(args, 1, 0.0, 0.1, 1, "boom")
+            man = kc.manifest(args, (1, 1), 0.0, 0.1, 1, "boom")
             self.assertEqual(man["capture"]["bytes"], 0)
             self.assertIsNone(man["capture"]["sha256"])
 
 
 class Cli(unittest.TestCase):
-    def test_dry_run_refuses_a_context_that_cannot_cross_the_boundary(self):
-        with self.assertRaises(kc.CaptureRefusal):
-            kc.main(["--reference-bin", "b", "--model", "m", "--corpus", "c",
-                     "--out", "o", "--n-ctx", "2048", "--dry-run"])
+    BASE = ["--reference-bin", "b", "--model", "m", "--corpus", "c", "--out", "o"]
 
-    def test_dry_run_accepts_a_context_that_can(self):
+    def test_dry_run_refuses_a_width_whose_rows_land_on_one_side(self):
+        with self.assertRaises(kc.CaptureRefusal):
+            kc.main(self.BASE + ["--n-ctx", "2048", "--dry-run"])
+
+    def test_dry_run_refuses_the_width_that_merely_crosses_the_boundary(self):
+        """4096 is the width the first version of this tool accepted."""
+        with self.assertRaises(kc.CaptureRefusal):
+            kc.main(self.BASE + ["--n-ctx", "4096", "--dry-run"])
+
+    def test_dry_run_accepts_the_balanced_width(self):
+        best_n, _ = kc.balanced_n_ctx()
         self.assertEqual(
-            kc.main(["--reference-bin", "b", "--model", "m", "--corpus", "c",
-                     "--out", "o", "--n-ctx", "4096", "--dry-run"]), 0)
+            kc.main(self.BASE + ["--n-ctx", str(best_n), "--dry-run"]), 0)
 
-    def test_one_chunk_is_refused_because_it_captures_nothing(self):
+    def test_the_minimum_each_side_is_the_callers(self):
+        """4096 is refused at the default and admitted at 3, because 3 is what
+        it has below the boundary. The knob is not a way to pretend."""
         with self.assertRaises(kc.CaptureRefusal):
-            kc.main(["--reference-bin", "b", "--model", "m", "--corpus", "c",
-                     "--out", "o", "--n-ctx", "4096", "--chunks", "1",
-                     "--dry-run"])
+            kc.main(self.BASE + ["--n-ctx", "4096", "--dry-run"])
+        self.assertEqual(
+            kc.main(self.BASE + ["--n-ctx", "4096", "--min-rows-each-side",
+                                 "3", "--dry-run"]), 0)
+
+    def test_one_chunk_is_allowed_over_a_long_enough_corpus(self):
+        """It was refused, on a rationale that belonged to the corpus."""
+        best_n, _ = kc.balanced_n_ctx()
+        with tempfile.TemporaryDirectory() as d:
+            corpus = os.path.join(d, "corpus")
+            with open(corpus, "wb") as fh:
+                fh.write(b"x" * (8 * best_n))
+            self.assertEqual(
+                kc.main(["--reference-bin", "b", "--model", "m", "--corpus",
+                         corpus, "--out", "o", "--n-ctx", str(best_n),
+                         "--chunks", "1", "--dry-run"]), 0)
+
+    def test_zero_chunks_is_refused(self):
+        best_n, _ = kc.balanced_n_ctx()
+        with self.assertRaises(kc.CaptureRefusal):
+            kc.main(self.BASE + ["--n-ctx", str(best_n), "--chunks", "0",
+                                 "--dry-run"])
+
+
+class CorpusLength(unittest.TestCase):
+    def test_a_corpus_that_cannot_reach_two_windows_is_refused(self):
+        """A token is at least one byte, so this bound cannot be wrong."""
+        with tempfile.TemporaryDirectory() as d:
+            corpus = os.path.join(d, "corpus")
+            with open(corpus, "wb") as fh:
+                fh.write(b"x" * 100)
+            with self.assertRaises(kc.CaptureRefusal) as caught:
+                kc.check_corpus_long_enough(corpus, 2736)
+            self.assertIn("5,472", str(caught.exception))
+
+    def test_a_corpus_that_could_reach_it_is_not_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            corpus = os.path.join(d, "corpus")
+            with open(corpus, "wb") as fh:
+                fh.write(b"x" * 200_000)
+            self.assertEqual(kc.check_corpus_long_enough(corpus, 2736), 200_000)
+
+    def test_a_missing_corpus_is_the_runners_error_not_this_check(self):
+        self.assertIsNone(
+            kc.check_corpus_long_enough("/nonexistent/corpus", 2736))
 
 
 if __name__ == "__main__":

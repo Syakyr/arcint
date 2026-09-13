@@ -364,8 +364,19 @@ def _gdn_subgraph(hidden, amask, config, state, T, ut_mode=None,
     k = _l2norm_last(k, 3)
 
     def _finish(core_bthd):
-        """RMSNormGated over Dv, then out_proj. Shared by both cores so the
-        tail cannot drift between them."""
+        """RMSNormGated over Dv, then out_proj -- the tail EVERY core returns
+        through, which is the only way the sentence "the tail cannot drift
+        between them" is true.
+
+        It was not true when this was written: the perchunk branch, which is
+        the module DEFAULT, kept its own copy of these three lines, so on the
+        default configuration the serving core went through here and the
+        parity-gated core did not -- exactly the pair the claim was about. The
+        copy is gone. The emitted graph is unchanged either way: the arguments
+        are built in the same order, so the ops are created in the same order
+        with the same operands, and the node-count assertions in
+        `test_the_chunk_emission_modes_agree_on_cpu_and_differ_in_node_count`
+        would move if they were not."""
         normed = _rmsnorm_gated(core_bthd, z, w("norm.weight"), eps, 3)
         return _mm(_reshape(normed, [1, T, value_dim]),
                    _c(w("out_proj.weight")), tb=True)      # [1,T,H]
@@ -440,9 +451,7 @@ def _gdn_subgraph(hidden, amask, config, state, T, ut_mode=None,
         if pad > 0:
             core = _slice(core, 0, T, 1, 2)
         core = _transpose(core, [0, 2, 1, 3])            # [1,T,HV,Dv]
-        core = _rmsnorm_gated(core, z, w("norm.weight"), eps, 3)
-        core = _reshape(core, [1, T, value_dim])
-        return _mm(core, _c(w("out_proj.weight")), tb=True)
+        return _finish(core)
 
     q_c = _reshape(q, [1, HV, C, CHUNK, Dk])
     k_c = _reshape(k, [1, HV, C, CHUNK, Dk])

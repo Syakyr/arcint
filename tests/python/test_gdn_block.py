@@ -572,14 +572,23 @@ def test_the_sequential_serving_core_is_the_same_gdn_as_the_chunked_one():
     arithmetic, which is exactly what "distance to truth" measures and what a
     comparison between them could not distinguish from both being wrong.
     """
-    import openvino as ov
-
-    from q4e import serving_shape as ss
-
     config = _make_config()
     ref, _ = _ref_and_pin(config)
     state = _state_np(ref)
-    T = 64
+    # T=64 is exactly CHUNK, so the chunked side never crosses a chunk
+    # boundary there and the comparison row is weaker than it looks. T=96 is
+    # two chunks with 32 pad rows -- the shape the chunk-mode cells use for the
+    # same reason.
+    for T in (64, 96):
+        _one_sequential_core_leg(config, ref, state, T)
+
+
+def _one_sequential_core_leg(config, ref, state, T):
+    import openvino as ov
+    from openvino import opset13 as ovop
+
+    from q4e import serving_shape as ss
+
     x = torch.randn(1, T, config.hidden_size)
     mask = torch.ones(1, T, dtype=torch.long)
     with torch.no_grad():
@@ -600,7 +609,6 @@ def test_the_sequential_serving_core_is_the_same_gdn_as_the_chunked_one():
     # The serving core wants a beam index and somewhere to put its Assign. A
     # constant beam is the single-lane case the serving path runs anyway, and
     # the fusion's own pattern has the Gather as optional.
-    from openvino import opset13 as ovop
     sinks = []
     seq_model = gdn.build_gdn_model(
         config, state, seq_len=T, sinks=sinks,
@@ -636,3 +644,26 @@ def test_the_sequential_serving_core_is_the_same_gdn_as_the_chunked_one():
         "the two cores are bitwise identical, which they cannot be: one sums "
         "the recurrence per chunk and the other per token. A zero here means "
         "this cell built the same graph twice and is measuring nothing.")
+
+    # THE STATE MUST ACTUALLY CARRY, which the rows above cannot see: they read
+    # one forward, and a Loop whose Assign went nowhere would produce exactly
+    # the same first forward. A second infer on the SAME input must differ,
+    # because the recurrent state it starts from is the one the first infer
+    # wrote -- and the chunked core, which has no state, must repeat itself
+    # exactly. Both halves are needed: the first alone would also pass on a
+    # graph that was merely non-deterministic.
+    y_seq2 = np.asarray(sequential(feed)[sequential.output(0)], np.float64)
+    y_chunked2 = np.asarray(chunked(feed)[chunked.output(0)], np.float64)
+    carry = float(np.max(np.abs(y_seq2 - y_seq)))
+    print(f"[gdn-seq] T={T} second forward: |seq2-seq1|={carry:.4e}  "
+          f"|chunked2-chunked1|={np.max(np.abs(y_chunked2 - y_chunked)):.4e}")
+    assert carry > 0.0, (
+        "a second forward on the same input reproduced the first exactly, so "
+        "the recurrent state did not carry: the Assign is not reaching the "
+        "Variable the ReadValue starts from. That is the whole reason this "
+        "core is a Loop over a state rather than a function of its inputs.")
+    assert np.array_equal(y_chunked2, y_chunked), (
+        "the CHUNKED core changed between two infers on identical input. It "
+        "carries no state, so this is non-determinism, and it would make the "
+        "assertion above meaningless -- a difference there would no longer be "
+        "evidence of a state carry.")

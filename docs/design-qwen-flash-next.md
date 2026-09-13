@@ -2160,6 +2160,21 @@ A missing port throws at `set_tensor` and is loud. An unfed port is silent,
 which is why it now has a cell that asserts the set is *exactly* this one and
 fails if it grows or shrinks.
 
+**And a fourth, found by review (2026-09-13): the rope table only spans the
+query block.** `emit_stateful_attention` bakes cos/sin for positions `0…T−1`
+and gathers them by `position_ids`. Every other part of that layer is built for
+`past > 0` — the causal mask derives `past` from the KV Variable's dynamic
+length rather than baking it — so the rope is the one place the static query
+block still reaches correctness: a position at or past `T` indexes off the end
+of the table, and OpenVINO's `Gather` does not throw for that. The graph is
+right for a forward starting at position 0 and silently wrong for any forward
+after it. Not fixed here because of a number: `max_position_embeddings` is
+262,144, so a full table is ~67 MB a side a layer and ~1.6 GiB over the twelve
+full-attention layers, which walks through the 5.12 GiB residency ceiling.
+Sizing it belongs with the increment that makes the query block dynamic — the
+same static-T root cause. `test_the_rope_table_only_spans_the_query_block`
+pins it, so the day it is fixed the cell reds.
+
 #### The last port, specified: what `gated_delta_state_table.N` actually requires (read 2026-09-13)
 
 The thirteenth row is not one more transcription, and this is what it is
@@ -2320,7 +2335,17 @@ and say nothing about either.
 
 The sequential core is measured against the **same f64 truth**, at the **same
 20× the f32 reference's own rounding** doctrine, that `test_gdn_ov_parity`
-holds the chunked core to. Measured, CPU, T=64, real reference weights:
+holds the chunked core to.
+
+**CORRECTION, same day:** this section and commit `068b7ec`'s message both said
+"real reference weights". They are **random** weights at seed 0 (`_ref_and_pin`)
+over the toy geometry `_make_config` builds — H=256, 2 key heads / 4 value
+heads, `Dk=Dv=32`, conv kernel 4 — not real weights and not real geometry. The
+distinction is load-bearing by this repository's own record (`gdn.py` states
+that a random-weight fixture is blind to the f32 defect class behind the
+FIX-GDN-UTINV retraction), so it is corrected here rather than quietly
+reworded. What the cell measures is unchanged; what it is entitled to claim is
+narrower. Measured, CPU, random-weight fixture (seed 0), toy geometry:
 
 | | distance to f64 truth | vs the f32 floor |
 |---|---|---|
@@ -2404,5 +2429,85 @@ window the price touches is **2052**, not 2053; the budget is 2048 and the
 boundary is 2051, and the tool refuses 2048 by name for exactly that reason.
 
 `python3 tools/kld_capture.py ... --dry-run` runs every check and prints the
-command without running it. 14 unit tests, Python 3 stdlib only, no venv, no
+command without running it. 23 unit tests, Python 3 stdlib only, no venv, no
 model, no card.
+
+#### CORRECTION: a capture holds only the SECOND HALF of each window
+
+**The refusal above was checking the wrong range, and the first capture taken
+through it is nearly useless for half the gate.** Found the same day, after the
+tool had already shipped, by reading what `llama-perplexity` writes rather than
+what it evaluates.
+
+It does not record a row per token of the window. It records the **second half
+only**, and says why in its own comment — *"calculate the perplexity over the
+last half of the window (so the model always has some context to predict the
+token)"*. In the source `first = n_ctx/2` and `n_ctx - 1 - first` rows are
+written per chunk, so the recorded 0-based row indices are `n_ctx/2 … n_ctx−2`.
+
+**Confirmed from the artifact, not from the source alone.** The file's layout is
+`"_logits_"` + `n_ctx` + `n_vocab` + `n_chunk` + the token ids, then one row of
+`2·((n_vocab+1)/2)+4` uint16 per recorded token. At `n_vocab` 248,320 that is
+496,648 B a row, and a real `-c 4096 --chunks 2` capture of 2,033,309,700 B
+divides into **exactly 4,094 rows = 2 × (4096 − 1 − 2048)**. A unit test pins
+that arithmetic to those measured figures.
+
+The consequence is the point:
+
+| `--n-ctx` | recorded rows | below 2051 | at/above 2051 |
+|---|---|---|---|
+| 2048 | 1024…2046 | 1023 | **0** |
+| **4096** | 2048…4094 | **3** | 2044 |
+| 2735 (balanced) | 1367…2733 | 684 | 683 |
+
+A 4096 window obviously crosses the boundary, so the old check — *does the
+window cross it* — passed it, and the capture holds three usable rows below the
+boundary. That is a refusal that could not refuse the thing it exists to
+refuse. The check now asks the right question: **do the rows the capture
+CONTAINS land on both sides, with enough on each** (`--min-rows-each-side`,
+default 256), and the refusal names the balanced width.
+
+#### CORRECTION: the `--chunks` floor was billed on the wrong mechanism
+
+The tool refused `--chunks 1` on the grounds that `llama-perplexity` "needs at
+least two windows' worth of tokens". That conflates two requirements: the
+corpus must tokenise to ≥ `2 × n_ctx` tokens **whatever `--chunks` says** (the
+failure a first attempt actually hit), while `--chunks 1` over a long enough
+corpus produces a perfectly good one-window capture. The chunk floor is now 1,
+and the corpus is checked instead — with the one bound that cannot be wrong: a
+token is at least one byte, so `bytes < 2·n_ctx` is impossible and is refused,
+while a merely *likely*-short corpus gets a warning. The tool has no tokenizer
+and does not pretend to.
+
+### The capture, taken (2026-09-13)
+
+**At the balanced width, through the tool**, over the fleet corpus this
+campaign already uses (sha-pinned in the run's manifest):
+
+| | |
+|---|---|
+| reference | upstream master `56b9eb28…`, CPU build |
+| window / chunks | 2735 / 2 |
+| rows per window | 1367 recorded — **684 below** the boundary, **683 at or above** |
+| throughput | 282.91 s per pass; 575.2 s wall including load |
+| capture | 1,357,857,532 B, sha256 `af7993b7…` |
+| PPL | 7.0320 ± 0.42010 |
+
+The size divides into exactly `2 × 1367` rows, which confirms the recorded-range
+model at a **second, different width** — the first confirmation was at 4096.
+
+**The reference is bit-reproducible.** The earlier 4096 capture was taken twice,
+once by a direct invocation and once through the tool, and the two files are
+byte-identical (`c7e3497d…`, same PPL 5.8509). A gate anchored to a
+non-deterministic reference would not be worth much, and this was checked rather
+than assumed.
+
+**PPL is a sanity number, not a quality claim** — nothing has been compared to
+anything. It says the forward is sane.
+
+**Still open: the served half.** There are no served logits, so the comparison
+is not built. When it is, note that `llama-perplexity --kl-divergence` expects
+its own base-file format; arcint's served logits will need converting into it,
+or the comparison written against the capture's format directly. That format is
+now known (it is documented in the correction above), so this is work, not a
+blocker.

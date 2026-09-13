@@ -114,21 +114,17 @@ module emits byte-identical in STRUCTURE to the ones the parity suites gate.
   2026-09-13; the reading is in `tests/python/test_serving_shape.py` beside
   the ports table.
 
-  TWO OF THE THREE ARE EMITTED (2026-09-13): the full-attention layers carry
-  a KV Variable and a ScaledDotProductAttention (`emit_stateful_attention`),
-  and every GDN layer's short conv carries its K-column state in a rank-3
-  Variable (`stateful_short_conv`, through `emit_gdn`'s `conv_emitter` hook).
-  The pass converts both, so `key_cache.N`, `value_cache.N`,
-  `conv_state_table.N`, the five PagedAttention index ports and all four
-  `la.*` ports exist.
-
-  WHAT IS LEFT is `gated_delta_state_table.N`: the rank-4 recurrent state.
-  Its fusion matches an `ov::op::internal::GatedDeltaNet` node -- a single
-  internal op, not the op-by-op recurrence this module emits -- so it is a
-  different kind of job from the other two, which were transcriptions. The
-  contract test carries the gap as a STRICT xfail over the whole port table,
-  so it fails loudly the day the last row closes rather than passing
-  silently while any of them is open.
+  ALL THREE ARE EMITTED (2026-09-13): the full-attention layers carry a KV
+  Variable and a ScaledDotProductAttention (`emit_stateful_attention`); every
+  GDN layer's short conv carries its K-column state in a rank-3 Variable
+  (`stateful_short_conv`); and the GDN recurrence is the token-sequential
+  `v5::Loop` that `FuseGDNLoop` fuses into the op `PagedGatedDeltaNetFusion`
+  matches (`stateful_gdn_core`). Both GDN constructs reach the parity-gated
+  emitter through `emit_gdn` hooks, which default to the unrolled conv and
+  the chunked core, so that module emits no different op when nobody passes
+  them. The pass therefore produces EVERY port in the contract, and the
+  strict xfail that carried the gap RETIRED when the last row of the table
+  flipped -- which is what it was written strict for.
 * The PLE n-gram table is declared as a Constant here so that the gather has
   something to index. In SERVING it is the host-mmap tier, read through
   `src/exec/ngram_table.h` (Link 3) and `src/exec/ngram_gather.h`, never an
@@ -1122,6 +1118,25 @@ def emit_stateful_attention(hidden, pid, config, state, T, layer, beam,
     to the MODEL, not to the layer -- `ov::Model` takes them as a separate
     argument and a layer that dropped one would emit a graph whose state is
     read and never written.
+
+    KNOWN LIMITATION, NAMED BECAUSE NOTHING ELSE NAMES IT: THE ROPE TABLE ONLY
+    SPANS THIS QUERY BLOCK. `qattn._freqs_tables(config, T)` bakes cos/sin for
+    positions 0..T-1 and `_apply_rope` GATHERS them by `position_ids`. Every
+    other part of this layer was built for `past > 0` on purpose -- the causal
+    mask derives `past` from the KV Variable's dynamic length rather than
+    baking it -- but a position at or past T indexes off the end of that
+    table, and OpenVINO's Gather does not throw for an out-of-range index. So
+    the graph is correct for a forward that starts at position 0 and silently
+    wrong for any forward after it.
+
+    It is not fixed here, and the reason is a number: `max_position_embeddings`
+    is 262,144 at real geometry, so a full table is ~67 MB per side per layer
+    and about 1.6 GiB over the 12 full-attention layers -- which walks straight
+    through the residency keystone's 5.12 GiB ceiling. Sizing it (once, shared
+    across layers, from `max_position_embeddings` or an explicit bound) belongs
+    with the increment that makes the query block dynamic, because it is the
+    same static-T root cause. `test_the_rope_table_only_spans_the_query_block`
+    pins it so the day it is fixed the cell reds and this paragraph gets read.
     """
     H = config.hidden_size
     heads = config.num_attention_heads

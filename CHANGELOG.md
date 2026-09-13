@@ -55,8 +55,10 @@ in a deliberate demonstration.
 
 **Not in this release:** the emitted IR still declares `input_ids`,
 `ngram_row_ids` and `conv_mask`, which no serving forward feeds (the forward
-feeds `inputs_embeds`), and its query block is static. Both are gated and
-named, not silent.
+feeds `inputs_embeds`); its query block is static; and the rope table spans
+only that block, so a position past it reads off the end of a `Gather` that
+does not throw — correct for a forward starting at position 0, silently wrong
+after it. All four are gated and named, not silent.
 
 ### WP7 — Flash-Next expert-offload serving policy (windowless)
 

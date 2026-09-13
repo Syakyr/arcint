@@ -39,6 +39,9 @@ ceiling. `tests/python/test_serving_shape.py` goes further for its own
 inventory and does not write the numbers down at all: its ports table derives
 every one of its citations from an anchor at import, and the number of rows is
 never written either -- every count printed about it is a `len()` of the table.
+That rule is scoped to THE SUITE, which is where a recited count can rot
+against a gate. Prose outside it (the CHANGELOG, the design note) does name the
+number, and is dated and revisable in the ordinary way.
 
 LEG 2, RESOLVABILITY. The weak, total one. Every `file:line` in tracked prose
 that resolves unambiguously to a file in this repository must point at a line
@@ -131,7 +134,7 @@ _ANCHORED = [
      "src/core/gguf_repack.cpp", "double repack_bound_steps(int32_t ggml_type)"),
     ("tests/python/test_repack_route.py", "design-gguf-native.md:52",
      "docs/design-gguf-native.md", "uses codebooks and sign tables"),
-    ("tests/python/test_repack_route.py", "serving_shape.py:158",
+    ("tests/python/test_repack_route.py", "serving_shape.py:154",
      "tools/q4e/serving_shape.py",
      "shipped tensor is IQ4_NL, which OpenVINO has no element type for"),
 ]

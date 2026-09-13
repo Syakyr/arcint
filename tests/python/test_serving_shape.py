@@ -64,14 +64,15 @@ none of the three constructs the pass converts, and the pass refused by name at
 `sdpa_to_paged_attention.cpp:75` before it looked at anything else.
 
 WHERE THAT STANDS NOW is the ports table's own `status` column and nothing
-else. The full-attention layers became stateful the same day
-(`q4e.serving_shape.emit_stateful_attention`) and the pass converts them; the
-GDN layers have not, so it produces neither state table nor the `la.*` index
-ports. Read the table, not this paragraph.
+else -- and the paragraph that used to sit here, describing a half-done state,
+is why that sentence is not decoration: it went stale inside the same batch
+that wrote it. All three constructs are emitted, every row of the table reads
+`present`, and the strict xfail retired. Read the table, not this paragraph.
 """
 import math
 import os
 import sys
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -88,6 +89,7 @@ import openvino as ov  # noqa: E402
 from openvino._offline_transformations import (  # noqa: E402
     paged_attention_transformation)
 
+from q4e import attention as qattn  # noqa: E402
 from q4e import piecewise_export as pwe  # noqa: E402
 from q4e import serving_shape as ss  # noqa: E402
 
@@ -809,15 +811,17 @@ def test_the_paged_port_citations_resolve_to_the_code_they_name():
 #                 attention_mask and beam_idx are GONE -- consumed by the pass
 #
 # Two of the eight layers are full-attention (index % 4 == 3), which is why the
-# caches number two. The GDN layers are untouched, so the two state tables and
-# the four la.* ports are still absent -- that is the remaining item, and the
-# table's status column is where it is recorded.
+# caches number two. THAT READING IS DATED: at the time it was taken the GDN
+# layers were untouched and the two state tables and four la.* ports were
+# absent. Both GDN constructs landed later the same day and the table's status
+# column -- not this comment -- is where the current state lives.
 #
-# ONE xfail over all the rows: `test_the_paged_port_contract_is_satisfied` is
-# all-or-nothing, so it retires on the commit that lands the LAST port, not the
-# first -- and the inventory cell reds on any port whose real state stops
-# matching its `status` column, in either direction. A port landing is one edit
-# to that column in the same commit as the port.
+# The xfail over all the rows was all-or-nothing, so it retired on the commit
+# that landed the LAST port rather than the first; see the block above
+# `test_the_paged_port_contract_is_satisfied`. The inventory cell reds on any
+# port whose real state stops matching its `status` column, in either
+# direction, and a port landing is one edit to that column in the same commit
+# as the port.
 
 
 @pytest.fixture(scope="module")
@@ -905,10 +909,19 @@ def test_the_paged_gap_is_inventoried_precisely(paged_census):
           f"paged ops: {paged_census['paged_ops'] or 'none'}")
     if paged_census["refusal"]:
         print(f"[contract-paged] the pass REFUSED: {paged_census['refusal']}")
+    # `served_count` is the multiplicity the SERVED artifact carries, and this
+    # is the one place it earns its column: printed beside what this 8-layer
+    # build produces, so a reader sees the two populations side by side rather
+    # than mistaking one for the other. It is deliberately NOT asserted -- the
+    # served model is a different checkpoint with a different layer count.
     for r in _PAGED_PORTS:
         mark = "yes" if produced[r["port"]] else "no "
         print(f"  {r['port']:28s} table={r['status']:8s} produced={mark} "
+              f"x{paged_census['counts'][r['port']]:<3d} "
+              f"(served x{r['served_count']:<3d}) "
               f"{r['cite']:22s} {r['produced_by']}")
+    print(f"[contract-paged] {len(_PAGED_PRESENT)} row(s) present, "
+          f"{len(_PAGED_ABSENT)} absent")
     wrong = [(r, produced[r["port"]]) for r in _PAGED_PORTS
              if produced[r["port"]] != (r["status"] == PRESENT)]
     assert not wrong, (
@@ -1130,6 +1143,41 @@ def test_the_converted_surface_against_every_tensor_the_forward_feeds(
         f"writes to -- read the list, do not widen it.")
 
 
+def test_the_rope_table_only_spans_the_query_block(built):
+    """A KNOWN LIMITATION, PINNED so it cannot be forgotten rather than
+    asserted because it is desirable.
+
+    `emit_stateful_attention` bakes the rope cos/sin for positions 0..T-1 and
+    gathers them by `position_ids`. Every other part of that layer is built for
+    `past > 0` -- the causal mask derives `past` from the KV Variable's dynamic
+    length -- so the rope is the one place the static query block still leaks
+    into correctness: a position at or past T indexes off the end of the table
+    and OpenVINO's Gather does not throw for that.
+
+    This cell asserts the table's extent IS the query block, which is the
+    current state and not the desired one. The day it is sized from
+    `max_position_embeddings` (~1.6 GiB over the 12 full-attention layers at
+    real geometry, which is why it was not done in the increment that found
+    it), this cell fails and the limitation gets promoted instead of forgotten
+    -- the same mechanic the ports table's strict xfail used.
+    """
+    cfg = pwe.real_config()
+    cos, sin = qattn._freqs_tables(cfg, _T)
+    print(f"\n[contract-rope] cos/sin tables {cos.shape} for a query block of "
+          f"{_T}; max_position_embeddings is {cfg.max_position_embeddings}")
+    assert cos.shape[0] == _T and sin.shape[0] == _T, (
+        f"the rope tables now span {cos.shape[0]} positions, not the query "
+        f"block's {_T}. If they were sized from max_position_embeddings "
+        f"({cfg.max_position_embeddings}) the limitation this cell pins is "
+        f"GONE -- delete the cell, delete the paragraph in "
+        f"emit_stateful_attention's docstring, and re-derive the residency "
+        f"keystone, which this change moves.")
+    assert cos.shape[0] < cfg.max_position_embeddings, (
+        "the query block reaches max_position_embeddings, so there is nothing "
+        "left for a position to run off the end of -- the limitation is gone "
+        "for this configuration and the cell no longer means anything.")
+
+
 def test_the_transformation_consumes_attention_mask_and_beam_idx(paged_census):
     """Both are declared so the pass can find them by name, and NEITHER
     survives it -- the served artifact's transformed input list has neither.
@@ -1302,14 +1350,29 @@ finally:
     with tempfile.TemporaryFile("w+") as out, tempfile.TemporaryFile("w+") as err:
         proc = subprocess.Popen([sys.executable, "-c", src],
                                 stdout=out, stderr=err)
-        _, status, usage = os.wait4(proc.pid, 0)
+        # `subprocess.run(..., timeout=1800)` carried a watchdog and `os.wait4`
+        # does not -- it blocks forever. Without this, a hung 48-layer build
+        # hangs the suite instead of failing it, which is a worse outcome than
+        # the measurement gap the wait4 conversion closed. A timer thread that
+        # kills the child is the smallest thing that keeps both.
+        killer = threading.Timer(1800.0, proc.kill)
+        killer.daemon = True
+        killer.start()
+        try:
+            _, status, usage = os.wait4(proc.pid, 0)
+        finally:
+            killer.cancel()
         proc.returncode = status                 # Popen must not wait() again
         out.seek(0), err.seek(0)
         stdout, stderr = out.read(), err.read()
     line = [l for l in stdout.splitlines() if l.startswith("REPORT ")]
     assert line, (
         "the keystone child produced no report.\n"
-        f"status={status}\nstdout tail:\n{stdout[-2000:]}\n"
+        # `os.wait4` hands back a raw wait status, not an exit code: a child
+        # that exited 1 reports 256 here. A reader debugging this message
+        # should see the number they would have seen from `subprocess.run`.
+        f"exit={os.waitstatus_to_exitcode(status)} (raw wait status "
+        f"{status})\nstdout tail:\n{stdout[-2000:]}\n"
         f"stderr tail:\n{stderr[-2000:]}")
     report = json.loads(line[-1][len("REPORT "):])
     # The kernel's accounting for the child, after it exited: the whole run.
@@ -1332,10 +1395,14 @@ def test_the_full_48_layer_stack_emits_at_real_geometry():
     experts slot-referenced, PLE table declared and never materialised.
 
     AND ITS RESIDENCY, which until CF-RESIDENT nothing measured. The headline
-    is "183 GiB declared, built on a 48 GiB host"; the two assertions that
-    carried it (`declared > 8 GiB`, `disk_kib <= 64`) are both INVARIANT to a
-    module dropping out of `_C_MODULES`, because a copied constant lives in
-    anonymous memory and never touches the arena file. The reviewer dropped
+    is "183 GiB declared, built on a 48 GiB host". This paragraph used to name
+    "the two assertions that carried it (`declared > 8 GiB`, `disk_kib <= 64`)"
+    -- there is only ONE: `arena_declared_bytes` is PRINTED and never asserted,
+    so the declared-bytes half of the headline has no gate behind it at all and
+    the docstring was crediting it with one. What is true of `disk_kib <= 64`
+    is what the paragraph was reaching for: it is INVARIANT to a module
+    dropping out of `_C_MODULES`, because a copied constant lives in anonymous
+    memory and never touches the arena file. The reviewer dropped
     `qattn` and every quantity this cell observed stayed bit-identical while
     peak RSS doubled. `peak_rss_gib` is the quantity that moves.
     """

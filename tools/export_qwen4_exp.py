@@ -356,6 +356,15 @@ def build_backbone_ir(out_dir, geometry, shards, seq_len=64, tiny=False):
         # on disk, 4.52 GiB peak RSS. The 2026-09-12 reading above is kept as
         # it was taken.
         #
+        # RE-MEASURED AGAIN the same day, and this is what `--serving-shape`
+        # prints TODAY: 16,766 nodes, 4.24 GiB peak RSS, the same 183.07 GiB
+        # declared and the same 0 KiB on disk. The GDN core became a
+        # token-sequential v5::Loop, which collapses 36 layers of unrolled
+        # chunked delta rule; `get_ordered_ops` does not descend into a Loop
+        # body. Both earlier readings are kept as they were taken -- they were
+        # each true of their own tree, and this block is read BEFORE anyone
+        # runs the verification, so a stale headline here misleads first.
+        #
         # Run `--serving-shape` for that verification. The superseded text is
         # kept below rather than edited away, per the 5d5d6ae precedent.
         raise NotImplementedError(
