@@ -11,11 +11,11 @@ stage so that the first stage to refuse names itself.
 
     stage   what runs                                   transcribed from
     build   build_serving_shape_ir(n_layers, seq_len)   (the IR under test)
-    protos  state prototypes read off the STATEFUL       backend_ov.cpp:2557-2569
+    protos  state prototypes read off the STATEFUL       backend_ov.cpp:2565-2577
             graph's Variables (rank 3 -> conv table,
             rank 4 with a static tail -> GDN table)
-    pass    ov::pass::SDPAToPagedAttention               backend_ov.cpp:2574
-    compile compile_model(device, KV_CACHE_PRECISION)    backend_ov.cpp:2711, :2965
+    pass    ov::pass::SDPAToPagedAttention               backend_ov.cpp:2582
+    compile compile_model(device, KV_CACHE_PRECISION)    backend_ov.cpp:2719, :2965
     request one InferRequest; f16 state rows bound       :3019, alloc_la_rows
             per la port; KV pools per key/value port     alloc_kv_pools
     forward inputs_embeds, position_ids, then the nine   :6141-6151
@@ -54,8 +54,8 @@ import numpy as np
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "tools"))
 
-KV_BLOCK_TOKENS = 16          # backend_ov.cpp:7661 kv_block_tokens_
-ROWS_PER_LANE = 3             # backend_ov.cpp:2629 drafts_max_ + 3, MTP off
+KV_BLOCK_TOKENS = 16          # backend_ov.cpp:7674 kv_block_tokens_
+ROWS_PER_LANE = 3             # backend_ov.cpp:2637 drafts_max_ + 3, MTP off
 PAGED_KV_DEFAULT = "u8"       # config.h:175
 
 
@@ -172,7 +172,7 @@ def main(argv=None):
                  f"port(s) under cap {rep['ngram_chunk_cap_bytes']:,}: "
                  + ", ".join(f"{n}[{r:,}]={b:,}B" for n, r, b in rep["ngram_table_ports"]))
 
-    # ---- protos (backend_ov.cpp:2557-2569) -----------------------------------
+    # ---- protos (backend_ov.cpp:2565-2577) -----------------------------------
     conv_proto, gdn_proto = [], []
     for var in model.get_variables():
         ps = var.get_info().data_shape
@@ -187,7 +187,7 @@ def main(argv=None):
                   f"gdn={gdn_proto[:1]}x{len(gdn_proto)} "
                   f"variables={len(model.get_variables())} sinks={len(model.get_sinks())}")
 
-    # ---- pass (backend_ov.cpp:2574) ------------------------------------------
+    # ---- pass (backend_ov.cpp:2582) ------------------------------------------
     if not args.no_pass:
         from openvino._offline_transformations import (
             paged_attention_transformation as pat)
@@ -439,7 +439,7 @@ def main(argv=None):
             else:
                 say("forward", f"{name}: not declared by the compiled model")
     else:
-        # THE SERVED PATH, in the C++'s own order (backend_ov.cpp:6141-6151).
+        # THE SERVED PATH, in the C++'s own order (backend_ov.cpp:6153-6163).
         # the served C++ feeds position_ids at the port's own rank: the
         # mrope artifact's [sections, n]; this IR's post-pass [n]
         past, tot = 0, n

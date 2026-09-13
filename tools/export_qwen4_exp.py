@@ -413,7 +413,7 @@ def build_backbone_ir(out_dir, geometry, shards, seq_len=64, tiny=False):
             "compress_to_fp16)` is the only entry point this OpenVINO build's "
             "Python API offers and it writes the whole .bin -- 183 GiB against "
             "27 GiB free on the dev host. The weightless form the load path can "
-            "consume (backend_ov.cpp:552-556, 'a weightless IR "
+            "consume (backend_ov.cpp:553-557, 'a weightless IR "
             "(ov::weights_path) still carries every constant's shape and "
             "element type in the XML') has no Python entry point here. The "
             "shape round-trips through save/read at reduced geometry; the "
@@ -425,7 +425,7 @@ def build_backbone_ir(out_dir, geometry, shards, seq_len=64, tiny=False):
             "      (c) THE PAGED PORT CONTRACT. The served forward feeds 13 "
             "ports this IR does not declare (conv_state_table.N, "
             "gated_delta_state_table.N, key_cache.N, value_cache.N, la.* -- "
-            "backend_ov.cpp:3191-3199 and :6141-6151). "
+            "backend_ov.cpp:3199-3207 and :6141-6151). "
             "tests/python/test_serving_shape.py carries that gap as a STRICT "
             "xfail with each port's feed site, so it fails loudly the day it "
             "closes.\n"
@@ -569,12 +569,12 @@ def verify_serving_shape(n_layers=None):
               f"port(s) under {rep['ngram_chunk_cap_bytes']:,} B each "
               f"(not a constant; bound from host memory per request)")
         sp = ss.slot_pool_from_ir(model, cfg.num_experts, 0)
-        print(f"  slot_pool_from_ir (backend_ov.cpp:577) -> {sp}")
+        print(f"  slot_pool_from_ir (backend_ov.cpp:578) -> {sp}")
         if sp is None:
             print("    nullopt: no op type contains 'moe'. The MoE fusion is a "
                   "GPU-plugin COMPILE-time pass and this walk runs on "
                   "read_model, so the config.json fallback at "
-                  "backend_ov.cpp:3746+ is what prices the host ledger. "
+                  "backend_ov.cpp:3757+ is what prices the host ledger. "
                   "0 of 172 IRs in the dev host's model store carry a "
                   "moe-typed op either (census 2026-09-12; 52 of those 172 "
                   "are over 100k, which was the narrower population 198b736 "

@@ -17,7 +17,7 @@ TWO KINDS OF CELL, and the distinction is the point:
 WHAT THIS FILE FOUND, on its first run (2026-09-12), and it is a finding about
 the C++ and not about the export:
 
-`slot_pool_from_ir` (backend_ov.cpp:577-623) identifies a MoE layer by
+`slot_pool_from_ir` (backend_ov.cpp:578-624) identifies a MoE layer by
     std::string tname = node->get_type_name();  ... tolower ...
     if (tname.find("moe") == std::string::npos) continue;      // :585
 NO ARCINT-EXPORTED IR CARRIES AN OP WHOSE TYPE NAME CONTAINS "moe". Measured
@@ -38,7 +38,7 @@ because the fusion (`ConvertTiledMoeBlockToGatherMatmuls`) is a GPU-PLUGIN
 COMPILE-TIME pass and `slot_pool_from_ir` runs on `read_model`, before it.
 
 So the analytic IR route returns nullopt on every artifact this fleet serves,
-and the `else` branch at backend_ov.cpp:3746+ (3 x hidden x moe_intermediate x
+and the `else` branch at backend_ov.cpp:3757+ (3 x hidden x moe_intermediate x
 bytes-per-weight per expert, from config.json) is what has always run. This is
 not a defect the serving-shape IR introduces and it is not one it can fix from
 the export side: an exporter cannot give a node a different OpenVINO type name.
@@ -54,7 +54,7 @@ WHAT THIS FILE FOUND SECOND (2026-09-13), and it is a correction TO THIS FILE:
 
 the paged serving ports are not something an exporter emits. `load_paged` runs
 `ov::pass::SDPAToPagedAttention` over the artifact it just read, before it
-compiles (backend_ov.cpp:2574), and every one of the ports in the table below
+compiles (backend_ov.cpp:2582), and every one of the ports in the table below
 is that pass's output -- measured both ways, on the real served artifact and on
 this emitter's own, in the block above `paged_census`. The cells here used to
 check the emitter's parameter list against the table and call the gap "NOT
@@ -83,7 +83,7 @@ sys.path.insert(0, str(REPO_ROOT / "tools"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import openvino as ov  # noqa: E402
-# THE pass `load_paged` runs before it compiles (backend_ov.cpp:2574 registers
+# THE pass `load_paged` runs before it compiles (backend_ov.cpp:2582 registers
 # `ov::pass::SDPAToPagedAttention`); this is its Python entry point, and the
 # cells below run it rather than describing what it would do.
 from openvino._offline_transformations import (  # noqa: E402
@@ -392,7 +392,7 @@ def test_the_input_ports_are_the_names_and_shapes_the_serving_path_feeds(built):
     `HashParams::num_ngram_heads() = (ngram_size - 1) * heads_per_ngram`
     (src/exec/ngram_row_ids.h:59), which the same file's header states at :21
     as "16 on Qwen3.8: 8 x 2-gram + 8 x 3-gram", and each head gathers one
-    160-wide row (:22). `position_ids` is the name backend_ov.cpp:98 declares
+    160-wide row (:22). `position_ids` is the name backend_ov.cpp:99 declares
     (`kPositionIds`). `conv_mask` is the port q4e.backbone already declares
     (backbone.py:105-106).
     """
@@ -406,7 +406,7 @@ def test_the_input_ports_are_the_names_and_shapes_the_serving_path_feeds(built):
     # -1 is a dynamic dimension (`_dims`): since feed-the-ports the graph is
     # dynamic in T, every per-token port with it.
     want = {
-        # the served forward feeds this name (backend_ov.cpp:6141), embedded on
+        # the served forward feeds this name (backend_ov.cpp:6153), embedded on
         # the host; the embedding weight left the graph with it
         "inputs_embeds": ((1, -1, cfg.hidden_size), "float32"),
         "position_ids":  ((1, -1), "int64_t"),
@@ -463,7 +463,7 @@ def test_the_layer_kinds_follow_the_checkpoint_not_a_convenience(built):
 
 def _expert_constants(model, num_expert):
     """Every Constant whose leading dimension is the expert count -- the same
-    selector backend_ov.cpp:600 uses, applied without the type-name gate."""
+    selector backend_ov.cpp:601 uses, applied without the type-name gate."""
     out = []
     for node in model.get_ordered_ops():
         if node.get_type_name() != "Constant":
@@ -587,7 +587,7 @@ def slot_pool_from_tiled_ir(model, num_expert, ratio_pct):
     exports instead of a type name: the Constants with leading dim
     `num_expert` that feed a dequant chain, grouped per MoE layer.
 
-    Same per-expert arithmetic as backend_ov.cpp:600-604 (product of dims[1:]
+    Same per-expert arithmetic as backend_ov.cpp:601-605 (product of dims[1:]
     times the CEILED element size) and the same slot ceiling as fit.h:95.
     """
     per_layer = {}
@@ -623,7 +623,7 @@ def slot_pool_from_tiled_ir(model, num_expert, ratio_pct):
 def test_the_cpp_type_name_matcher_finds_nothing_and_the_line_is_named(built):
     """THE HANDSHAKE FAILURE, named exactly.
 
-    `slot_pool_from_ir`'s gate is backend_ov.cpp:585
+    `slot_pool_from_ir`'s gate is backend_ov.cpp:586
 
         if (tname.find("moe") == std::string::npos) continue;
 
@@ -658,8 +658,8 @@ def test_the_cpp_type_name_matcher_finds_nothing_and_the_line_is_named(built):
     is worth exactly what the nullopt path costs -- which is nothing:
 
     Asserted, not lamented: the analytic route is nullopt here, so
-    backend_ov.cpp:3746+ config.json fallback is what prices the host ledger.
-    THAT LEDGER LINE IS INFORMATIONAL. backend_ov.cpp:3729-3734 says so in the
+    backend_ov.cpp:3757+ config.json fallback is what prices the host ledger.
+    THAT LEDGER LINE IS INFORMATIONAL. backend_ov.cpp:3740-3745 says so in the
     source -- "Host-side ledger (GTT): informational, never charged against the
     device budget" -- and the device term is priced by the plateau probe
     (:3631+), with the analytic figure used only if the probe throws. Nothing
@@ -673,7 +673,7 @@ def test_the_cpp_type_name_matcher_finds_nothing_and_the_line_is_named(built):
     typed = sorted({n.get_type_name() for n in model.get_ordered_ops()
                     if "moe" in n.get_type_name().lower()})
     print(f"\n[contract-otd] moe-typed ops in the serving-shape IR: {typed}")
-    print(f"[contract-otd] slot_pool_from_ir(backend_ov.cpp:577) -> {got}")
+    print(f"[contract-otd] slot_pool_from_ir(backend_ov.cpp:578) -> {got}")
     print(f"[contract-otd] dev-host model store, 2026-09-12: "
           f"{FLEET_IRS_WITH_MOE_TYPED_OP} of {FLEET_IRS_ALL} IRs carry one "
           f"({FLEET_IRS_SIZE_FILTERED} of them over 100k)")
@@ -697,7 +697,7 @@ def test_the_pattern_matcher_prices_the_expert_pool_and_lands_on_the_cpp_constan
     gate+up+down at real geometry = 2*(640*2560) + 2560*640 = 4,915,200 int4
     values = 2,457,600 bytes. The IR walk cannot reproduce that figure, and the
     reason is structural rather than a bug in either side:
-    backend_ov.cpp:604 uses `element_type().size()`, which CEILS a 4-bit width
+    backend_ov.cpp:605 uses `element_type().size()`, which CEILS a 4-bit width
     to one whole byte -- so it reads 4,915,200 B per expert, EXACTLY 2x. The
     C++ comment at :610-615 anticipates over-reservation ("this over-reserves
     rather than under-reserves, pending an on-card audit"); this cell measures
@@ -757,7 +757,7 @@ def test_the_serving_shape_survives_save_and_read_back(tmp_path):
     host, so the full-geometry model is validated as a live ov::Model (which is
     OpenVINO's own shape inference accepting every op as it is built) and NOT
     round-tripped. A weightless / `ov::weights_path` write -- the form
-    backend_ov.cpp:552-556 says the load path can consume -- has no Python
+    backend_ov.cpp:553-557 says the load path can consume -- has no Python
     entry point here; that is recorded as blocked, with the reason, rather than
     claimed.
 
@@ -985,7 +985,7 @@ def test_the_paged_port_citations_resolve_to_the_code_they_name():
 # answer: there is no non-paged forward to boot into.
 #
 #   * the backend compiles the served IR as `paged_model_`
-#     (backend_ov.cpp:2965) and every lane's request comes from it (:3019);
+#     (backend_ov.cpp:2973) and every lane's request comes from it (:3019);
 #   * the forward at :6141-6151 sets the table's nine "feed" rows
 #     UNCONDITIONALLY -- `set_tensor` calls with no branch, which is what those
 #     rows' citations resolve to;
@@ -1010,7 +1010,7 @@ def test_the_paged_port_citations_resolve_to_the_code_they_name():
 # whole item's work at hand-declaring a list of parameters.
 #
 # `load_paged` reads the artifact and then runs a pass over it before compiling
-# (backend_ov.cpp:2574, `ov::pass::SDPAToPagedAttention`). EVERY PORT IN THE
+# (backend_ov.cpp:2582, `ov::pass::SDPAToPagedAttention`). EVERY PORT IN THE
 # TABLE IS THAT PASS'S OUTPUT. Measured on the real served artifact, dev host,
 # 2026-09-13, OV 2026.4.0-22849 -- `read_model`, then the same transformation,
 # device-free, no compile and no card:
@@ -1092,7 +1092,7 @@ def paged_census():
         model, _ = ss.build_serving_shape_ir(arena=arena, n_layers=_CONTRACT_LAYERS)
         before = {p.get_node().get_friendly_name() for p in model.inputs}
         # The variables AS THE LOAD PATH SEES THEM: read off the stateful graph
-        # before the pass runs, which is what backend_ov.cpp:2557-2569 does and
+        # before the pass runs, which is what backend_ov.cpp:2565-2577 does and
         # for the same reason -- the transformed ports leave these dims dynamic.
         variables = []
         for var in model.get_variables():
@@ -1198,7 +1198,7 @@ def test_the_paged_gap_is_inventoried_precisely(paged_census):
 def test_the_kv_variables_are_the_shape_the_load_path_reads_prototypes_from(
         paged_census):
     """`load_paged` reads its KV/state prototypes off the STATEFUL graph
-    (backend_ov.cpp:2557-2569): rank 4, leading dim replaced by 1, the tail
+    (backend_ov.cpp:2565-2577): rank 4, leading dim replaced by 1, the tail
     static, the sequence dim NOT static -- that is the test it applies
     (`tail_static` over dims 1.. , and the attention KV is the case it excludes
     with "attention KV: dynamic seq dim"). Two variables per full-attention
@@ -1290,7 +1290,7 @@ def test_the_recurrent_state_is_one_table_per_gdn_layer_at_the_head_geometry(
     This is the shape `matches_linear_attention_loop` binds as
     `[?, head_num, k_head_size, v_head_size]` inside the Loop body, and the
     shape `load_paged` takes as a rank-4 prototype with a static tail
-    (backend_ov.cpp:2557-2569). The attention KV Variables are rank 4 too and
+    (backend_ov.cpp:2565-2577). The attention KV Variables are rank 4 too and
     are NOT prototypes there -- their sequence dim is dynamic, which is the
     exclusion that same code writes as "attention KV: dynamic seq dim" -- so
     this cell checks that separation holds on the emitted graph rather than

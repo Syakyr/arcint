@@ -579,7 +579,7 @@ Q4E_GPU= <venv>/bin/python boot.py <layers> <device> <T>
   written because it is what the window recorded.** (a) "not emitted" named
   the wrong side: no exporter emits those ports on any artifact this fleet
   serves. `load_paged` runs `ov::pass::SDPAToPagedAttention` over the IR it
-  has just read (`backend_ov.cpp:2574`) and the ports are that pass's output,
+  has just read (`backend_ov.cpp:2582`) and the ports are that pass's output,
   produced from three constructs of the *stateful* graph. (b) The count is no
   longer a fixed 13 to recite: the suite's `_PAGED_PORT_TABLE` carries one row
   per port with its status, both cells read that table, and the number of rows
@@ -863,7 +863,7 @@ item 1 uses ("1-layer boot, then depth / 4 GiB chunking").
 | the PLE n-gram table, ONE object | 25,600,122,880 B = 320,001,536 × 160 nibbles, enters at layer index 1 | `RUN@be57428` §4.4 |
 | first full-attention layer | index 3 (`kind = "attn" if i % 4 == 3`), so the first SDPA exists at **depth 4** | `serving_shape.build_serving_shape_ir` |
 | what the pass demands | a stateful graph AND at least one `v13::ScaledDotProductAttention`; each absence is an `OPENVINO_ASSERT` by name | pinned OV source `71640275`, `src/core/src/pass/sdpa_to_paged_attention.cpp`, `run_on_model` |
-| what the served forward feeds first | `inputs_embeds`, unconditionally (`backend_ov.cpp:6141`); the IR declares `input_ids` | contract cell `test_the_converted_surface_against_every_tensor_the_forward_feeds` |
+| what the served forward feeds first | `inputs_embeds`, unconditionally (`backend_ov.cpp:6153`); the IR declares `input_ids` | contract cell `test_the_converted_surface_against_every_tensor_the_forward_feeds` |
 | 1-layer boot, pre-stateful graph | compiles + infers on both cards, `absmax = 0.0000e+00` | `RUN@be57428` §4.4 |
 
 ### The prediction — read the two constraints together
@@ -1301,7 +1301,7 @@ increment changed before any card was touched, each with its device-free gate:
   conv concat and threw once the length went dynamic). Every parity suite is
   green under the same emitters — the change is structure-only there.
 - **`inputs_embeds` is the port** the served forward feeds
-  (backend_ov.cpp:6141), embedded on the host; the embedding weight left the
+  (backend_ov.cpp:6153), embedded on the host; the embedding weight left the
   graph. The served feed order is accepted end to end now.
 - **one rope table pair for the full context**, `rope/cos` and `rope/sin`,
   `[262144, rotary]`, shared by every full-attention layer; the cell that
@@ -1345,7 +1345,71 @@ The KLD gate does not read them (served path only).
 
 **Not predicted**: every timing, the host peak, the fill's wall time.
 
-### Measured — `UNTESTED`, filled by the measurement commit
+### Measured, run 1 — `RUN@b88f275` on the A770 and B60, 2026-09-13 11:05Z — RETRACTED on the PLE rows
+
+The ladder ran on the prediction commit's tree with `--shards /flash-model`.
+**It hashed the n-gram rows with the wrong constants**: the driver passed the
+PLE ordinal the parity cells use on both of their sides (1), and the
+reference derives a PLE layer's constants from its ordinal among the PLE
+layers (`modeling_qwen4_exp.py:1268`, `ple_layer_ids.index(layer_idx + 1)`),
+which for the real model's one PLE layer is **0** — as the served loader
+already derives it. So run 1's PLE gathered real rows of a wrong hash. Its
+logits are real-weight logits of a graph with one wrong input, kept here as
+the first reading and superseded by run 2 below; everything that does not
+depend on the PLE rows stands.
+
+| # | card | measured (run 1) | prediction |
+|---|---|---|---|
+| R1 | A770 | dense fill **95 tensors, 3.64 GiB written**; expert fill 12 bodies, 4 layers, 5,387,059,200 B; arena written 5.02 GiB; build **410 s** | **yes** (95 exactly) |
+| R2 | A770 | compile OK 12.95 s, `prec=float16`, resident 6.79 GiB; peak host 27.67 GiB (the fill's dequant temporaries, before the table) | **yes** |
+| R3 | A770 | seven chunks copied from the shard's memmap in 3.6 / 3.6 / 3.5 / 4.3 / 3.7 / 3.5 / 2.6 s, 28.33 s in all; `usm_host` 26.83 GiB, `usm_device` unchanged; host during the forward: 21 GiB used, 26 available — no OOM | **yes** |
+| R4 | A770 | `INFER OK 7.268s out(1, 5, 248320) finite=True absmax=1.0346e+01`; second forward 0.035 s | **yes** (finite, non-zero) — with the wrong PLE rows |
+| R5 | A770 | argmax per position `[2042, 65606, 2972, 18230, 220]`; last position top 5: `220='Ġ':5.614, 98390='å´ĩ':5.357, 115899='ä¸ĢåŃĹ':5.188, 55072='_subplot':5.062, 59126='ĠFeet':5.060` — a space, not Paris | as written: not Paris, not predicted |
+| R6 | A770 | 1-token block `INFER OK 0.127s out(1, 1, 248320) finite=True` | **yes** |
+| R7 | A770 | `--long 1600`: `INFER OK 17.829s out(1, 1600, 248320) finite=True absmax=1.8620e+01` | **yes** |
+| R8 | B60 | build 433.78 s (the same 95 tensors, 12 bodies); compile 9.58 s, resident 6.79 GiB; table bound in 49.28 s (chunks 5 and 6 at 15.2 / 7.9 s: the shard pages were being evicted under the 28.78 GiB host peak); `INFER OK 8.701s`, the SAME argmax `[2042, 65606, 2972, 18230, 220]`, last-position top 5 `220='Ġ':5.588, 98390:5.314, 115899:5.163, 59126:5.071, 55072:5.052` (the A770's within f16 noise, two of the five swapped in order at the third decimal); 1-token block OK 0.049 s; `--long 2100` `INFER OK 24.127s out(1, 2100, 248320) finite=True absmax=1.8514e+01` past the 2051 boundary | **yes** — the cards agree |
+
+### Measured, run 2 — `RUN@2413cab` (tree `3e50948c…`), 2026-09-13 11:24–11:42Z, both cards — THE MEASUREMENT
+
+The same ladder with the hash ordinal derived from the config
+(`q4e.ngram_ids.ple_ordinal` → 0). The row ids moved (min 7,226,134, max
+316,425,755 against run 1's 4,023,550 / 317,350,792), the logits moved with
+them, and both cards agree at the last position to the third decimal.
+
+| # | card | measured (run 2) | prediction |
+|---|---|---|---|
+| R1 | both | dense fill 95 tensors, 3.64 GiB; expert fill 12 bodies; build 431.35 s (A770 leg) / 418.26 s (B60 leg) | **yes** |
+| R2 | A770 / B60 | compile OK 10.15 s / 6.57 s, resident 6.79 GiB | **yes** |
+| R3 | A770 / B60 | table bound in 33.03 s / 29.49 s, 26.82 GiB USM host, `usm_device` unchanged; peak host 27.67 GiB; no OOM | **yes** |
+| R4 | A770 | **`INFER OK 10.383s out(1, 5, 248320) finite=True absmax=9.1495e+00`**; second forward 0.035 s | **yes** |
+| R4 | B60 | `INFER OK 6.750s … finite=True absmax=9.1205e+00`; second 0.027 s | **yes** |
+| R5 | A770 | argmax per position `[3181, 14160, 6387, 18230, 5613]`; last position top 5: **`5613='ramework':3.586`**, `67416='SetName':3.548`, `215412='antul':3.541`, `37124='ĠsetIs':3.522`, `55541='ambre':3.512` | not Paris, as written; a token with a face and no meaning |
+| R5 | B60 | argmax `[53108, 14160, 6387, 18230, 5613]` — position 0 differs (near-tied logits under f16), positions 1–4 identical; last position `5613='ramework':3.573, 67416:3.557, 215412:3.537, 37124:3.529, 55541:3.506` | the cards agree where the margin exists |
+| R6 | A770 / B60 | 1-token block `INFER OK` 0.103 s / 0.054 s, `(1, 1, 248320)`, finite | **yes** |
+| R7 | A770 | `--long 1600`: `INFER OK 17.194s out(1, 1600, 248320) finite=True absmax=1.8889e+01` | **yes** |
+| R7 | B60 | `--long 2100`: `INFER OK 28.597s out(1, 2100, 248320) finite=True absmax=1.8888e+01`, past the 2051 boundary, rope positions to 2,099 | **yes** |
+| R8 | B60 | as above | **yes** |
+
+**What this is.** The first real-weight logits of the serving-shape IR on
+the served path's own compiled graph, on both cards, with every port fed:
+the served feed order end to end, the driver's id and mask feeds labelled as
+its own, the real table bound from the shard's bytes. Every row of the
+prediction held except the one the prediction could not make (R5), and the
+long-block row it had already had to rewrite.
+
+**What it is not.** Forty-four layers are missing. `ramework` is the argmax
+of a four-layer prefix of a forty-eight-layer model and says nothing about
+Paris. The KLD gate does not read these logits (served path only; the
+served path for THIS IR is the runtime's binding site, which compiles and
+passes its cells and has not run on a card — no artifact directory for the
+IR exists yet).
+
+**Host cost, first readings.** The fill's build is 7 minutes (gguf-py
+dequantisation of 95 dense tensors and the u4 packing of 12 expert bodies);
+the peak host is 27.67 GiB before the table and the table adds 26.82 GiB of
+pinned USM host; the container's 48 GiB held with the shard pages evicting
+under it (run 1's B60 leg paid 15.2 s and 7.9 s for two chunk copies for
+exactly that reason).
 
 ## 5. Residency — the SIZE LEDGER, and the number that decides the window
 
@@ -1600,12 +1664,18 @@ baseline probe from a different model either.
 | "What is the capital of France? Answer in one word." | serving-shape IR, `RUN@8a84598`, 2026-09-13 | **no forward reached on either card** — depths 1–3: the pass refuses (`No ScaledDotProductAttention operation observed in the graph`); depth 4 (and 2): `engine.cpp:319`, `requested 25600122880 bytes` against `4294959104` (A770) / `24385683456` (B60). §4.6 | 0 | — |
 | "The capital of France is" (ids `760,6511,314,9338,369`) | serving-shape IR at depth 4, `RUN@806b76f`, 2026-09-13 09:38–09:46Z, A770 then B60 | **served path: refused at `set_tensor(inputs_embeds)` — `Port for tensor name inputs_embeds was not found`** (the IR declares `input_ids`). **Labelled probe** (input_ids fed in its place, nothing else): `INFER OK`, logits `(1, 5, 248320)`, finite, `absmax 0.0000e+00`, greedy token id **`0`** on both cards — zero weights, a structure witness and not an answer. §4.7 | 1 (probe) | — |
 
+| "The capital of France is" (ids `760,6511,314,9338,369`) | serving-shape IR at depth 4, **REAL weights** (Q3_K_XL shards; dense fill 95 tensors, 12 expert bodies, the IQ4_NL table bound as 7 ports), `RUN@2413cab`, 2026-09-13 11:24–11:42Z, A770 then B60 | served feed order accepted end to end; logits `(1, 5, 248320)`, finite, absmax 9.1495 (A770) / 9.1205 (B60); **greedy token id `5613` = `ramework`** on both cards (3.586 / 3.573) — the argmax of a four-of-forty-eight-layer prefix, not an answer. §4.8 | 1 | — |
+
 §4.6 predicted the first row before its window ran (P4) and the window wrote
 it as predicted. §4.7 predicted the second row's served-path signature (B4)
 and its probe token (B5) before its window ran, and the window wrote both.
-The row stays the coherence line for the first window that reaches a forward
-on REAL weights; that window replaces the token `0` with the model's, dated,
-in the same commit as its measurement.
+§4.8 predicted the third row's shape — finite, non-zero, not Paris, not
+predicted — before its window ran, and the window wrote it (the first run
+of that window, with the parity cells' hash ordinal, is retracted in §4.8
+and its token `Ġ` is not this line's). **Paris is not dated.** The row
+stays the coherence line for the first window that runs the FULL model;
+that window replaces `ramework` with the model's own token, dated, in the
+same commit as its measurement.
 
 (For contrast and NOT as a substitute: the pre-window baseline of the *resident
 agent* — a different model, `qwen3.8-agent` on :8087 — answered `Paris` in 27

@@ -94,17 +94,17 @@ _FOREIGN_CITATION_FILES = {
 # with a test around it.
 _ANCHORED = [
     # -- the OTD / expert-slot handshake, both sides ------------------------
-    ("tools/q4e/serving_shape.py", "backend_ov.cpp:577",
+    ("tools/q4e/serving_shape.py", "backend_ov.cpp:578",
      "src/exec/backend_ov.cpp", "std::optional<SlotPoolIr> slot_pool_from_ir"),
-    ("tools/q4e/serving_shape.py", "backend_ov.cpp:566-569",
+    ("tools/q4e/serving_shape.py", "backend_ov.cpp:567-570",
      "src/exec/backend_ov.cpp", "this function never guesses"),
-    ("tests/python/test_serving_shape.py", "backend_ov.cpp:585",
+    ("tests/python/test_serving_shape.py", "backend_ov.cpp:586",
      "src/exec/backend_ov.cpp",
      'if (tname.find("moe") == std::string::npos) continue;'),
-    ("tests/python/test_serving_shape.py", "backend_ov.cpp:604",
+    ("tests/python/test_serving_shape.py", "backend_ov.cpp:605",
      "src/exec/backend_ov.cpp",
      "per_expert_bytes += elems * konst->get_element_type().size();"),
-    ("tools/q4e/serving_shape.py", "backend_ov.cpp:600-604",
+    ("tools/q4e/serving_shape.py", "backend_ov.cpp:601-605",
      "src/exec/backend_ov.cpp",
      "per_expert_bytes += elems * konst->get_element_type().size();"),
     # -- the constants the residency arithmetic is checked against ----------
@@ -117,7 +117,7 @@ _ANCHORED = [
     ("tools/q4e/serving_shape.py", "src/exec/fit.h:95",
      "src/exec/fit.h", "inline uint64_t expert_slot_bytes("),
     # -- the port names the serving path declares and feeds -----------------
-    ("tests/python/test_serving_shape.py", "backend_ov.cpp:98",
+    ("tests/python/test_serving_shape.py", "backend_ov.cpp:99",
      "src/exec/backend_ov.cpp", 'kPositionIds   = "position_ids"'),
     ("tests/python/test_serving_shape.py", "src/exec/ngram_row_ids.h:59",
      "src/exec/ngram_row_ids.h", "int num_ngram_heads() const"),

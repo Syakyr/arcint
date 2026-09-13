@@ -20,7 +20,7 @@ same graph with the weights carried the way the served runtime carries them.
 --------------------------------------------------------------------------
 
 arcint's own load path sizes the expert slot pool from the IR without reading
-one byte of weight data. `src/exec/backend_ov.cpp:552-556`:
+one byte of weight data. `src/exec/backend_ov.cpp:553-557`:
 
     // M7 §2 Phase B, analytic route ...: sizes the expert slot pool from the
     // `read_model` the load path already holds, without materialising any
@@ -31,24 +31,24 @@ So "shape and element type, no data" is not a degraded artifact from the
 serving runtime's point of view -- for the slot-pool decision it is the WHOLE
 artifact. This module emits exactly that, and the contract test
 (`tests/python/test_serving_shape.py`) checks it against a Python transcription
-of `slot_pool_from_ir` (`backend_ov.cpp:577-623`) rather than against a
+of `slot_pool_from_ir` (`backend_ov.cpp:578-624`) rather than against a
 description of it.
 
 --------------------------------------------------------------------------
 2. THE EXPERT-SLOT (OTD) CONTRACT, BOTH SIDES, CITED
 --------------------------------------------------------------------------
 
-C++ side, `src/exec/backend_ov.cpp:577-623` `slot_pool_from_ir`:
+C++ side, `src/exec/backend_ov.cpp:578-624` `slot_pool_from_ir`:
 
   * a MoE op is any node whose OpenVINO TYPE NAME contains "moe",
-    case-insensitively                                    (backend_ov.cpp:581-585)
+    case-insensitively                                    (backend_ov.cpp:582-586)
   * its expert-weight inputs are the Constant operands, or a Constant behind
     exactly ONE Convert, whose LEADING DIMENSION equals `num_expert`
-                                                          (backend_ov.cpp:588-604)
+                                                          (backend_ov.cpp:589-605)
   * per-expert bytes = product of dims[1:] x element_type().size()
-                                                          (backend_ov.cpp:600-604)
+                                                          (backend_ov.cpp:601-605)
   * an unmatched graph returns nullopt and the caller falls back to the
-    plateau probe -- "this function never guesses"        (backend_ov.cpp:566-569)
+    plateau probe -- "this function never guesses"        (backend_ov.cpp:567-570)
 
 Export side, the shape that was MEASURED to fuse on the card is the TILED
 lowering, described in `tools/verify_moe_lowering.py:26-45` and emitted by
@@ -105,9 +105,9 @@ module emits byte-identical in STRUCTURE to the ones the parity suites gate.
 * It is not the paged serving graph, and the reason is not that the paged
   ports are unwritten. NOBODY WRITES THEM: `load_paged` runs
   `ov::pass::SDPAToPagedAttention` over the artifact it has just read
-  (`backend_ov.cpp:2574`) and that pass produces the whole port contract
+  (`backend_ov.cpp:2582`) and that pass produces the whole port contract
   (`conv_state_table.N`, `gated_delta_state_table.N`, `key_cache.N`,
-  `value_cache.N`, `la.*` and the index ports -- `backend_ov.cpp:3191-3199`
+  `value_cache.N`, `la.*` and the index ports -- `backend_ov.cpp:3199-3207`
   and `:6141-6151`) out of three constructs of the STATEFUL graph: a rank-3
   Variable per GDN short conv, a rank-4 Variable per GDN recurrent state, and
   a ScaledDotProductAttention over a rank-4 KV Variable. Measured both ways
@@ -868,7 +868,7 @@ def build_serving_shape_ir(config=None, arena=None, n_layers=None,
         inputs_embeds    [1, T, H]   f32   -- the embedded tokens. The served
                                              runtime embeds on the host
                                              (`embed_paged`) and feeds this
-                                             name (backend_ov.cpp:6141); the
+                                             name (backend_ov.cpp:6153); the
                                              pass rewrites the port to [-1, -1]
                                              + Unsqueeze(1), so it is fed as
                                              [T, H]. The embedding weight is
@@ -1122,7 +1122,7 @@ def _dims(port):
 
 def _kv_variable(layer, tag, kv_heads, head_dim):
     """One rank-4 KV Variable, the shape `load_paged` reads its KV prototypes
-    from before the transformation runs (backend_ov.cpp:2557-2569: rank 4, the
+    from before the transformation runs (backend_ov.cpp:2565-2577: rank 4, the
     leading dim and the sequence dim dynamic, the tail static).
 
     The variable_id is the stateful-export convention the served artifact
@@ -1357,7 +1357,7 @@ def stateful_gdn_core(layer, beam, sinks):
     The recurrent state is declared `[1, HV, Dk, Dv]` rather than the served
     artifact's `[?, ...]`. It reaches `load_paged`'s rank-4 prototype scan
     either way -- that code replaces dim 0 with 1 regardless
-    (backend_ov.cpp:2557-2569) -- and this is the form that was measured to
+    (backend_ov.cpp:2565-2577) -- and this is the form that was measured to
     fuse. The attention KV Variables stay out of that scan on their own, by
     the dynamic sequence dim the same code excludes.
     """
@@ -1634,7 +1634,7 @@ def _ple_tail(hidden, emb, config, state, T, conv_mask=None):
 # --------------------------------------------------------------------------
 
 def slot_pool_from_ir(model, num_expert, ratio_pct):
-    """Python transcription of `slot_pool_from_ir`, src/exec/backend_ov.cpp:577-623.
+    """Python transcription of `slot_pool_from_ir`, src/exec/backend_ov.cpp:578-624.
 
     Line-for-line, with the C++ line numbers on each step. Returns None where
     the C++ returns nullopt.
