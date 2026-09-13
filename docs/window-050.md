@@ -836,6 +836,111 @@ changed in starting point: the `T ≤ 64` restriction is lifted.
 Not run by this seat, and therefore open: **GPU.0** (B60) confirmation, and any
 shape with C > 4.
 
+## 4.6 ITEM 4 — THE BOOT AT DEPTH, PREDICTED BEFORE IT RAN (2026-09-13)
+
+Written with **no boot output in existence** for the tree it predicts (the last
+boot output this repository holds is `RUN@be57428`, §4.4, taken on the
+pre-stateful graph). Every row below is `UNTESTED` by construction; the
+measurement commit that follows this one turns each into `RUN@<sha>` and pastes
+what the card said, verbatim, next to what was predicted here. Every term is a
+B60 / A770 measurement this repository already holds, or a device-free reading
+of the pinned OpenVINO source; no external number appears.
+
+**The reproducer is `tools/boot_serving_shape.py`**, committed with this
+section so the experiment is defined before it is run. It transcribes
+`load_paged`'s own sequence stage by stage (build → state prototypes → the
+pass → compile → request → the forward's `set_tensor` order) and captures the
+first refusal by name. It fills nothing: every weight is an unwritten arena
+page, as in `RUN@be57428`. "Depth" here is the LAYER count, the sense §4.5
+item 1 uses ("1-layer boot, then depth / 4 GiB chunking").
+
+### The constraints, both already on the record
+
+| constraint | value | provenance |
+|---|---|---|
+| A770 per-object cap | 4,294,959,104 B | `RUN@be57428` §4.4 |
+| B60 per-object cap | 24,385,683,456 B (its whole VRAM) | `RUN@be57428` §4.4 |
+| the PLE n-gram table, ONE object | 25,600,122,880 B = 320,001,536 × 160 nibbles, enters at layer index 1 | `RUN@be57428` §4.4 |
+| first full-attention layer | index 3 (`kind = "attn" if i % 4 == 3`), so the first SDPA exists at **depth 4** | `serving_shape.build_serving_shape_ir` |
+| what the pass demands | a stateful graph AND at least one `v13::ScaledDotProductAttention`; each absence is an `OPENVINO_ASSERT` by name | pinned OV source `71640275`, `src/core/src/pass/sdpa_to_paged_attention.cpp`, `run_on_model` |
+| what the served forward feeds first | `inputs_embeds`, unconditionally (`backend_ov.cpp:6141`); the IR declares `input_ids` | contract cell `test_the_converted_surface_against_every_tensor_the_forward_feeds` |
+| 1-layer boot, pre-stateful graph | compiles + infers on both cards, `absmax = 0.0000e+00` | `RUN@be57428` §4.4 |
+
+### The prediction — read the two constraints together
+
+**The depths the pass accepts (≥ 4) and the depths the A770's object cap
+admits (≤ 1, and the B60's too, since 25.6 GB exceeds its 24.39 GB) are
+disjoint. There is no depth at which the served path boots this IR on either
+card.** That is the headline, and it is falsified by ANY served-path forward
+returning logits at any depth on any card.
+
+| # | leg | prediction (`UNTESTED`) | dies if |
+|---|---|---|---|
+| P1 | pass, device-free, depth 1 (and 2, 3) | **REFUSED**: `No ScaledDotProductAttention operation observed in the graph, cannot perform the SDPAToPagedAttention transformation.` | the pass converts a graph with no SDPA |
+| P2 | pass, device-free, depth 4 | OK; `PagedAttentionExtension` 1, `PagedCausalConv1D` 3, `PagedGatedDeltaNet` 3, one `key_cache.`/`value_cache.` pair, all nine index ports | the pass refuses depth 4, or the op census differs |
+| P3 | compile, depth 4, served props (`KV_CACHE_PRECISION` u8, no precision hint), **A770** | FAIL at `engine.cpp:319`: `requested 25600122880 bytes, but max alloc size supported by device is 4294959104 bytes` | depth 4 compiles on the A770 |
+| P3b | the same on the **B60** | FAIL at `engine.cpp:319`, the same request against `24385683456 bytes` | depth 4 compiles on the B60 |
+| P4 | France question through the served path | **no forward is reached on either card**; the §8 coherence line records that, not a token | any served-path `infer()` returns |
+| P5 | CONTROL: depth 1, `--no-pass`, f32 pinned, both cards, prompt ids `760,6511,314,9338,369` | compile OK, infer OK, `finite=True`, `absmax=0.0000e+00`, argmax `0` at all five positions, RAW greedy last-position token id **0** | the now-stateful depth-1 graph (v5::Loop core, stateful conv, Variables + Assign sinks — their first card compile outside the fusion) fails to compile; or any logit is non-zero; or any argmax is not 0 |
+| P6 | CONTROL: depth 2, `--no-pass`, both cards | FAIL at `engine.cpp:319` with P3/P3b's numbers — the object survived the keystone reshape unchanged | depth 2 compiles, or the requested byte count moved |
+| P7 | decode behaviour | on the served path: none (P4). On the control: no decode step is possible against the static query block — a 1-token block against the compiled `[1, 5]` port is **refused at `set_tensor`** with a shape-incompatibility text naming both shapes | the runtime accepts a `[1, 1]` block on a `[1, 5]` port |
+
+**What "answers the France question" means after this table:** it cannot be
+answered in this window, and the reason is not a missing fix in the C++'s
+feed order. Before any of the handoff's three suspects (`input_ids` /
+`ngram_row_ids` / `conv_mask` declared-never-fed; the static query block; the
+rope span) can be MEASURED on a card, the served path has to reach a forward,
+and P1+P3 say it cannot: the n-gram table has to leave the graph (host-mmap
+gather, which is how serving reads it — `src/exec/ngram_table.h`) or be
+chunked under 4 GiB, and the minimum served depth is 4. Those two are the
+first two lines of increment 5's spec, and they are read off the device in the
+measurement commit rather than argued here.
+
+**What is NOT predicted**, on purpose: any timing (compile seconds on the
+stateful graph, infer seconds) — the driver prints them and the measurement
+commit records them as first readings, not as confirmations. The
+`enable_large_allocations` lever is not pulled: "max depth within the cap"
+means the cap as measured.
+
+### The commands, in order (one process per leg, `timeout 1200` each)
+
+```
+# UNTESTED — device-free, the P1/P2 legs
+<venv>/bin/python tools/boot_serving_shape.py --layers 1 --stage pass
+<venv>/bin/python tools/boot_serving_shape.py --layers 2 --stage pass
+<venv>/bin/python tools/boot_serving_shape.py --layers 3 --stage pass
+<venv>/bin/python tools/boot_serving_shape.py --layers 4 --stage pass
+# UNTESTED — A770 first (reserved card), then B60; P5, P6, P3
+<venv>/bin/python tools/boot_serving_shape.py --layers 1 --device GPU.1 --no-pass --ids 760,6511,314,9338,369
+<venv>/bin/python tools/boot_serving_shape.py --layers 2 --device GPU.1 --no-pass --ids 760,6511,314,9338,369
+<venv>/bin/python tools/boot_serving_shape.py --layers 4 --device GPU.1 --ids 760,6511,314,9338,369
+<venv>/bin/python tools/boot_serving_shape.py --layers 1 --device GPU.0 --no-pass --ids 760,6511,314,9338,369
+<venv>/bin/python tools/boot_serving_shape.py --layers 2 --device GPU.0 --no-pass --ids 760,6511,314,9338,369
+<venv>/bin/python tools/boot_serving_shape.py --layers 4 --device GPU.0 --ids 760,6511,314,9338,369
+```
+
+The prompt ids are `"The capital of France is"` under the shipped GGUF's own
+tokenizer (`llama-tokenize` from the pinned reference build, §ITEM 3):
+`760 'The'  6511 ' capital'  314 ' of'  9338 ' France'  369 ' is'`. The chat
+form of the probe (`"What is the capital of France? Answer in one word."`) is
+12 tokens under the same tokenizer and is not used here: the driver has no
+chat template and the served path would not reach it either way.
+
+### Measured (filled by the measurement commit — EMPTY here)
+
+| # | card | measured | matches? |
+|---|---|---|---|
+| P1 | — | | |
+| P2 | — | | |
+| P3 | A770 | | |
+| P3b | B60 | | |
+| P4 | both | | |
+| P5 | A770 | | |
+| P5 | B60 | | |
+| P6 | A770 | | |
+| P6 | B60 | | |
+| P7 | A770 / B60 | | |
+
 
 ## 5. Residency — the SIZE LEDGER, and the number that decides the window
 
@@ -1088,6 +1193,12 @@ baseline probe from a different model either.
 | probe | served model | answer | tokens | MTP acc/rej |
 |---|---|---|---|---|
 | "What is the capital of France? Answer in one word." | | | | |
+
+§4.6 (2026-09-13) predicts, before running, that this row cannot be filled
+with a token in the ITEM 4 window: the served path reaches no forward at any
+depth (P1 + P3). If that holds, the measurement commit writes the refusal here
+in place of an answer, dated, and the row stays a coherence line for the
+window that first gets a forward.
 
 (For contrast and NOT as a substitute: the pre-window baseline of the *resident
 agent* — a different model, `qwen3.8-agent` on :8087 — answered `Paris` in 27
