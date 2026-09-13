@@ -540,7 +540,12 @@ def ngram_chunked_gather(chunk_ids, local_ids, ports, head_dim):
     row_bytes = int(ports[0].get_output_partial_shape(0)[1].get_length())
     assert head_dim == 2 * row_bytes, (head_dim, row_bytes)
 
-    zero = op.multiply(local_ids, op.constant(np.array(0, np.int64)))
+    # the fallback index for the chunks the id does not name: a CONSTANT
+    # zero of the id port's own (static) shape. The first form multiplied
+    # the id tensor by zero -- inert, but an eltwise op on the index path
+    # that the record said carried none (review of d30db36, F1 rider).
+    zero = op.constant(np.zeros(
+        [d.get_length() for d in local_ids.get_output_partial_shape(0)], np.int64))
     picked = None
     for k, port in enumerate(ports):
         here = op.equal(chunk_ids, i32(k))                     # [1,T,Hn] bool
