@@ -53,9 +53,28 @@ class TestKLCore(unittest.TestCase):
         below = {"mean": kh.THRESHOLD_NATS - 1e-6, "max": 0, "p95": 0, "tokens": 1}
         at = {"mean": kh.THRESHOLD_NATS, "max": 0, "p95": 0, "tokens": 1}
         above = {"mean": kh.THRESHOLD_NATS + 1e-6, "max": 0, "p95": 0, "tokens": 1}
-        self.assertEqual(kh.gate(below)[1], "PASS")
-        self.assertEqual(kh.gate(at)[1], "PASS")
-        self.assertEqual(kh.gate(above)[1], "RED")
+        self.assertTrue(kh.gate(below)[1].startswith("PASS"))
+        self.assertTrue(kh.gate(at)[1].startswith("PASS"))
+        self.assertTrue(kh.gate(above)[1].startswith("RED"))
+
+    def test_the_bar_is_the_inherited_multiple_and_every_verdict_says_so(self):
+        """REVIEW ba2d5de F2 + the frontier's three conditions (2026-09-13):
+        the bar is 1.5 x another model's R0, defined once, and no verdict is a
+        bare PASS. Red first: against the previous module (a bare literal, a
+        bare "PASS") the first two assertions fail by construction."""
+        # 1.5 x 0.0399 = 0.05985; the campaign rounded the half up to 0.0599,
+        # so the pin is |product - bar| <= half a unit in the fourth decimal
+        self.assertLessEqual(abs(kh.INHERITED_BAR_MULTIPLIER * kh.INHERITED_R0_NATS
+                                 - kh.THRESHOLD_NATS), 5e-5 + 1e-12)
+        self.assertEqual(kh.BAR_STATUS, "PROVISIONAL")
+        for word in ("PROVISIONAL", "0.0399", "Qwen3.6-35B-A3B", "2026-08-11"):
+            self.assertIn(word, kh.BAR_PROVENANCE)
+        s = {"mean": 0.0, "max": 0, "p95": 0, "tokens": 1}
+        self.assertIn("PROVISIONAL", kh.gate(s)[1])
+        s["mean"] = 1.0
+        self.assertIn("PROVISIONAL", kh.gate(s)[1])
+        # the circular sentence is gone from the instrument's own text
+        self.assertNotIn("measured PASSING", kh.__doc__.replace("\n", " "))
 
 
 class TestRedProbe(unittest.TestCase):
@@ -72,7 +91,7 @@ class TestRedProbe(unittest.TestCase):
         large = ref + rng.standard_normal((200, 2048)) * 0.6
         s = kh.summarize_kl(kh.kl_per_token(ref, large))
         self.assertGreater(s["mean"], kh.THRESHOLD_NATS)
-        self.assertEqual(kh.gate(s)[1], "RED")
+        self.assertTrue(kh.gate(s)[1].startswith("RED"))
 
 
 if __name__ == "__main__":

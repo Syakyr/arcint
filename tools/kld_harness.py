@@ -9,20 +9,26 @@ provably did not move" is. This harness is that proof instrument: it measures
 the per-token KL divergence between a BF16/FP16 reference and the quantized
 candidate over a text slice and gates on a fixed threshold.
 
-Threshold: mean per-token KL(P_ref || P_cand), in NATS, must be <= 0.0599.
-The UD-Q3_K_XL class was measured PASSING at .0399 against this .0599 bar
-(DECIDED FACTS, 2026-09-10); narrow experts (Flash-Next width 640) tolerate
-~3-4 bit, not 2-bit.
+Threshold: mean per-token KL(P_ref || P_cand), in NATS, must be <=
+THRESHOLD_NATS = 0.0599 -- PROVISIONAL. Narrow experts (Flash-Next width 640)
+tolerate ~3-4 bit, not 2-bit (DECIDED FACTS, 2026-09-10).
 
-WHERE THE BAR COMES FROM (REVIEW ba2d5de F2, 2026-09-13): the 2026-08-11
-expert-quantisation campaign on Qwen3.6-35B-A3B -- a DIFFERENT model --
-measured its R0 (UD-Q3_K_XL vs BF16, wikitext-2, -c 512, 64 chunks) at mean
-KLD 0.0399 and SET the bar at 50 % over that R0 = 0.0599 (the note later
-moved it to 0.0581 against a re-uploaded R0). So the ".0399 passing against
-.0599" above is the quantity the bar was built from, not an independent
-pass, and the bar is a chosen multiplier over another model's measurement.
-Whether it is Flash-Next's bar is the operator's decision to record; this
-harness gates on it as inherited.
+WHERE THE BAR COMES FROM (REVIEW ba2d5de F2, 2026-09-13; frontier decision of
+the same day): the 2026-08-11 expert-quantisation campaign on Qwen3.6-35B-A3B
+-- a DIFFERENT model -- measured its R0 (UD-Q3_K_XL vs BF16, wikitext-2,
+-c 512, 64 chunks) at mean KLD 0.0399 and SET the bar at 50 % over that R0 =
+0.0599 (the note later moved it to 0.0581 against a re-uploaded R0). The
+derivation is the code below (INHERITED_R0_NATS x INHERITED_BAR_MULTIPLIER,
+pinned by tools/test_kld_harness.py). An earlier docstring called that R0 a
+class that had passed against this bar; it was the bar's own input, and the
+sentence is gone. The bar is a chosen multiplier over another model's
+measurement, so it is PROVISIONAL under three conditions: (1) its provenance
+sits beside it wherever it appears (BAR_PROVENANCE); (2) nothing calls
+anything "passing against" it; (3) the 0.5.1 acceptance commit re-derives it
+from THIS model's own reference round-trip -- the pair decided and stated,
+its run-to-run floor measured -- as a stated multiple of that reference's own
+rounding error, never an imported multiplier. Until that commit lands the
+harness gates on the inherited number and every verdict says PROVISIONAL.
 
 THE INSTRUMENT MUST BE ABLE TO GO RED. An acceptance check that cannot fail
 measures nothing. ``--self-test`` drives the KL core with synthetic
@@ -48,7 +54,19 @@ import math
 import os
 import sys
 
+# THE BAR, derived where it is defined and nowhere else. R0 is another model's
+# measurement (Qwen3.6-35B-A3B UD-Q3_K_XL vs BF16, wikitext-2 -c 512 x 64
+# chunks, 2026-08-11); the multiplier is the 50 % that campaign chose. The
+# literal 0.0599 is that product rounded to four decimals (0.05985 -> 0.0599,
+# the campaign's own rounding), pinned by tools/test_kld_harness.py.
+INHERITED_R0_NATS = 0.0399
+INHERITED_BAR_MULTIPLIER = 1.5
 THRESHOLD_NATS = 0.0599
+BAR_STATUS = "PROVISIONAL"
+BAR_PROVENANCE = ("PROVISIONAL: 0.0599 nats = 1.5 x 0.0399, the R0 measured "
+                  "2026-08-11 on Qwen3.6-35B-A3B (UD-Q3_K_XL vs BF16, wikitext-2) "
+                  "-- another model's number; the 0.5.1 acceptance commit "
+                  "re-derives it from this model's own reference round-trip")
 
 
 # --------------------------------------------------------------------------
@@ -99,9 +117,11 @@ def summarize_kl(per_token):
 
 
 def gate(summary, threshold=THRESHOLD_NATS):
-    """PASS when mean per-token KL <= threshold. Returns (passed, verdict)."""
+    """PASS when mean per-token KL <= threshold. Returns (passed, verdict);
+    the verdict names the bar's status, because the bar is inherited (see
+    BAR_PROVENANCE) and a bare PASS would read as more than it is."""
     passed = summary["mean"] <= threshold
-    verdict = "PASS" if passed else "RED"
+    verdict = ("PASS" if passed else "RED") + f" (bar {threshold} nats, {BAR_STATUS})"
     return passed, verdict
 
 
@@ -135,7 +155,8 @@ def self_test():
 
     # Cell 2: a small, calibrated perturbation that stays under the bar. A tiny
     # additive logit jitter moves the distribution a little; scaled to land
-    # comfortably below 0.0599.
+    # comfortably below THRESHOLD_NATS (0.0599, PROVISIONAL -- see the module
+    # docstring; the cell calibrates the instrument, not the model).
     small = ref + rng.standard_normal((T, V)) * 0.03
     s_small = summarize_kl(kl_per_token(ref, small))
     passed_small, verdict_small = gate(s_small)
@@ -237,8 +258,8 @@ def logits_from_ir(model_dir, token_ids, device="CPU"):
     # defaults this to float16 (measured, OV 2026.4 on both Arc cards:
     # `core.get_property("GPU", "INFERENCE_PRECISION_HINT")` -> float16, while
     # CPU reports float32), so an unconfigured GPU compile silently executes the
-    # graph in f16. A KLD gate at 0.0599 nats cannot be read off an f16 forward
-    # and be about the export. CPU is left alone -- it is already f32. Mirrors
+    # graph in f16. A KLD gate at 0.0599 nats (PROVISIONAL, inherited) cannot
+    # be read off an f16 forward and be about the export. CPU is left alone -- it is already f32. Mirrors
     # tests/python/q4e_device.py, which carries the full note; this module is
     # product tooling and cannot import from tests/.
     cfg = ({"INFERENCE_PRECISION_HINT": "f32"}
@@ -336,6 +357,7 @@ def measure(args):
           f"p95 {summary['p95']:.4f}  max {summary['max']:.4f}  "
           f"threshold {args.threshold}  -> {verdict}")
     print(json.dumps({"summary": summary, "threshold": args.threshold,
+                      "bar_status": BAR_STATUS, "bar_provenance": BAR_PROVENANCE,
                       "verdict": verdict}))
     return 0 if passed else 1
 

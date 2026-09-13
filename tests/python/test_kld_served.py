@@ -171,3 +171,53 @@ def test_the_floor_is_reported_from_the_last_two_replays(tmp_path):
     write_dump(dump, [(0, 0, n_ctx, w0), (0, 0, n_ctx, w1)])
     assert ks.main(["--ref", str(cap), "--compare", "--dump", str(dump), "--out", str(out)]) == 0
     assert json.loads(out.read_text())["floor"] is None
+
+
+def test_three_replays_give_two_pairs_and_count_the_moved_windows(tmp_path):
+    """The floor over N replays: every earlier replay against the last, and
+    the count of window pairs that moved. Red first: against the two-replay
+    compare the report has no "pairs" key and the count is not there."""
+    import json
+    n_ctx, vocab = 10, 7
+    rng = np.random.default_rng(6)
+    w0 = rng.normal(size=(n_ctx, vocab)).astype(np.float32)
+    w1 = rng.normal(size=(n_ctx, vocab)).astype(np.float32)
+    cap = tmp_path / "ref.dat"
+    write_capture(cap, n_ctx, vocab, [w0, w1], np.arange(2 * n_ctx))
+    dump = tmp_path / "dump.bin"
+    out = tmp_path / "rep.json"
+    w0b = w0 + rng.normal(size=w0.shape).astype(np.float32) * 2
+    # replay 0: moved w0; replay 1: identical to the last; replay 2: the last
+    write_dump(dump, [(0, 0, n_ctx, w0b), (0, 0, n_ctx, w1),
+                      (0, 0, n_ctx, w0), (0, 0, n_ctx, w1),
+                      (0, 0, n_ctx, w0), (0, 0, n_ctx, w1)])
+    assert ks.main(["--ref", str(cap), "--compare", "--dump", str(dump), "--out", str(out)]) == 0
+    rep = json.loads(out.read_text())
+    fl = rep["floor"]
+    assert fl["replays"] == 3 and len(fl["pairs"]) == 2
+    assert fl["pairs"][0]["windows_moved"] == 1 and fl["pairs"][1]["windows_moved"] == 0
+    assert fl["window_pairs_moved"] == 1 and fl["window_pairs"] == 4
+    assert fl["mean_kl_a_b"] < 1e-9                    # the last pair is identical
+    assert fl["pairs"][0]["windows"][0]["mean_kl_a_b"] > 0.05
+
+
+def test_the_report_carries_the_bar_as_provisional_with_its_provenance(tmp_path):
+    """REVIEW ba2d5de F2 + the frontier's conditions: the bar is printed as
+    PROVISIONAL with its provenance beside it, and it is kld_harness's, not a
+    second literal. Red first: the previous report had neither key."""
+    import json
+    import kld_harness as kh
+    n_ctx, vocab = 10, 7
+    rng = np.random.default_rng(7)
+    w0 = rng.normal(size=(n_ctx, vocab)).astype(np.float32)
+    cap = tmp_path / "ref.dat"
+    write_capture(cap, n_ctx, vocab, [w0], np.arange(n_ctx))
+    dump = tmp_path / "dump.bin"
+    out = tmp_path / "rep.json"
+    write_dump(dump, [(0, 0, n_ctx, w0)])
+    assert ks.main(["--ref", str(cap), "--compare", "--dump", str(dump), "--out", str(out)]) == 0
+    rep = json.loads(out.read_text())
+    assert rep["threshold_nats"] == kh.THRESHOLD_NATS
+    assert rep["threshold_status"] == "PROVISIONAL"
+    assert "0.0399" in rep["threshold_provenance"] and "2026-08-11" in rep["threshold_provenance"]
+    assert ks.THRESHOLD_NATS is kh.THRESHOLD_NATS

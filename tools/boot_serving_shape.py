@@ -133,6 +133,30 @@ def main(argv=None):
                          "it, the rest is dropped) and compile THAT. Names the "
                          "emitter sets: ple/gathered, ple/out, layerN/mixer_out, "
                          "layerN/out. Not the served path; its output says so.")
+    # THE FLOOR'S MECHANISM (REVIEW ba2d5de F1 rider, 2026-09-13): the served
+    # logits of a 2,735-token window are not run-to-run deterministic; these
+    # four options turn the driver into the bisect that finds the first node
+    # whose output differs between two identical forwards.
+    ap.add_argument("--capture", default=None,
+                    help="prompt = the first --take ids of window --window of "
+                         "this llama.cpp --kl-divergence-base capture (the KLD "
+                         "gate's own tokens; overrides --ids)")
+    ap.add_argument("--window", type=int, default=0)
+    ap.add_argument("--take", type=int, default=1024)
+    ap.add_argument("--repeat", type=int, default=2,
+                    help="run the prompt forward this many times and compare "
+                         "every repeat against the first: bit-identical or "
+                         "not, the first differing row, rows differing, max "
+                         "|diff|, argmaxes moved (default 2: the second "
+                         "forward that pays no kernel jit)")
+    ap.add_argument("--fresh", action="store_true",
+                    help="each repeat on a FRESH request (new state rows and "
+                         "KV pools, table ports shared) instead of the served "
+                         "path's re-used one")
+    ap.add_argument("--precision", default=None,
+                    help="INFERENCE_PRECISION_HINT for the post-pass compile "
+                         "(f32 / f16); absent = the plugin's default, which is "
+                         "what the served binary gets")
     args = ap.parse_args(argv)
 
     import openvino as ov
@@ -141,6 +165,12 @@ def main(argv=None):
     ids = parse_ids(args.ids)
     if args.zeros:
         ids = [0] * int(args.zeros)
+    if args.capture:
+        from kld_served import read_capture
+        _n_ctx, _nv, n_chunk, ctoks, _rows = read_capture(args.capture)
+        ids = [int(t) for t in ctoks[args.window][:args.take]]
+        say("capture", f"{args.capture}: window {args.window} of {n_chunk}, the "
+                       f"first {len(ids)} of {_n_ctx} ids")
     if not ids:
         ids = list(range(1000, 1008))
     T = len(ids)                       # the FEED's length; the graph is dynamic
@@ -277,6 +307,8 @@ def main(argv=None):
         props = {"INFERENCE_PRECISION_HINT": "f32"} if dev.startswith("GPU") else {}
     else:
         props = {"KV_CACHE_PRECISION": getattr(ov.Type, args.paged_kv)}
+        if args.precision:
+            props["INFERENCE_PRECISION_HINT"] = args.precision
     t0 = time.time()
     try:
         compiled = core.compile_model(model, dev, props)
@@ -563,14 +595,64 @@ def main(argv=None):
             f"{int(i)}={toks[int(i)]!r}:{float(rows[-1][int(i)]):.3f}" for i in top))
         say("forward", f"prompt tokens: {[toks[int(i)] for i in ids]}")
     gpu_mem("after infer")
-    # a second forward on the same request: the first one pays the kernel
-    # jit (feedback-first-request-compiles-kernels); the second is the rate
-    t0 = time.time()
-    try:
-        req.infer()
-        say("forward", f"INFER #2 OK {time.time() - t0:.3f}s")
-    except Exception as exc:                                      # noqa: BLE001
-        say("forward", f"INFER #2 FAIL after {time.time() - t0:.3f}s " + one_line(exc))
+
+    # ---- REPEATS: the same forward again, compared bit for bit ----------------
+    # The first forward pays the kernel jit (feedback-first-request-compiles-
+    # kernels); every later one is the rate AND the determinism reading. On
+    # the served path the request is re-used (the runtime keeps one per lane);
+    # --fresh binds a new request per repeat instead, so a difference that
+    # appears only in one of the two modes names the request's own state.
+    base = np.array(rows, dtype=np.float32, copy=True)
+    served_feeds = {name: req.get_tensor(name) for name in fed}
+
+    def fresh_request():
+        r2 = compiled.create_infer_request()
+        ctx2 = core.get_default_context(dev) if dev.startswith("GPU") else None
+        for name, portp in declared.items():
+            if name.startswith("conv_state_table."):
+                sh = list(conv_proto[0]); sh[0] = ROWS_PER_LANE
+                et2 = ov.Type.f16
+            elif name.startswith("gated_delta_state_table."):
+                sh = list(gdn_proto[0]); sh[0] = ROWS_PER_LANE
+                et2 = ov.Type.f16
+            elif name.startswith(("key_cache.", "value_cache.")):
+                sh = list(served_feeds[name].get_shape())
+                et2 = portp.get_element_type()
+            else:
+                if name in served_feeds:
+                    r2.set_tensor(name, served_feeds[name])   # table ports, feeds: shared
+                continue
+            r2.set_tensor(name, ctx2.create_tensor(et2, ov.Shape(sh), {})
+                          if ctx2 else ov.Tensor(et2, ov.Shape(sh)))
+        return r2
+
+    for k in range(2, int(args.repeat) + 1):
+        rk = fresh_request() if args.fresh else req
+        t0 = time.time()
+        try:
+            rk.infer()
+        except Exception as exc:                                  # noqa: BLE001
+            say("repeat", f"#{k} INFER FAIL after {time.time() - t0:.3f}s " + one_line(exc))
+            break
+        dt = time.time() - t0
+        outk = rk.get_output_tensor(0).data if args.cut else rk.get_tensor("logits").data
+        cur = np.array(outk, dtype=np.float32).reshape(-1, outk.shape[-1])
+        if cur.shape != base.shape:
+            say("repeat", f"#{k} shape {cur.shape} != #1 {base.shape}")
+            break
+        diff_rows = np.flatnonzero((cur != base).any(axis=1))
+        if diff_rows.size == 0:
+            say("repeat", f"#{k} ({'fresh' if args.fresh else 'same'} request) "
+                          f"INFER OK {dt:.3f}s: BIT-IDENTICAL to #1 over "
+                          f"{base.shape[0]} rows x {base.shape[1]}")
+            continue
+        moved = int((cur.argmax(axis=1) != base.argmax(axis=1)).sum())
+        say("repeat", f"#{k} ({'fresh' if args.fresh else 'same'} request) "
+                      f"INFER OK {dt:.3f}s: DIFFERS from #1 -- first row "
+                      f"{int(diff_rows[0])}, {diff_rows.size} of {base.shape[0]} "
+                      f"rows differ, max |diff| {float(np.abs(cur - base).max()):.4e}, "
+                      f"max |#1| {float(np.abs(base).max()):.4e}, argmax moved "
+                      f"in {moved} rows")
 
     # ---- the static-T probe: what a DECODE step would meet -----------------------
     # A decode step feeds one token. The query block is static in T inside the

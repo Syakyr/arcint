@@ -21,8 +21,9 @@ capture's own token ids in its header. This tool is the other half:
      llama.cpp's tools/perplexity/perplexity.cpp), log-softmax the served
      rows, and report mean per-token KL(P_ref || P_served) over the
      recorded rows, split at the boundary: rows at 0-based index < 2051 and
-     rows >= 2051. The threshold the design pins (tools/kld_harness.py,
-     0.0599 nats) is printed beside both means; nothing here decides.
+     rows >= 2051. The bar (tools/kld_harness.py THRESHOLD_NATS, 0.0599
+     nats, PROVISIONAL) is printed beside both means with its provenance;
+     nothing here decides.
 
 What the capture records (kld_capture.py's correction, measured): the SECOND
 HALF of each window only -- rows `n_ctx/2 .. n_ctx-2` (0-based), which is
@@ -44,22 +45,22 @@ bar. A full-depth artifact is the measurement.
 THE INSTRUMENT'S OWN FLOOR (REVIEW ba2d5de F1): served logits at 2,735
 tokens are not run-to-run deterministic on this backend (chunked prefill,
 f16 kernels), so a reading needs its noise floor beside it. `--replay
---repeat 2` posts every window twice; `--compare` then pairs the last two
-replays and reports KL(A||B) mean/max and argmax agreement over the same
-recorded rows -- the floor the gate's means are read against. A floor near
+--repeat N` posts every window N times; `--compare` then pairs every earlier
+replay with the last one and reports KL(A||B) mean/max, argmax agreement and
+max |logit diff| over the same recorded rows -- the floor the gate's means
+are read against, and with N > 2 how often the event occurs. A floor near
 the bar makes the bar unreadable; a floor far below it does not make a
-reading pass.
+reading pass. The floor's mechanism is measured by
+tools/boot_serving_shape.py --repeat/--cut (the per-node bisect), not here.
 
-THE BAR (REVIEW ba2d5de F2): 0.0599 nats is NOT derived from Flash-Next. Its
-source is the 2026-08-11 expert-quantisation campaign on a DIFFERENT model,
-Qwen3.6-35B-A3B: R0 = UD-Q3_K_XL against BF16 on wikitext-2 (-c 512, 64
-chunks) measured mean KLD 0.0399, and the bar was set at 50 % over R0 =
-0.0599 (that note later moved it to 0.0581 against a re-uploaded R0).
-kld_harness.py's "UD-Q3_K_XL measured PASSING at .0399 against this bar" is
-that same R0 -- the quantity the bar was built from, not an independent
-pass. Whether 1.5 x another model's R0 is Flash-Next's bar is the
-operator's decision; until it is recorded, this tool prints the number as
-"the inherited bar" and decides nothing.
+THE BAR (REVIEW ba2d5de F2; PROVISIONAL): 0.0599 nats is NOT derived from
+Flash-Next. It is kld_harness.THRESHOLD_NATS = 1.5 x 0.0399, the R0 of a
+DIFFERENT model (Qwen3.6-35B-A3B, UD-Q3_K_XL against BF16 on wikitext-2,
+-c 512, 64 chunks, 2026-08-11); the derivation and its three conditions live
+in that module and its provenance sentence is printed beside every reading
+here. The 0.5.1 acceptance commit re-derives the bar from this model's own
+reference round-trip; until then this tool prints the inherited number,
+tagged, and decides nothing.
 """
 import argparse
 import json
@@ -73,10 +74,9 @@ import numpy as np
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "tools"))
 
+from kld_harness import BAR_PROVENANCE, BAR_STATUS, THRESHOLD_NATS  # noqa: E402
+
 QSA_BOUNDARY_TOKENS = 2051
-# INHERITED, not derived here: 1.5 x the Qwen3.6-35B-A3B UD-Q3_K_XL R0 of
-# 0.0399 nats (2026-08-11 campaign, wikitext-2); see the module docstring.
-THRESHOLD_NATS = 0.0599
 DUMP_MAGIC = b"ARCLGT01"
 
 
@@ -230,6 +230,7 @@ def compare(args):
     n_rows = n_ctx - 1 - first
     report = {"ref": args.ref, "dump": args.dump, "n_ctx": n_ctx, "n_vocab": n_vocab,
               "boundary": QSA_BOUNDARY_TOKENS, "threshold_nats": THRESHOLD_NATS,
+              "threshold_status": BAR_STATUS, "threshold_provenance": BAR_PROVENANCE,
               "windows": []}
     all_below, all_above = [], []
     for w, win in enumerate(windows[:n_chunk]):
@@ -260,37 +261,53 @@ def compare(args):
               flush=True)
     report["mean_kl_below"] = float(np.mean(all_below)) if all_below else None
     report["mean_kl_above"] = float(np.mean(all_above)) if all_above else None
-    # THE FLOOR: the previous replay (A) against the last one (B), same rows
+    # THE FLOOR: every earlier replay (A) against the last one (B), same rows.
+    # `windows` is the last pair's per-window list (the shape the first floor
+    # reading was recorded in); `pairs` carries every pair, so a run with
+    # --repeat N says how many of N-1 pairs moved, not just whether the last did.
     report["floor"] = None
-    if len(replays) >= 2 * n_chunk:
-        prev = replays[-2 * n_chunk:-n_chunk]
-        fl = []
-        for w in range(n_chunk):
-            a = window_rows(args.dump, prev[w], n_ctx, n_vocab)
-            b = window_rows(args.dump, windows[w], n_ctx, n_vocab)
-            kls, agree, maxdiff = [], 0, 0.0
-            for i in range(n_rows):
-                p = first + i
-                kls.append(kl_ref_vs_served(log_softmax(a[p].astype(np.float64)), b[p]))
-                agree += int(np.argmax(a[p]) == np.argmax(b[p]))
-                maxdiff = max(maxdiff, float(np.abs(a[p] - b[p]).max()))
-            fl.append({"window": w, "mean_kl_a_b": float(np.mean(kls)),
-                       "max_kl_a_b": float(max(kls)), "argmax_agreement": agree / n_rows,
-                       "max_abs_logit_diff": maxdiff})
-            print(f"FLOOR window {w}: KL(A||B) mean {fl[-1]['mean_kl_a_b']:.6e} max "
-                  f"{fl[-1]['max_kl_a_b']:.4e}; argmax agreement {fl[-1]['argmax_agreement']:.4f}; "
-                  f"max |logit diff| {maxdiff:.3f}", flush=True)
-        report["floor"] = {"windows": fl,
-                           "mean_kl_a_b": float(np.mean([f["mean_kl_a_b"] for f in fl])),
-                           "max_kl_a_b": float(max(f["max_kl_a_b"] for f in fl))}
-        print(f"FLOOR ALL: KL(A||B) mean {report['floor']['mean_kl_a_b']:.6e} max "
-              f"{report['floor']['max_kl_a_b']:.4e} -- two replays of the same windows in the "
-              f"same process; the means above are read against this", flush=True)
+    n_rep = len(replays) // n_chunk
+    if n_rep >= 2:
+        pairs = []
+        for a_idx in range(n_rep - 1):
+            prev = replays[a_idx * n_chunk:(a_idx + 1) * n_chunk]
+            fl = []
+            for w in range(n_chunk):
+                a = window_rows(args.dump, prev[w], n_ctx, n_vocab)
+                b = window_rows(args.dump, windows[w], n_ctx, n_vocab)
+                kls, agree, maxdiff = [], 0, 0.0
+                for i in range(n_rows):
+                    p = first + i
+                    kls.append(kl_ref_vs_served(log_softmax(a[p].astype(np.float64)), b[p]))
+                    agree += int(np.argmax(a[p]) == np.argmax(b[p]))
+                    maxdiff = max(maxdiff, float(np.abs(a[p] - b[p]).max()))
+                fl.append({"window": w, "mean_kl_a_b": float(np.mean(kls)),
+                           "max_kl_a_b": float(max(kls)), "argmax_agreement": agree / n_rows,
+                           "max_abs_logit_diff": maxdiff})
+                print(f"FLOOR replay {a_idx} vs {n_rep - 1}, window {w}: KL(A||B) mean "
+                      f"{fl[-1]['mean_kl_a_b']:.6e} max {fl[-1]['max_kl_a_b']:.4e}; argmax "
+                      f"agreement {fl[-1]['argmax_agreement']:.4f}; max |logit diff| "
+                      f"{maxdiff:.3f}", flush=True)
+            pairs.append({"a": a_idx, "b": n_rep - 1, "windows": fl,
+                          "mean_kl_a_b": float(np.mean([f["mean_kl_a_b"] for f in fl])),
+                          "max_kl_a_b": float(max(f["max_kl_a_b"] for f in fl)),
+                          "windows_moved": sum(int(f["max_abs_logit_diff"] > 0) for f in fl)})
+        last = pairs[-1]
+        moved = sum(p["windows_moved"] for p in pairs)
+        report["floor"] = {"windows": last["windows"], "mean_kl_a_b": last["mean_kl_a_b"],
+                           "max_kl_a_b": last["max_kl_a_b"], "replays": n_rep,
+                           "pairs": pairs,
+                           "window_pairs_moved": moved,
+                           "window_pairs": (n_rep - 1) * n_chunk}
+        print(f"FLOOR ALL: KL(A||B) mean {last['mean_kl_a_b']:.6e} max {last['max_kl_a_b']:.4e} "
+              f"(last pair); {moved} of {(n_rep - 1) * n_chunk} window pairs moved across "
+              f"{n_rep} replays of the same windows in the same process; the means above are "
+              f"read against this", flush=True)
     else:
         print("FLOOR: not measured (one replay; --replay --repeat 2 gives it)", flush=True)
     print(f"ALL: mean KL below {report['mean_kl_below']:.6e} above "
           f"{report['mean_kl_above'] if report['mean_kl_above'] is None else format(report['mean_kl_above'], '.6e')} "
-          f"(inherited bar {THRESHOLD_NATS} nats = 1.5 x another model's R0; REPORT ONLY)",
+          f"(bar {THRESHOLD_NATS} nats, {BAR_STATUS} -- {BAR_PROVENANCE}; REPORT ONLY)",
           flush=True)
     if args.out:
         Path(args.out).write_text(json.dumps(report, indent=2) + "\n")

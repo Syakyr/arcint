@@ -58,9 +58,12 @@ or above row 2051. Report only. Two riders of the ba2d5de review: `--replay
 --repeat 2` measures the served logits' own floor (KL between two replays
 of the same windows: 2.1e-4 nats mean on the A770, one window bit-identical
 and one with 41 of 1,367 argmaxes moved), and the 0.0599 bar is recorded
-as inherited — 1.5 × the Qwen3.6-35B-A3B UD-Q3_K_XL R0 of 0.0399 from the
-2026-08-11 campaign, another model's measurement, the operator's to
-confirm for Flash-Next.
+as **PROVISIONAL** — 1.5 × the Qwen3.6-35B-A3B UD-Q3_K_XL R0 of 0.0399 from
+the 2026-08-11 campaign, another model's measurement, derived once in
+`kld_harness.py` (pinned by a cell), its provenance printed beside every
+reading and every verdict; the sentence that called that R0 a pass against
+the bar is gone. The 0.5.1 acceptance commit re-derives the bar from this
+model's own reference round-trip (frontier decision, 2026-09-13).
 
 ### Full depth: built, and refused by the host at compile (2026-09-13)
 

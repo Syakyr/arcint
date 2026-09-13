@@ -1588,14 +1588,15 @@ uint16 rows: f32 scale, f32 min log-prob, `q = round((logit − min) / scale)`,
 transcribed from `perplexity.cpp` and pinned to the quantisation step by a
 cell), log-softmaxes the served rows, and reports mean per-token
 KL(P_ref‖P_served) over the recorded rows `n_ctx/2 .. n_ctx−2`, split at row
-index 2051. REPORT ONLY; the 0.0599-nat bar is printed beside the means.
+index 2051. REPORT ONLY; the 0.0599-nat bar (PROVISIONAL — inherited, §7) is
+printed beside the means with its provenance sentence.
 
 Reference: `/flash-model/kld-ref/qwen4exp-c2735-chunks2.dat`, sha
 `af7993b7…`, llama.cpp master `56b9eb28`, n_ctx 2735, 2 windows, 1,367 rows a
 window (684 below the boundary, 683 at or above), 91,266-byte corpus.
 
 **Red probe, predicted**: through the depth-4 artifact the instrument must
-read a mean KL FAR above 0.0599 in both regimes (forty-four layers are
+read a mean KL FAR above 0.0599 (PROVISIONAL bar) in both regimes (forty-four layers are
 missing; `ramework` is not a distribution over English) and an argmax
 agreement near zero. A reading near the bar at depth 4 would falsify the
 instrument, not pass the model. This prediction was written in the tree
@@ -1621,7 +1622,7 @@ boundary, 683 at or above):
 | **all** | **1.165143e+01** | **1.147997e+01** | | |
 
 **The instrument reads red at depth 4, as predicted**: 11.65 / 11.48 nats
-against the 0.0599 bar, two hundred times over; argmax agreement 1 row in
+against the 0.0599 bar (PROVISIONAL), two hundred times over; argmax agreement 1 row in
 1,367. Nothing here is a statement about the model. The same command against
 a full-depth artifact is the gate's measurement — REPORT ONLY.
 
@@ -1757,22 +1758,35 @@ never approached — twice, in opposite directions.
 ## 7. The KLD gate
 
 `tools/kld_harness.py` exists and is red-probed: mean per-token
-KL(P_ref‖P_cand) ≤ **0.0599 nats**. It now pins f32 on GPU devices for the same
-reason §3 gives — a KLD read off an f16 forward is not a measurement of the
-export.
+KL(P_ref‖P_cand) ≤ **0.0599 nats — PROVISIONAL**. It now pins f32 on GPU
+devices for the same reason §3 gives — a KLD read off an f16 forward is not a
+measurement of the export.
 
-**Where 0.0599 comes from (REVIEW ba2d5de F2, 2026-09-13).** Not from
-Flash-Next. The 2026-08-11 expert-quantisation campaign on Qwen3.6-35B-A3B
-measured its R0 — UD-Q3_K_XL against BF16, wikitext-2, `-c 512 --chunks 64`
-— at mean KLD **0.0399** and set its bar at 50 % over R0 = 0.0599 (later
-moved to 0.0581 against a re-uploaded R0). The harness's "UD-Q3_K_XL
-measured PASSING at .0399 against this bar" is that R0, the quantity the bar
-was built from. So the bar is a chosen multiplier over another model's
-measurement; whether 1.5 × that R0 is Flash-Next's bar is the operator's
-decision to record here. Until then every reading prints it as the
-inherited bar and decides nothing. A second caveat, measured in §4.11: the
-served logits have a noise floor of their own, and a bar is readable only
-against it.
+**Where 0.0599 comes from (REVIEW ba2d5de F2, 2026-09-13; the derivation
+cell).** Not from Flash-Next. The 2026-08-11 expert-quantisation campaign on
+Qwen3.6-35B-A3B measured its R0 — UD-Q3_K_XL against BF16, wikitext-2,
+`-c 512 --chunks 64` — at mean KLD **0.0399** and set its bar at 50 % over
+R0: **bar = 1.5 × 0.0399 = 0.05985 → 0.0599** (dated 2026-08-11, attributed to
+that campaign, caveated: another model's number; the note later moved it to
+0.0581 against a re-uploaded R0). The harness used to describe that R0 as a
+class that had passed against this bar; it was the bar's own input, and the
+sentence is gone from the harness (`kld_harness.py` now defines
+`INHERITED_R0_NATS × INHERITED_BAR_MULTIPLIER`, pinned by a cell, and every
+verdict and every `kld_served.py` line carries `BAR_PROVENANCE`).
+
+**Frontier bar decision (2026-09-13), the three conditions under which the
+number stays in use:** (1) every place the bar appears, its provenance
+sentence sits beside it; (2) nothing is called "passing against" it; (3) the
+0.5.1 acceptance commit re-derives the bar from THIS model's own reference
+round-trip — since BF16 of this model may fit nowhere this repository can
+run, that commit DECIDES AND STATES the round-trip pair (for instance the
+served quantised path against the llama reference on the same shards) and
+its own measured floor, doctrine: a stated multiple of the reference's own
+rounding error, never an imported multiplier. Until that commit lands every
+reading prints the inherited bar, tagged PROVISIONAL, and decides nothing.
+A second caveat, measured in §4.11: the served logits have a noise floor of
+their own, and a bar is readable only against it — no KL mean is quotable
+without its measured run-to-run floor beside it.
 
 What still stands between the tip and the gate (`UNTESTED` as a whole — the gate
 has not been run on an assembled Flash-Next artifact):
@@ -1824,7 +1838,7 @@ record than a blank guessed.
 | QSA→dense price, T = 2052 | 2.307817e-06 over **1**/2052 rows | `RUN@692c0a6` attention piece |
 | QSA→dense price, T = 2080 | 2.385560e-02 over **29**/2080 rows = T−2051 | `RUN@692c0a6` attention piece |
 | attention piece floor vs pin | 1.855e-07 (T=64), 1.535e-07 (T=96) | `RUN@e78812d` attention piece |
-| KLD gate threshold | ≤ 0.0599 nats mean per-token | harness, red-probed |
+| KLD gate threshold | ≤ 0.0599 nats mean per-token — **PROVISIONAL**: 1.5 × the Qwen3.6-35B-A3B UD-Q3_K_XL R0 of 0.0399 (2026-08-11), another model's number; re-derived in the 0.5.1 acceptance commit (§7) | harness, red-probed |
 | serving-shape IR, 48 layers | 84,372 nodes, 36 GDN + 12 dense-causal | `RUN@198b736` `--serving-shape` |
 | → declared constants | 183.07 GiB | `RUN@198b736` |
 | → materialised on disk | **0 KiB** — but see the qualifier below; this figure does not discriminate | `RUN@198b736`, qualified `RUN@5663a44` |

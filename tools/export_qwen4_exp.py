@@ -229,7 +229,8 @@ def write_output_layout(out_dir, checkpoint_dir, geometry, options,
 #   Qwen4ExpTextGatedDeltaNet   - GDN linear attention (interval 4 -> 36 of 48)
 #   Qwen4ExpTextTopKRouter / Experts / SparseMoeBlock - 512 experts, top-10, width 640
 #   MTP x1 head                 - text_config.mtp (hybrid, layer_types, ...)
-# Acceptance is the KLD gate in tools/kld_harness.py (threshold 0.0599 nats),
+# Acceptance is the KLD gate in tools/kld_harness.py (threshold 0.0599 nats,
+# PROVISIONAL: 1.5 x another model's R0, its provenance in that module),
 # NOT "compiles and serves". Every emitted component is validated against the
 # torch reference (max-abs + KL drift on synthetic weights) before the whole
 # backbone is admitted.
