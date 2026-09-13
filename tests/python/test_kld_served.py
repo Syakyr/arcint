@@ -135,3 +135,39 @@ def test_compare_reads_zero_for_a_dump_equal_to_the_capture(tmp_path, capsys):
                     "--out", str(out)]) == 0
     rep = json.loads(out.read_text())
     assert rep["mean_kl_below"] > 0.1
+
+
+def test_the_floor_is_reported_from_the_last_two_replays(tmp_path):
+    """REVIEW ba2d5de F1: two replays of the same windows give KL(A||B); zero
+    for identical replays, positive for a moved second one. Written with the
+    change, not before it: against the previous compare (no "floor" key in
+    the report) the first assertion fails by construction, and that is the
+    only red this cell has seen."""
+    import json
+    n_ctx, vocab = 10, 7
+    rng = np.random.default_rng(5)
+    w0 = rng.normal(size=(n_ctx, vocab)).astype(np.float32)
+    w1 = rng.normal(size=(n_ctx, vocab)).astype(np.float32)
+    cap = tmp_path / "ref.dat"
+    write_capture(cap, n_ctx, vocab, [w0, w1], np.arange(2 * n_ctx))
+    dump = tmp_path / "dump.bin"
+    out = tmp_path / "rep.json"
+    # replay A == replay B: floor 0
+    write_dump(dump, [(0, 0, n_ctx, w0), (0, 0, n_ctx, w1), (0, 0, n_ctx, w0), (0, 0, n_ctx, w1)])
+    assert ks.main(["--ref", str(cap), "--compare", "--dump", str(dump), "--out", str(out)]) == 0
+    rep = json.loads(out.read_text())
+    assert rep["floor"] is not None
+    assert rep["floor"]["mean_kl_a_b"] < 1e-9 and rep["floor"]["max_kl_a_b"] < 1e-9
+    assert all(f["argmax_agreement"] == 1.0 for f in rep["floor"]["windows"])
+    # replay B moved: floor positive, and the means are against B (the last)
+    w0b = w0 + rng.normal(size=w0.shape).astype(np.float32) * 2
+    write_dump(dump, [(0, 0, n_ctx, w0), (0, 0, n_ctx, w1), (0, 0, n_ctx, w0b), (0, 0, n_ctx, w1)])
+    assert ks.main(["--ref", str(cap), "--compare", "--dump", str(dump), "--out", str(out)]) == 0
+    rep = json.loads(out.read_text())
+    assert rep["floor"]["windows"][0]["mean_kl_a_b"] > 0.05
+    assert rep["floor"]["windows"][1]["mean_kl_a_b"] < 1e-9
+    assert rep["windows"][0]["mean_kl_below"] > 0.05      # ref vs B, B moved
+    # one replay only: no floor, said so
+    write_dump(dump, [(0, 0, n_ctx, w0), (0, 0, n_ctx, w1)])
+    assert ks.main(["--ref", str(cap), "--compare", "--dump", str(dump), "--out", str(out)]) == 0
+    assert json.loads(out.read_text())["floor"] is None

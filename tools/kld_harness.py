@@ -14,6 +14,16 @@ The UD-Q3_K_XL class was measured PASSING at .0399 against this .0599 bar
 (DECIDED FACTS, 2026-09-10); narrow experts (Flash-Next width 640) tolerate
 ~3-4 bit, not 2-bit.
 
+WHERE THE BAR COMES FROM (REVIEW ba2d5de F2, 2026-09-13): the 2026-08-11
+expert-quantisation campaign on Qwen3.6-35B-A3B -- a DIFFERENT model --
+measured its R0 (UD-Q3_K_XL vs BF16, wikitext-2, -c 512, 64 chunks) at mean
+KLD 0.0399 and SET the bar at 50 % over that R0 = 0.0599 (the note later
+moved it to 0.0581 against a re-uploaded R0). So the ".0399 passing against
+.0599" above is the quantity the bar was built from, not an independent
+pass, and the bar is a chosen multiplier over another model's measurement.
+Whether it is Flash-Next's bar is the operator's decision to record; this
+harness gates on it as inherited.
+
 THE INSTRUMENT MUST BE ABLE TO GO RED. An acceptance check that cannot fail
 measures nothing. ``--self-test`` drives the KL core with synthetic
 distributions and asserts it reads 0 when nothing moved, stays green for a

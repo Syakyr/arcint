@@ -40,6 +40,26 @@ ignored. A sliced dump (rows < n) is refused by name.
 A depth-4 artifact through this tool is the instrument's RED PROBE, not a
 measurement: forty-four layers are missing and the KL must be far above the
 bar. A full-depth artifact is the measurement.
+
+THE INSTRUMENT'S OWN FLOOR (REVIEW ba2d5de F1): served logits at 2,735
+tokens are not run-to-run deterministic on this backend (chunked prefill,
+f16 kernels), so a reading needs its noise floor beside it. `--replay
+--repeat 2` posts every window twice; `--compare` then pairs the last two
+replays and reports KL(A||B) mean/max and argmax agreement over the same
+recorded rows -- the floor the gate's means are read against. A floor near
+the bar makes the bar unreadable; a floor far below it does not make a
+reading pass.
+
+THE BAR (REVIEW ba2d5de F2): 0.0599 nats is NOT derived from Flash-Next. Its
+source is the 2026-08-11 expert-quantisation campaign on a DIFFERENT model,
+Qwen3.6-35B-A3B: R0 = UD-Q3_K_XL against BF16 on wikitext-2 (-c 512, 64
+chunks) measured mean KLD 0.0399, and the bar was set at 50 % over R0 =
+0.0599 (that note later moved it to 0.0581 against a re-uploaded R0).
+kld_harness.py's "UD-Q3_K_XL measured PASSING at .0399 against this bar" is
+that same R0 -- the quantity the bar was built from, not an independent
+pass. Whether 1.5 x another model's R0 is Flash-Next's bar is the
+operator's decision; until it is recorded, this tool prints the number as
+"the inherited bar" and decides nothing.
 """
 import argparse
 import json
@@ -54,6 +74,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "tools"))
 
 QSA_BOUNDARY_TOKENS = 2051
+# INHERITED, not derived here: 1.5 x the Qwen3.6-35B-A3B UD-Q3_K_XL R0 of
+# 0.0399 nats (2026-08-11 campaign, wikitext-2); see the module docstring.
 THRESHOLD_NATS = 0.0599
 DUMP_MAGIC = b"ARCLGT01"
 
@@ -168,7 +190,8 @@ def replay(args):
     import urllib.request
     n_ctx, n_vocab, n_chunk, tokens, _rows = read_capture(args.ref)
     print(f"capture {args.ref}: n_ctx {n_ctx} n_vocab {n_vocab} windows {n_chunk}", flush=True)
-    for w in range(n_chunk):
+    for rep in range(int(args.repeat)):
+      for w in range(n_chunk):
         if args.windows and w not in args.windows:
             continue
         ids = [int(t) for t in tokens[w]]
@@ -180,8 +203,8 @@ def replay(args):
         with urllib.request.urlopen(req, timeout=args.timeout) as resp:
             reply = json.loads(resp.read())
         usage = reply.get("usage", {})
-        print(f"window {w}: {len(ids)} ids -> HTTP OK in {time.time() - t0:.1f}s; usage "
-              f"{usage}; text {reply.get('choices', [{}])[0].get('text', '')!r}", flush=True)
+        print(f"replay {rep} window {w}: {len(ids)} ids -> HTTP OK in {time.time() - t0:.1f}s; "
+              f"usage {usage}; text {reply.get('choices', [{}])[0].get('text', '')!r}", flush=True)
     return 0
 
 
@@ -195,12 +218,13 @@ def compare(args):
     # those, the LAST n_chunk are the replay (the tool posts them in order).
     windows = [w for w in all_windows
                if sum(r[3] for r in w if r[1] < n_ctx and r[1] + r[3] <= n_ctx) == n_ctx]
-    windows = windows[-n_chunk:]
+    replays = windows
+    windows = replays[-n_chunk:]
     print(f"capture: n_ctx {n_ctx} n_vocab {n_vocab} windows {n_chunk}; dump: {len(recs)} "
-          f"records in {len(all_windows)} window(s), {len(windows)} of them {n_ctx}-token "
+          f"records in {len(all_windows)} window(s), {len(replays)} of them {n_ctx}-token "
           f"replays (the rest: the server's load-time probes)", flush=True)
     if len(windows) != n_chunk:
-        raise ValueError(f"dump holds {len(windows)} replayed window(s) of {n_ctx} tokens, "
+        raise ValueError(f"dump holds {len(replays)} replayed window(s) of {n_ctx} tokens, "
                          f"the capture has {n_chunk}")
     first = n_ctx // 2
     n_rows = n_ctx - 1 - first
@@ -236,9 +260,38 @@ def compare(args):
               flush=True)
     report["mean_kl_below"] = float(np.mean(all_below)) if all_below else None
     report["mean_kl_above"] = float(np.mean(all_above)) if all_above else None
+    # THE FLOOR: the previous replay (A) against the last one (B), same rows
+    report["floor"] = None
+    if len(replays) >= 2 * n_chunk:
+        prev = replays[-2 * n_chunk:-n_chunk]
+        fl = []
+        for w in range(n_chunk):
+            a = window_rows(args.dump, prev[w], n_ctx, n_vocab)
+            b = window_rows(args.dump, windows[w], n_ctx, n_vocab)
+            kls, agree, maxdiff = [], 0, 0.0
+            for i in range(n_rows):
+                p = first + i
+                kls.append(kl_ref_vs_served(log_softmax(a[p].astype(np.float64)), b[p]))
+                agree += int(np.argmax(a[p]) == np.argmax(b[p]))
+                maxdiff = max(maxdiff, float(np.abs(a[p] - b[p]).max()))
+            fl.append({"window": w, "mean_kl_a_b": float(np.mean(kls)),
+                       "max_kl_a_b": float(max(kls)), "argmax_agreement": agree / n_rows,
+                       "max_abs_logit_diff": maxdiff})
+            print(f"FLOOR window {w}: KL(A||B) mean {fl[-1]['mean_kl_a_b']:.6e} max "
+                  f"{fl[-1]['max_kl_a_b']:.4e}; argmax agreement {fl[-1]['argmax_agreement']:.4f}; "
+                  f"max |logit diff| {maxdiff:.3f}", flush=True)
+        report["floor"] = {"windows": fl,
+                           "mean_kl_a_b": float(np.mean([f["mean_kl_a_b"] for f in fl])),
+                           "max_kl_a_b": float(max(f["max_kl_a_b"] for f in fl))}
+        print(f"FLOOR ALL: KL(A||B) mean {report['floor']['mean_kl_a_b']:.6e} max "
+              f"{report['floor']['max_kl_a_b']:.4e} -- two replays of the same windows in the "
+              f"same process; the means above are read against this", flush=True)
+    else:
+        print("FLOOR: not measured (one replay; --replay --repeat 2 gives it)", flush=True)
     print(f"ALL: mean KL below {report['mean_kl_below']:.6e} above "
           f"{report['mean_kl_above'] if report['mean_kl_above'] is None else format(report['mean_kl_above'], '.6e')} "
-          f"(threshold {THRESHOLD_NATS} nats; REPORT ONLY)", flush=True)
+          f"(inherited bar {THRESHOLD_NATS} nats = 1.5 x another model's R0; REPORT ONLY)",
+          flush=True)
     if args.out:
         Path(args.out).write_text(json.dumps(report, indent=2) + "\n")
     return 0
@@ -253,6 +306,8 @@ def main(argv=None):
     sub.add_argument("--compare", action="store_true")
     ap.add_argument("--url", default="http://127.0.0.1:8091")
     ap.add_argument("--windows", type=int, nargs="*", default=None)
+    ap.add_argument("--repeat", type=int, default=1,
+                    help="replay every window this many times (2 = the floor)")
     ap.add_argument("--timeout", type=float, default=3600.0)
     ap.add_argument("--dump", default=None, help="the ARCINT_LOGITS_DUMP file")
     ap.add_argument("--out", default=None, help="write the report JSON here")

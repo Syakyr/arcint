@@ -54,7 +54,13 @@ rate under it is not the served rate. `tools/kld_served.py --replay` posts
 the pinned llama.cpp capture's own token windows; `--compare` reconstructs the
 capture's uint16 log-prob rows (transcribed from `perplexity.cpp`, pinned to
 the quantisation step by a cell) and reports mean per-token KL below and at
-or above row 2051. Report only.
+or above row 2051. Report only. Two riders of the ba2d5de review: `--replay
+--repeat 2` measures the served logits' own floor (KL between two replays
+of the same windows: 2.1e-4 nats mean on the A770, one window bit-identical
+and one with 41 of 1,367 argmaxes moved), and the 0.0599 bar is recorded
+as inherited — 1.5 × the Qwen3.6-35B-A3B UD-Q3_K_XL R0 of 0.0399 from the
+2026-08-11 campaign, another model's measurement, the operator's to
+confirm for Flash-Next.
 
 ### Full depth: built, and refused by the host at compile (2026-09-13)
 

@@ -1569,7 +1569,7 @@ constant the allocator names, whether the xe driver spills.
 |---|---|---|
 | F1 | `export_serving_artifact.py --layers 48 --tree 092df69`: build **4,914.5 s** (81.9 min; the fill was SIGSTOPped 14:26–14:50Z for the reviewer's card legs and that pause is not in the figure — the process clock stops with it), 17,354 nodes, **1,030 dense tensors 17,169,341,952 B (15.99 GiB)**, **144 bodies 64,644,710,400 B** (the arithmetic's number to the byte), save 2,141 s, `.bin` **81,948,724,009 B (76.32 GiB)** — 2.07 % under the 83.7 GB predicted (the per-layer dense term was over-estimated from four layers that included the PLE and the final mixer), so the "within 2 %" clause **dies by 0.07 points** and the count clauses hold; sha256 pass 277.9 s; peak host **32.81 GiB** (against the depth-4 run's 21.6 — the row "peak host ≈ the same" was wrong by 11 GiB; the arena's dirty pages and the 76 GiB save both charge the process); no host OOM. xml sha `3f574b776a8dd2c6`, allowlisted as `qwen3.8-flash-next` / `qwen38-flash-next-ov`. | **yes** on the counts, the time and no-OOM; **dies** on the 2 % `.bin` clause and the peak-host guess |
 | F2 | A770, served binary, `--prefill-chunk 1536 --n-ctx 8192`, fenced `systemd-run --user --scope -p MemoryMax=44G` (`served-a770-d48`): `load_artifact` admits, `--ngram-gguf` opens shard 2, `read_model` + `SDPAToPagedAttention` pass, then **6 min 8 s in `compile_model`** during which `fdinfo` showed the constants going to **host memory, not the card**: `drm-resident-gtt` 5.3 → 0.4 → 1.1 → 6.4 → **11.8 GiB** (sawtooth: allocate, convert, release, re-allocate), `drm-resident-vram0` flat at **7.6 MiB** throughout. At 15:13:26Z the host kernel logged `arcint: page allocation failure: order:0, mode:0x104dc2(GFP_HIGHUSER\|__GFP_ZERO\|__GFP_RETRY_MAYFAIL)` from `xe_gem_create_ioctl` with **Mem-Info: shmem 9,767,873 pages (37.3 GiB), free 676,952 pages (2.6 GiB)** — the physical host, not the container — and the plugin threw **`[CL ext] Can not allocate 419430400 bytes for USM Host. ptr: 0, error: -6`** (`CL_OUT_OF_HOST_MEMORY`; 419,430,400 B is one down-projection body `[512, 2560, 640]` u4). arcint exited on the exception; no OOM killer fired; the cgroup fence **never engaged** (driver memory is not charged to it — the caveat measured in §4.9, now with consequence). Teardown clean, leftover 0. | **REFUSED, as predicted — but not by the mechanism predicted.** The prediction named the card's allocator; the device's words name the HOST: this plugin generation stages every constant of the compile in USM host memory before anything reaches VRAM, and 69 GiB of constants meet the host's ~46 GiB first. The "UNTESTED spill" alternative is therefore not an alternative: spilling is what the compile does, and the host is the ceiling it hits. The "dies if" (compile completes) did not occur. |
-| F3 | B60 — **not executed, engineer's call, stated for the operator to overrule**: the refusal is host-side and card-independent (the allocation that failed is USM Host; VRAM was untouched at 7.6 MiB on a card with 8 GiB free), the physical host was within 2.6 GiB of its OOM killer, and a second leg buys the same words at the same risk. The order said "then B60"; this row is where that step was not taken and why. (The word this row avoids is the manifest's marker word.) | — |
+| F3 | B60 — **not executed, engineer's call, sustained by the frontier in the ba2d5de review, still the operator's to overrule**: the refusal is host-side and card-independent (the allocation that failed is USM Host; VRAM was untouched at 7.6 MiB on a card with 8 GiB free), the physical host was within 2.6 GiB of its OOM killer, and a second leg buys the same words at the same risk. The order said "then B60"; this row is where that step was not taken and why. (The word this row avoids is the manifest's marker word.) | — |
 | F4 | **The France question at full depth was not reached.** The line stays EMPTY at full depth; §8's coherence row keeps the depth-4 served token. | **yes** |
 | F5 | Confirmed from an unexpected side: the compile's own staging already needs the whole constant set in host memory, so "experts host-bound" is not a residency choice this plugin can be asked for on this host — it is the failure mode. A route that compiles fewer than 48 layers' experts at once is the only one left (see the handoff's CR). | **yes** |
 
@@ -1624,6 +1624,33 @@ boundary, 683 at or above):
 against the 0.0599 bar, two hundred times over; argmax agreement 1 row in
 1,367. Nothing here is a statement about the model. The same command against
 a full-depth artifact is the gate's measurement — REPORT ONLY.
+
+**The instrument's own floor — `RUN@wt+ba2d5de`, A770, defaults (embeddings
+on the card, served chunk 512), 2026-09-13 15:54–15:59Z
+(`kld-floor-a770-d4`).** REVIEW ba2d5de F1: the reviewer's B60 leg found two
+identical replays of the same windows in the same process differing from row
+14 / 261 onward (chunk 1024; KL(A‖B) 1e-3..5e-3 mean, max 0.24; argmax
+differing in 207 and 115 of 2,735 rows). So the served logits are not
+run-to-run deterministic at this length and a reading needs its floor
+beside it. `--replay --repeat 2` (four 2,735-token prefills, 13.4–15.1 s
+each = 182–204 t/s at chunk 512) and `--compare` pairing the last two
+replays, same recorded rows:
+
+| window | KL(A‖B) mean | KL(A‖B) max | argmax agreement | max \|logit diff\| |
+|---|---|---|---|---|
+| 0 | 4.289103e-04 | 9.6520e-02 | 0.9700 | 2.142 |
+| 1 | 2.170477e-19 | 1.8088e-15 | 1.0000 | 0.000 |
+| **all** | **2.144551e-04** | **9.6520e-02** | | |
+
+Window 1's two replays are **bit-identical**; window 0's differ in 41 of
+1,367 argmaxes with a max KL of 0.097 in one row. The floor is therefore
+not a constant of the backend but a per-window event — which is the
+reviewer's "the mechanism is an increment of its own" — and at 2.1e-4 mean
+it sits 280× below the inherited bar while its max in one row is 1.6× the
+bar. The reference means re-read against replay B: 11.65 / 11.48 (11.6835 /
+11.2465 and 11.6180 / 11.7171 per window), unchanged to the third decimal
+from the single-replay run. Every gate reading from now on carries this
+row beside it; the mechanism is not narrated here.
 
 ## 5. Residency — the SIZE LEDGER, and the number that decides the window
 
@@ -1734,6 +1761,19 @@ KL(P_ref‖P_cand) ≤ **0.0599 nats**. It now pins f32 on GPU devices for the s
 reason §3 gives — a KLD read off an f16 forward is not a measurement of the
 export.
 
+**Where 0.0599 comes from (REVIEW ba2d5de F2, 2026-09-13).** Not from
+Flash-Next. The 2026-08-11 expert-quantisation campaign on Qwen3.6-35B-A3B
+measured its R0 — UD-Q3_K_XL against BF16, wikitext-2, `-c 512 --chunks 64`
+— at mean KLD **0.0399** and set its bar at 50 % over R0 = 0.0599 (later
+moved to 0.0581 against a re-uploaded R0). The harness's "UD-Q3_K_XL
+measured PASSING at .0399 against this bar" is that R0, the quantity the bar
+was built from. So the bar is a chosen multiplier over another model's
+measurement; whether 1.5 × that R0 is Flash-Next's bar is the operator's
+decision to record here. Until then every reading prints it as the
+inherited bar and decides nothing. A second caveat, measured in §4.11: the
+served logits have a noise floor of their own, and a bar is readable only
+against it.
+
 What still stands between the tip and the gate (`UNTESTED` as a whole — the gate
 has not been run on an assembled Flash-Next artifact):
 
@@ -1792,7 +1832,7 @@ record than a blank guessed.
 | expert body declared type | u4, rank-4 [E, out, groups, 128] | `RUN@198b736` contract test |
 | per-expert int4 slice | 2,457,600 B (gate+up+down) | `flash_next_offload.h:45`, re-derived |
 | → as the IR walk reads it | 4,915,200 B = **exactly 2×** | `RUN@198b736` (u4 ceiled to 1 B) |
-| `slot_pool_from_ir` on any arcint IR | **nullopt** — 0 of 172 IRs carry a moe-typed op (52 of them over 100k; the wider census re-run 2026-09-12) | `RUN@198b736` |
+| `slot_pool_from_ir` on any arcint IR | **nullopt** — 0 of 172 IRs carry a moe-typed op (52 of them over 100k; the wider census re-run 2026-09-12). 2026-09-13: the two serving-shape artifacts make it 174; the depth-4 one re-checked by the reviewer — no moe-typed op, `slot_pool` None | `RUN@198b736` |
 | MoE router on GPU | scatter shape OK both cards; one_hot FAILs | `RUN@be57428` §4.3 |
 | → cost of the swap | 0.000000e+00 on CPU | `RUN@be57428` |
 | GDN GPU first bad row | 65, at every T ≥ 66, both cards | `RUN@be57428` §4.2 |
