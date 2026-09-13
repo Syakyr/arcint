@@ -140,6 +140,182 @@ def built():
 
 
 # ---------------------------------------------------------------------------
+# The per-object cap, and the n-gram table that has to live under it
+# ---------------------------------------------------------------------------
+
+# THE NUMBER THE DEVICE WROTE, verbatim. `engine.cpp:319` on the A770:
+# "requested 25600122880 bytes, but max alloc size supported by device is
+# 4294959104 bytes" -- `RUN@be57428` (window-050 §4.4) and again `RUN@8a84598`
+# (§4.6, P3/P6). The B60's is its whole VRAM, 24,385,683,456 B, and the table
+# is above that too. Written here INDEPENDENTLY of the emitter's constant and
+# asserted equal to it below, so neither can drift without the other noticing.
+_A770_MAX_ALLOC_BYTES = 4_294_959_104
+_B60_MAX_ALLOC_BYTES = 24_385_683_456
+# One row of the table: 160 nibbles (`ple_embed_dim / num_ngram_heads` =
+# 2560 / 16, the "160-wide row" ngram_row_ids.h:22 states), packed two to a
+# byte. The port carries bytes; the nibble width is the declared u4's.
+_NGRAM_ROW_BYTES = 80
+
+
+def _ngram_partition_transcribed(cfg):
+    """The chunk row counts, from the arithmetic and not from the emitter:
+    the largest multiple of 4096 rows whose bytes fit the A770 cap, repeated,
+    and the remainder last. Under 4 GiB the whole table is one chunk."""
+    V = (cfg.ngram_total_vocab if hasattr(cfg, "ngram_total_vocab")
+         else pwe.REAL_GEOMETRY["ngram_total_vocab"])
+    if V * _NGRAM_ROW_BYTES <= _A770_MAX_ALLOC_BYTES:
+        return [V]
+    per = (_A770_MAX_ALLOC_BYTES // _NGRAM_ROW_BYTES) // 4096 * 4096
+    full, rest = divmod(V, per)
+    return [per] * full + ([rest] if rest else [])
+
+
+def _constant_bytes(node):
+    """Exact bytes of a Constant, sub-byte types included (u4 is half a byte
+    per element; `element_type.size` would ceil it to one)."""
+    et = node.get_output_element_type(0)
+    elems = int(np.prod(list(node.get_output_shape(0)))) if node.get_output_shape(0) else 1
+    return (elems * et.bitwidth + 7) // 8
+
+
+def test_no_constant_of_the_graph_exceeds_the_per_object_cap(built):
+    """Every Constant the IR carries must be allocatable on the A770 as ONE
+    object, because that is how the GPU plugin allocates a constant -- there
+    is no spill and no split (`engine::check_allocatable`, pinned source: the
+    cap is checked before the allocation type is looked at).
+
+    RED on 37d9b33: `ple/ngram_table_u4`, [320001536, 160] u4 =
+    25,600,122,880 B, which is the exact figure the device refused at
+    engine.cpp:319. That one constant is why no depth >= 2 compiled on either
+    card (window-050 §4.6). This cell is the device's refusal, made
+    device-free and permanent.
+    """
+    model, report, _ = built
+    assert ss.NGRAM_CHUNK_CAP_BYTES == _A770_MAX_ALLOC_BYTES, (
+        "the emitter's cap and the device's measured cap disagree: "
+        f"{ss.NGRAM_CHUNK_CAP_BYTES} vs {_A770_MAX_ALLOC_BYTES}")
+    over = []
+    largest = (0, None)
+    for node in model.get_ordered_ops():
+        if node.get_type_name() != "Constant":
+            continue
+        b = _constant_bytes(node)
+        if b > largest[0]:
+            largest = (b, node.get_friendly_name())
+        if b > _A770_MAX_ALLOC_BYTES:
+            over.append((node.get_friendly_name(),
+                         list(node.get_output_shape(0)),
+                         str(node.get_output_element_type(0)), b))
+    print(f"\n[contract-cap] largest constant {largest[1]!r} at "
+          f"{largest[0]:,} B of the {_A770_MAX_ALLOC_BYTES:,} B cap "
+          f"({largest[0] / _A770_MAX_ALLOC_BYTES * 100:.1f}%)")
+    assert not over, (
+        "constants above the A770's per-object cap, each of which is a "
+        "compile refusal at engine.cpp:319 on both cards:\n"
+        + "\n".join(f"  {n} {s} {t} = {b:,} B" for n, s, t, b in over))
+
+
+def test_the_ngram_table_travels_as_ports_that_partition_the_vocabulary(built):
+    """The table is INPUT, not constant: `ngram_table.K` ports, contiguous
+    from 0, each u8 `[rows_K, 80]`, each under the cap, together exactly the
+    vocabulary. The partition is transcribed by `_ngram_partition_transcribed`
+    and compared -- the emitter's `ngram_table_chunks` is not consulted.
+
+    RED on 37d9b33: no such port exists.
+    """
+    model, report, _ = built
+    cfg = pwe.real_config()
+    want = _ngram_partition_transcribed(cfg)
+    ports = {p.get_node().get_friendly_name(): p for p in model.inputs
+             if p.get_node().get_friendly_name().startswith("ngram_table.")}
+    names = sorted(ports, key=lambda n: int(n.split(".")[1]))
+    assert names == [f"ngram_table.{k}" for k in range(len(want))], (
+        f"table ports {names}; the transcribed partition has {len(want)} chunk(s)")
+    got = []
+    for n in names:
+        shape = [d.get_length() for d in ports[n].get_partial_shape()]
+        assert ports[n].get_element_type() == ov.Type.u8, (n, ports[n].get_element_type())
+        assert len(shape) == 2 and shape[1] == _NGRAM_ROW_BYTES, (n, shape)
+        assert shape[0] * _NGRAM_ROW_BYTES <= _A770_MAX_ALLOC_BYTES, (
+            f"{n}: {shape[0] * _NGRAM_ROW_BYTES:,} B is over the cap")
+        got.append(shape[0])
+    V = pwe.REAL_GEOMETRY["ngram_total_vocab"]
+    print(f"\n[contract-table] {len(got)} port(s) over {V:,} rows x "
+          f"{_NGRAM_ROW_BYTES} B: rows {got}, "
+          f"bytes {[r * _NGRAM_ROW_BYTES for r in got]}")
+    assert sum(got) == V, (sum(got), V)
+    assert got == want, (got, want)
+    # the report carries the same partition, and the byte total is the table
+    assert [r for _, r, _ in report["ngram_table_ports"]] == want
+    assert sum(b for _, _, b in report["ngram_table_ports"]) == V * _NGRAM_ROW_BYTES
+    # and it is NOT a constant of the graph any more: nothing with the
+    # vocabulary as its leading dimension is baked in. (`graph_const_bytes`
+    # cannot carry this check -- it ceils u4 to a byte, so the eight layers'
+    # expert bodies alone read 20 GB there; the first draft of this cell
+    # compared against it and was wrong on a green tree.)
+    baked = [n.get_friendly_name() for n in model.get_ordered_ops()
+             if n.get_type_name() == "Constant"
+             and list(n.get_output_shape(0))[:1] == [V]]
+    assert not baked, f"the table is still a constant: {baked}"
+
+
+def test_the_chunked_gather_is_the_whole_table_gather():
+    """NUMERIC, on CPU, at a toy width: gathering through the chunked ports
+    produces exactly what a Gather over the un-chunked u4 table produces --
+    row by row, nibble by nibble, across every chunk boundary.
+
+    Three chunks (4096, 4096, 1808 rows of 8 B -- the emitter's own
+    partition under a cap of 32,768 B), random bytes in every row, and row
+    ids that include both edges of every chunk. The reference is numpy over
+    the concatenated table: low nibble first.
+
+    RED CASES, run 2026-09-13 on the dev host (CPU, the pinned OV) before
+    this went green, figures pasted from the runs: the nibble order swapped
+    (hi first) -> 306 of 320 values wrong; the chunk id computed from `local`
+    instead of `rid` -> 184 of 320 wrong (every row past chunk 0). Both
+    caught by exact equality; neither would be caught by a shape check. And
+    on the old emitter (37d9b33) the cell cannot run at all: there is no
+    chunked gather to call.
+    """
+    n_rows, row_bytes, cap = 10_000, 8, 4096 * 8
+    head_dim = 2 * row_bytes
+    Hn, T = 4, 5
+    rng = np.random.default_rng(5)
+    table = rng.integers(0, 256, size=(n_rows, row_bytes), dtype=np.uint8)
+    rows = ss.ngram_table_chunks(n_rows, row_bytes, cap)
+    assert rows == [4096, 4096, 1808], rows
+
+    ports = ss.ngram_table_ports(n_rows, row_bytes, cap)
+    row_ids = ov.opset13.parameter([1, T, Hn], ov.Type.i64)
+    row_ids.set_friendly_name("ngram_row_ids")
+    out = ss.ngram_chunked_gather(row_ids, ports, head_dim)
+    model = ov.Model([ov.opset13.result(out)], [row_ids] + ports, "chunked_gather")
+    req = ov.Core().compile_model(model, "CPU").create_infer_request()
+
+    edges = [0, 4095, 4096, 8191, 8192, n_rows - 1]
+    ids = np.concatenate([np.array(edges, np.int64),
+                          rng.integers(0, n_rows, size=T * Hn - len(edges))])
+    ids = ids.reshape(1, T, Hn)
+    req.set_tensor("ngram_row_ids", ov.Tensor(ids))
+    off = 0
+    for k, r in enumerate(rows):
+        req.set_tensor(f"ngram_table.{k}", ov.Tensor(np.ascontiguousarray(table[off:off + r])))
+        off += r
+    req.infer()
+    got = req.get_output_tensor(0).data
+
+    picked = table[ids]                                       # [1,T,Hn,row_bytes]
+    ref = np.empty(picked.shape[:-1] + (head_dim,), np.float32)
+    ref[..., 0::2] = picked & 0x0F
+    ref[..., 1::2] = picked >> 4
+    print(f"\n[chunked-gather] {len(rows)} chunks {rows}, {ids.size} ids incl. "
+          f"edges {edges}; out {got.shape} {got.dtype}; "
+          f"mismatches {int((got != ref).sum())} of {ref.size}")
+    assert got.shape == ref.shape and got.dtype == np.float32
+    assert np.array_equal(got, ref)
+
+
+# ---------------------------------------------------------------------------
 # MET -- the port contract, tensor for tensor name
 # ---------------------------------------------------------------------------
 
@@ -172,6 +348,11 @@ def test_the_input_ports_are_the_names_and_shapes_the_serving_path_feeds(built):
         "attention_mask": ((1, -1), "int64_t"),
         "beam_idx":       ((-1,), "int32_t"),
     }
+    # The n-gram table's ports, one per chunk under the A770's per-object cap
+    # (increment 5). The partition is transcribed here, not imported, so the
+    # cell checks the emitter against arithmetic rather than against itself.
+    for k, rows in enumerate(_ngram_partition_transcribed(cfg)):
+        want[f"ngram_table.{k}"] = ((rows, _NGRAM_ROW_BYTES), "uint8_t")
     print("\n[contract-ports] inputs:")
     for k in sorted(got):
         print(f"  {k:16s} {got[k][0]}  {got[k][1]}")
@@ -1132,6 +1313,14 @@ def test_the_converted_surface_against_every_tensor_the_forward_feeds(
         "ngram_row_ids",
         "conv_mask",
     }
+    # The n-gram table's chunk ports (increment 5): a LOAD-TIME binding, like
+    # the KV pools and the state rows, not a per-forward feed -- and the
+    # runtime has no site for it yet. `load_ngram_lookup` mmaps the table
+    # behind --flash-next-ngram and gathers on the host; nothing hands that
+    # mapping to a compiled model's ports. One family, as many ports as the
+    # transcribed partition says, every one of them never fed today.
+    expected |= {f"ngram_table.{k}"
+                 for k in range(len(_ngram_partition_transcribed(pwe.real_config())))}
     print("\n[contract-feed] the forward feeds, unconditionally:")
     for name, c in _FORWARD_ALSO_FEEDS:
         print(f"  {name:26s} {c:22s} "
@@ -1392,7 +1581,9 @@ finally:
 def test_the_full_48_layer_stack_emits_at_real_geometry():
     """FULL GEOMETRY STRUCTURE EMISSION -- the thing the refusal said was
     blocked. 48 layers, 36 GDN + 12 dense-causal, real widths, real vocabulary,
-    experts slot-referenced, PLE table declared and never materialised.
+    experts slot-referenced, PLE table carried as chunk PORTS (increment 5;
+    it was a declared-never-materialised constant until the device refused
+    it as one object, window-050 §4.6).
 
     AND ITS RESIDENCY, which until CF-RESIDENT nothing measured. The headline
     is "183 GiB declared, built on a 48 GiB host". This paragraph used to name

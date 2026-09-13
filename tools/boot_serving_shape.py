@@ -131,6 +131,10 @@ def main(argv=None):
                  f"{rep['attn_layers']} attn) peak_host_GiB={peak_rss_gib():.2f}")
     for name, shape, et in rep["inputs"]:
         say("build", f"input  {name:16s} {shape} {et}")
+    say("build", f"ngram table: {rep['ngram_table_rows']:,} rows x "
+                 f"{rep['ngram_row_bytes']} B over {len(rep['ngram_table_ports'])} "
+                 f"port(s) under cap {rep['ngram_chunk_cap_bytes']:,}: "
+                 + ", ".join(f"{n}[{r:,}]={b:,}B" for n, r, b in rep["ngram_table_ports"]))
 
     # ---- protos (backend_ov.cpp:2557-2569) -----------------------------------
     conv_proto, gdn_proto = [], []
@@ -221,6 +225,54 @@ def main(argv=None):
             return exc
         fed.append(name)
         return None
+
+    def gpu_mem(label):
+        """GPU_MEMORY_STATISTICS by allocation type, GiB, so a table that the
+        plugin silently copied to the device shows up as usm_device growth."""
+        if not dev.startswith("GPU"):
+            return
+        try:
+            st = dict(core.get_property(dev, "GPU_MEMORY_STATISTICS"))
+            say("gpu-mem", f"{label}: " + " ".join(
+                f"{k}={v / 2 ** 30:.2f}GiB" for k, v in sorted(st.items()) if v))
+        except Exception as exc:                                  # noqa: BLE001
+            say("gpu-mem", f"{label}: unavailable ({one_line(exc)})")
+
+    # ---- the n-gram table: bound ONCE per request, from host memory ------------
+    # Increment 5. The table is `ngram_table.K` ports, one per chunk under the
+    # A770's per-object cap. On a GPU each chunk is a USM-host tensor from the
+    # device's own context: the plugin shares such a tensor with the graph
+    # without copying it to the device (sync_infer_request.cpp `prepare_input`,
+    # `is_usm_host_tensor && !convert_needed`), which is what "host-mmap tier"
+    # means for a compiled graph. The rows are whatever the allocation holds --
+    # unwritten, like every weight here. `gpu-mem` lines before and after say
+    # where the bytes went.
+    table_ports = sorted((nm for nm in declared if nm.startswith("ngram_table.")),
+                         key=lambda nm: int(nm.split(".")[1]))
+    if table_ports:
+        gpu_mem("before table")
+        tctx = core.get_default_context(dev) if dev.startswith("GPU") else None
+        t0 = time.time()
+        total = 0
+        for name in table_ports:
+            sh = dims(declared[name])
+            et = declared[name].get_element_type()
+            try:
+                t = (tctx.create_host_tensor(et, ov.Shape(sh)) if tctx
+                     else ov.Tensor(et, ov.Shape(sh)))
+            except Exception as exc:                              # noqa: BLE001
+                say("table", f"{name}{sh}: ALLOC FAIL " + one_line(exc))
+                arena.close()
+                return 0
+            total += int(np.prod(sh))
+            if feed(name, t) is not None:
+                arena.close()
+                return 0
+        say("table", f"bound {len(table_ports)} port(s), {total:,} B "
+                     f"({total / 2 ** 30:.2f} GiB) of "
+                     f"{'USM host' if tctx else 'host'} memory in "
+                     f"{time.time() - t0:.2f}s peak_host_GiB={peak_rss_gib():.2f}")
+        gpu_mem("after table")
 
     if not args.no_pass:
         ctx = core.get_default_context(dev) if dev.startswith("GPU") else None
@@ -328,6 +380,15 @@ def main(argv=None):
                    f"absmax={float(np.abs(lg).max()):.4e}")
     say("forward", f"argmax per position: {[int(r.argmax()) for r in rows]}")
     say("forward", f"RAW OUTPUT (greedy, last position): {int(rows[-1].argmax())}")
+    gpu_mem("after infer")
+    # a second forward on the same request: the first one pays the kernel
+    # jit (feedback-first-request-compiles-kernels); the second is the rate
+    t0 = time.time()
+    try:
+        req.infer()
+        say("forward", f"INFER #2 OK {time.time() - t0:.3f}s")
+    except Exception as exc:                                      # noqa: BLE001
+        say("forward", f"INFER #2 FAIL after {time.time() - t0:.3f}s " + one_line(exc))
 
     # ---- the static-T probe: what a DECODE step would meet -----------------------
     # A decode step feeds one token. The query block is static in T, so the

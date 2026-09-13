@@ -520,9 +520,11 @@ def parse_args(argv=None):
     ap.add_argument("--serving-shape", dest="serving_shape", action="store_true",
                     help="verify the FULL-GEOMETRY serving-shape IR: 48 layers "
                          "at real widths, expert bodies slot-referenced as u4 "
-                         "and never materialised, PLE via ngram_row_ids. Prints "
-                         "the structure report and the expert-slot arithmetic. "
-                         "Device-free, needs no shards, writes nothing.")
+                         "and never materialised, the PLE table as chunk ports "
+                         "under the A770's per-object cap, indexed by "
+                         "ngram_row_ids. Prints the structure report and the "
+                         "expert-slot arithmetic. Device-free, needs no shards, "
+                         "writes nothing.")
     ap.add_argument("--dry-run", action="store_true",
                     help="run passthrough + sidecar only, skip the backbone "
                     "build. Test-hook; write_output_layout(verify=False) is "
@@ -563,6 +565,10 @@ def verify_serving_shape(seq_len=64, n_layers=None):
             print(f"  input   {name:16s} {shape}  {etype}")
         for name, shape, etype in rep["outputs"]:
             print(f"  output  {name:16s} {shape}  {etype}")
+        print(f"  ngram table           {rep['ngram_table_rows']:,} rows x "
+              f"{rep['ngram_row_bytes']} B as {len(rep['ngram_table_ports'])} "
+              f"port(s) under {rep['ngram_chunk_cap_bytes']:,} B each "
+              f"(not a constant; bound from host memory per request)")
         sp = ss.slot_pool_from_ir(model, cfg.num_experts, 0)
         print(f"  slot_pool_from_ir (backend_ov.cpp:577) -> {sp}")
         if sp is None:

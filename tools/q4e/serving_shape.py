@@ -125,13 +125,30 @@ module emits byte-identical in STRUCTURE to the ones the parity suites gate.
   them. The pass therefore produces EVERY port in the contract, and the
   strict xfail that carried the gap RETIRED when the last row of the table
   flipped -- which is what it was written strict for.
-* The PLE n-gram table is declared as a Constant here so that the gather has
-  something to index. In SERVING it is the host-mmap tier, read through
-  `src/exec/ngram_table.h` (Link 3) and `src/exec/ngram_gather.h`, never an
-  emitted constant. That divergence is deliberate and is recorded rather than
-  hidden: what this module emits is the kernel-side gather's STRUCTURE, and
-  which of the two the 0.5.0 artifact ships is a frontier decision, not one
-  this file makes.
+* The PLE n-gram table is NOT a constant of this graph any more (2026-09-13,
+  increment 5). It used to be declared as one u4 Constant so the gather had
+  something to index, and the device wrote the refusal: ONE object of
+  25,600,122,880 B, above the A770's 4,294,959,104 B per-object cap and above
+  the B60's whole 24,385,683,456 B (window-050 §4.6, P3/P3b/P6). Chunking it
+  into sub-cap CONSTANTS was falsified before any card was touched, by three
+  measured numbers and one inequality: 25,600,122,880 B of table exceeds the
+  A770's 16,225,243,136 B and the B60's 24,385,683,456 B of VRAM whether it is
+  one object or six, so a chunked-constant graph cannot be resident on
+  either card. The table is now carried as PARAMETER PORTS `ngram_table.K`,
+  u8 `[rows_K, row_bytes]`, each under the cap (`ngram_table_chunks`), fed at
+  request time from host memory -- the host-mmap tier the served runtime
+  already reads through `src/exec/ngram_table.h`, handed to the graph instead
+  of gathered beside it. The gather stays IN the graph (`ngram_chunked_gather`:
+  chunk id and local row derived from the fed row id, one Gather per port, a
+  Select to pick the chunk's row). Why u8 and not the declared u4: the GPU
+  plugin rewrites a u4 Parameter to u8 anyway (`transformations_pipeline.cpp`
+  `int_convert_precision_map`, pinned source), and a USM-host tensor is shared
+  with the graph WITHOUT a device copy only when its element type is the
+  port's own (`sync_infer_request.cpp` `prepare_input`, the `is_usm_host_tensor
+  && !convert_needed` branch). The nibble unpack after the gather is this
+  graph's stand-in for the row format, low nibble first; the shipped rows are
+  block-quantised and dequantised host-side today (`ngram_gather.h`), and which
+  side dequantises in the 0.5.0 artifact is still the frontier's decision.
 """
 import contextlib
 import os
@@ -153,7 +170,46 @@ from . import piecewise_export as pwe
 # The n-gram table's element type as DECLARED in the serving-shape IR. The
 # shipped tensor is IQ4_NL, which OpenVINO has no element type for; u4 carries
 # the same nibble width, which is what the residency arithmetic depends on.
+# Since increment 5 the table is not a constant of the graph: its rows travel
+# as u8 BYTES over the `ngram_table.K` ports (NGRAM_PORT_TYPE) and the nibble
+# width lives in `row_bytes = head_dim * u4.bitwidth / 8`.
 NGRAM_DECLARED_TYPE = Type.u4
+NGRAM_PORT_TYPE = Type.u8
+# The per-object allocation cap the table is chunked under: the A770's, as the
+# GPU plugin reported it at engine.cpp:319 (`RUN@be57428`, window-050 §4.4,
+# re-read verbatim by `RUN@8a84598` §4.6). The tighter of the two cards, and
+# the check applies to USM-host allocations too (engine.cpp `check_allocatable`
+# runs before the allocation type is looked at). A build for a card with a
+# wider cap passes its own; nothing here reads the device.
+NGRAM_CHUNK_CAP_BYTES = 4_294_959_104
+# Chunk row counts are rounded down to a multiple of this so a chunk boundary
+# never falls inside a page of the host mapping that serves it.
+NGRAM_CHUNK_ROW_ALIGN = 4096
+
+
+def ngram_table_chunks(n_rows, row_bytes, cap_bytes=NGRAM_CHUNK_CAP_BYTES,
+                       align=NGRAM_CHUNK_ROW_ALIGN):
+    """The row partition of an `[n_rows, row_bytes]` table into objects that
+    each stay under `cap_bytes`: a list of row counts, in port order, summing
+    to `n_rows`. Every chunk but the last has `rows_per_chunk` rows, the
+    largest multiple of `align` whose byte size fits the cap; the last takes
+    the remainder. A table that fits is one chunk of `n_rows`.
+
+    This is the ONE place the partition is computed. The contract cell
+    transcribes the arithmetic independently rather than importing it, and the
+    served runtime reads the partition off the compiled model's port shapes
+    rather than off any config -- so the artifact carries its own cap.
+    """
+    n_rows, row_bytes = int(n_rows), int(row_bytes)
+    assert n_rows > 0 and row_bytes > 0, (n_rows, row_bytes)
+    if n_rows * row_bytes <= cap_bytes:
+        return [n_rows]
+    per = (cap_bytes // row_bytes) // align * align
+    assert per > 0, (
+        f"a single aligned row block of {align} x {row_bytes} B does not fit "
+        f"the {cap_bytes} B cap")
+    full, rest = divmod(n_rows, per)
+    return [per] * full + ([rest] if rest else [])
 # The expert bodies' declared type: the tiled lowering's compressed-weight
 # family (verify_moe_lowering.py:30 "u4/i4/u8/i8"); u4 matches the shipped
 # int4 slice width that exec/flash_next_offload.h:45 sizes the slot pool from
@@ -429,6 +485,83 @@ def shared_constants():
 
 
 # --------------------------------------------------------------------------
+# The n-gram table as PORTS, and the gather that indexes them
+# --------------------------------------------------------------------------
+
+def ngram_table_ports(n_rows, row_bytes, cap_bytes=NGRAM_CHUNK_CAP_BYTES):
+    """One u8 Parameter per chunk of `ngram_table_chunks`, named
+    `ngram_table.K` in row order, static `[rows_K, row_bytes]`.
+
+    STATIC on purpose, both dims. A static input is what the GPU plugin defers
+    allocating until a tensor is set (`allocate_inputs`: "Reserve a null slot;
+    materialized lazily or replaced by set_tensor()") -- a dynamic one is
+    allocated eagerly at request creation. And the static row count is the
+    contract the served runtime reads the partition off: the port shapes ARE
+    the chunk table, no config carries it.
+    """
+    ports = []
+    for k, rows in enumerate(ngram_table_chunks(n_rows, row_bytes, cap_bytes)):
+        p = op.parameter([int(rows), int(row_bytes)], NGRAM_PORT_TYPE)
+        p.set_friendly_name(f"ngram_table.{k}")
+        p.output(0).set_names({f"ngram_table.{k}"})
+        ports.append(p)
+    return ports
+
+
+def ngram_chunked_gather(row_ids, ports, head_dim):
+    """`[1, T, Hn]` i64 row ids over the chunked table -> `[1, T, Hn, head_dim]`
+    f32, the same tensor a Gather over the whole `[n_rows, head_dim]` u4 table
+    would produce, nibbles unpacked LOW FIRST (element 2j is the low nibble of
+    byte j, 2j+1 the high one).
+
+    The row id is decomposed IN THE GRAPH, in i32 -- exact, since every row id
+    is below the 320,001,536-row table and so below 2**31, and i32 is the width
+    the measured-broken i64 integer path (q4e.ple's header) is not trusted
+    past. Every chunk is gathered, at its own local row where the id lands in
+    it and at row 0 otherwise, so no Gather ever sees an out-of-range index
+    (OpenVINO's Gather does not throw for one; it reads something). One Select
+    per chunk then keeps the row of the chunk the id named. The cost is
+    `len(ports)` gathers of T x Hn rows each -- bytes, not the table.
+
+    The chunk size is read off the FIRST port's shape, so the decomposition
+    and the ports cannot disagree; the last chunk may be shorter and is never
+    indexed past its end for a valid id.
+    """
+    i32 = lambda v: op.constant(np.array(v, np.int32))
+    per = int(ports[0].get_output_partial_shape(0)[0].get_length())
+    row_bytes = int(ports[0].get_output_partial_shape(0)[1].get_length())
+    assert head_dim == 2 * row_bytes, (head_dim, row_bytes)
+
+    rid = op.convert(row_ids, Type.i32)                        # [1,T,Hn]
+    chunk = op.divide(rid, i32(per))                           # floor, ints
+    local = op.subtract(rid, op.multiply(chunk, i32(per)))
+    zero = op.multiply(local, i32(0))
+    picked = None
+    for k, port in enumerate(ports):
+        here = op.equal(chunk, i32(k))                         # [1,T,Hn] bool
+        idx = op.select(here, local, zero)
+        rows = op.gather(port, idx, op.constant(np.array(0, np.int64)))
+        rows.set_friendly_name(f"ple/ngram_gather.{k}")       # [1,T,Hn,row_bytes]
+        if picked is None:
+            picked = rows
+        else:
+            picked = op.select(op.unsqueeze(here, i32(-1)), rows, picked)
+
+    x = op.convert(picked, Type.f32)                           # bytes as f32
+    hi = op.floor(op.divide(x, op.constant(np.array(16.0, np.float32))))
+    lo = op.subtract(x, op.multiply(hi, op.constant(np.array(16.0, np.float32))))
+    pair = op.concat([op.unsqueeze(lo, i32(-1)), op.unsqueeze(hi, i32(-1))],
+                     axis=-1)                                  # [1,T,Hn,rb,2]
+    shape = op.concat([
+        op.slice(op.shape_of(x, output_type="i64"),
+                 op.constant(np.array([0], np.int64)),
+                 op.constant(np.array([3], np.int64)),
+                 op.constant(np.array([1], np.int64))),
+        op.constant(np.array([head_dim], np.int64))], axis=0)
+    return op.reshape(pair, shape, special_zero=False)         # [1,T,Hn,head_dim]
+
+
+# --------------------------------------------------------------------------
 # The tiled MoE layer, expert bodies slot-referenced
 # --------------------------------------------------------------------------
 
@@ -631,12 +764,18 @@ def _ple_state(arena, config):
 
 
 def build_serving_shape_ir(config=None, seq_len=64, arena=None, n_layers=None,
-                           filler=None):
+                           filler=None,
+                           ngram_chunk_cap_bytes=NGRAM_CHUNK_CAP_BYTES):
     """The full-geometry serving-shape backbone as an ov::Model.
 
     Inputs
         input_ids        [1, T]      i64
         position_ids     [1, T]      i64
+        ngram_table.K    [rows_K, 80] u8   -- the n-gram table, one port per
+                                             chunk under `ngram_chunk_cap_bytes`
+                                             (ngram_table_ports), bound once
+                                             per request from host memory;
+                                             80 = 160 nibbles of one row
         ngram_row_ids    [1, T, 16]  i64   -- the hashed n-gram row ids, one per
                                              n-gram head; 16 = (ngram_size-1) *
                                              heads_per_ngram, exactly
@@ -699,14 +838,15 @@ def build_serving_shape_ir(config=None, seq_len=64, arena=None, n_layers=None,
             emb = op.gather(qgdn._c(embed_w), input_ids, qgdn._i(0))    # [1,T,H]
             hidden = op.tile(emb, op.constant(np.array([1, 1, hc], np.int64)))
 
-            # the n-gram table: declared, never materialised. In SERVING this is
-            # the host-mmap tier (src/exec/ngram_table.h Link 3); here it is the
-            # kernel-side gather's structure.
-            ngram_table = ar.constant([cfg.ngram_total_vocab
-                                       if hasattr(cfg, "ngram_total_vocab")
-                                       else pwe.REAL_GEOMETRY["ngram_total_vocab"],
-                                       head_dim], NGRAM_DECLARED_TYPE)
-            ngram_table.set_friendly_name("ple/ngram_table_u4")
+            # the n-gram table: PORTS, one per sub-cap chunk, never a constant
+            # (module docstring §4). The host-mmap tier serving reads through
+            # src/exec/ngram_table.h is what gets bound to them.
+            ngram_rows = (cfg.ngram_total_vocab
+                          if hasattr(cfg, "ngram_total_vocab")
+                          else pwe.REAL_GEOMETRY["ngram_total_vocab"])
+            ngram_row_bytes = (head_dim * NGRAM_DECLARED_TYPE.bitwidth + 7) // 8
+            table_ports = ngram_table_ports(ngram_rows, ngram_row_bytes,
+                                            ngram_chunk_cap_bytes)
 
             kinds = []
             for i in range(nl):
@@ -716,10 +856,8 @@ def build_serving_shape_ir(config=None, seq_len=64, arena=None, n_layers=None,
 
                 if i == ple_layer_idx:
                     # pin 1283: hidden = hidden + ple(...), ADDITIVE
-                    gathered = op.gather(op.multiply(
-                        op.convert(ngram_table, Type.f32),
-                        op.constant(np.ones((1, 1), np.float32))),
-                        row_ids, qgdn._i(0))                # [1,T,Hn,head_dim]
+                    gathered = ngram_chunked_gather(
+                        row_ids, table_ports, head_dim)     # [1,T,Hn,head_dim]
                     emb_ple = op.reshape(
                         gathered,
                         op.constant(np.array([1, T, Hn * head_dim], np.int64)),
@@ -761,7 +899,8 @@ def build_serving_shape_ir(config=None, seq_len=64, arena=None, n_layers=None,
             res.set_friendly_name("logits")
 
             model = Model([res], sinks,
-                          [input_ids, pid, row_ids, conv_mask, attn_mask, beam],
+                          [input_ids, pid, row_ids, conv_mask, attn_mask, beam]
+                          + table_ports,
                           "qwen4_exp_serving_shape")
 
         nodes, const_bytes, counts = pwe.graph_measures(model)
@@ -773,6 +912,16 @@ def build_serving_shape_ir(config=None, seq_len=64, arena=None, n_layers=None,
             "nodes": nodes,
             "graph_const_bytes": const_bytes,
             "op_histogram": counts,
+            # the table as it now travels: rows per port, bytes per port, and
+            # the cap they were cut under. Not counted in graph_const_bytes --
+            # it is not a constant any more, which is the point.
+            "ngram_table_rows": int(ngram_rows),
+            "ngram_row_bytes": int(ngram_row_bytes),
+            "ngram_chunk_cap_bytes": int(ngram_chunk_cap_bytes),
+            "ngram_table_ports": [
+                (p.get_friendly_name(), int(_dims(p.output(0))[0]),
+                 int(_dims(p.output(0))[0]) * int(ngram_row_bytes))
+                for p in table_ports],
             "arena_declared_bytes": ar.declared_bytes,
             "arena_written_bytes": ar.written_bytes,
             "arena_disk_kib": ar.disk_kib(),
@@ -1314,5 +1463,7 @@ __all__ = [
     "SparseArena", "shared_constants", "build_serving_shape_ir",
     "emit_moe_tiled", "emit_stateful_attention", "stateful_short_conv",
     "stateful_gdn_core", "slot_pool_from_ir",
-    "EXPERT_DECLARED_TYPE", "NGRAM_DECLARED_TYPE", "EXPERT_GROUP_SIZE",
+    "ngram_table_chunks", "ngram_table_ports", "ngram_chunked_gather",
+    "EXPERT_DECLARED_TYPE", "NGRAM_DECLARED_TYPE", "NGRAM_PORT_TYPE",
+    "NGRAM_CHUNK_CAP_BYTES", "NGRAM_CHUNK_ROW_ALIGN", "EXPERT_GROUP_SIZE",
 ]

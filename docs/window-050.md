@@ -1022,6 +1022,143 @@ self-match class already on record), not a leftover process; every later leg
 swept clean and both cards were free at the end.
 
 
+## 4.7 INCREMENT 5 — MAKE A DEPTH COMPILE, PREDICTED BEFORE IT RAN (2026-09-13)
+
+Written with **no card output in existence** for the tree it predicts. The
+device's spec from §4.6 was three lines: (a) the n-gram table leaves the graph
+as a constant or is chunked under the A770's cap; (b) the minimum served depth
+is 4; (c) there is no unfused control. What this increment did about each,
+device-free, before the window — and what the window is asked to falsify.
+
+### (a) The table — chunked CONSTANTS falsified first, by arithmetic
+
+The route sketch named "chunk the table into sub-cap constant objects, row ids
+indexing the slice" as the smallest change. It is dead before any card is
+touched, on three numbers this manifest already holds:
+
+| term | value | provenance |
+|---|---|---|
+| the table, any way it is cut | 25,600,122,880 B | `RUN@be57428` §4.4, `RUN@8a84598` §4.6 |
+| A770 VRAM, total | 16,225,243,136 B | `RUN@e78812d` §8 enumeration |
+| B60 VRAM, total | 24,385,683,456 B | `RUN@e78812d` §8 enumeration |
+
+A GPU-plugin constant is device-resident, whole. Six objects of 4.27 GB are
+still 25.6 GB of device memory, and neither card has it: the table exceeds the
+A770's VRAM by 9.4 GB and the B60's by 1.2 GB **whether it is one object or
+six**. The only way "chunked constants" could compile is if the kernel driver
+evicted the chunks to system memory under pressure — which is not a route
+anyone designed, and is the mechanism behind this host's recorded freeze class
+(the xe CAT-error item: a direct-submission BO evicted under VRAM pressure).
+That is why it was falsified on paper and NOT probed on the card: the probe
+IS the hazard. `UNTESTED`, deliberately: whether the plugin or driver spills a
+chunked-constant graph to host memory, and at what cost.
+
+**What landed instead: the table is PARAMETER PORTS.** `ngram_table.K`, u8
+`[rows_K, 80]`, one per chunk under the A770 cap, six of them at real
+geometry — five of 53,686,272 rows (4,294,901,760 B, 57,344 B under the cap)
+and a last of 51,570,176 — bound once per request from host memory. The
+gather stays in the graph (`q4e.serving_shape.ngram_chunked_gather`: chunk id
+and local row derived from the fed id in i32, one Gather per port at a
+clamped index, one Select per chunk, nibbles unpacked low-first after the
+gather). This is the host-mmap tier the served runtime already reads through
+`src/exec/ngram_table.h`, handed to the compiled graph instead of gathered
+beside it. Three facts from the pinned plugin source decided the form, each
+one a thing the window checks rather than trusts:
+
+- the per-object cap is checked in `engine::check_allocatable` BEFORE the
+  allocation type is looked at, so a USM-host object is capped the same as a
+  device one → chunk under the cap even though it lives on the host;
+- `SyncInferRequest::allocate_inputs` defers a STATIC input's allocation
+  ("reserve a null slot; materialized lazily or replaced by set_tensor()") and
+  allocates a dynamic one eagerly → the ports are static, so creating the
+  request allocates none of the 25.6 GB on the device;
+- `prepare_input` shares a USM-host tensor from the device's own context with
+  the graph without a device copy only when `!convert_needed`, and the
+  precision pipeline rewrites a u4 Parameter to u8 anyway → the ports are u8
+  bytes of a row, not the declared u4.
+
+Device-free gates, all green on this tree and all RED on `37d9b33` (run on the
+dev host, CPU, one extract per tree):
+`test_no_constant_of_the_graph_exceeds_the_per_object_cap` (red: exactly
+`ple/ngram_table_u4 [320001536,160] u4 = 25,600,122,880 B`),
+`test_the_ngram_table_travels_as_ports_that_partition_the_vocabulary`,
+`test_the_chunked_gather_is_the_whole_table_gather` (numeric, CPU, every chunk
+edge; mutations hi-nibble-first 306/320 wrong, chunk-from-local 184/320
+wrong), and the two contract cells whose recorded sets moved.
+
+### (b) Depth 4 is the ladder's first rung — nothing predicted for 1–3
+
+Unchanged from §4.6 P1: the pass refuses without an SDPA. The window runs no
+leg below 4.
+
+### (c) The witness is the FUSED graph — decided, with the alternative measured
+
+The static-length alternative was checked device-free rather than left as "a
+design question": a short-conv Variable of `[1, conv_dim, K]` with the beam
+Gather dropped **still matches** `PagedCausalConv1DFusion` (pass output at
+depth 4: `PagedCausalConv1D 3, PagedGatedDeltaNet 3, PagedAttentionExtension
+1`, every port), and the unfused depth-1 graph in that form **compiles and
+infers on CPU** (absmax 0.0) where §4.6 P5's form died at the Assign. So a
+control is one line away. It is NOT adopted, for three reasons: the served
+path never runs the unfused graph, so a control witnesses nothing the served
+path needs; adopting it changes a construct the ports table was read against
+(the served artifact's own `[?, ...]` state plus beam Gather) for the benefit
+of a leg the served path does not have; and if the fused graph compiles, the
+control has nothing left to say — while if it does not, the static form is the
+localisation tool, one line away, and gets used then. The witness for this
+increment is the fused graph at depth 4 on the A770, which is also the
+acceptance.
+
+### The prediction — probe first, then the boot
+
+The probe (`tools/probe_ngram_table_ports.py`) runs BEFORE the boot because
+the boot cannot tell a wrong row from a right one: every weight there is an
+unwritten page. The probe writes sentinel rows, a function of the GLOBAL row
+index, at both edges of every chunk, and gathers them through the same
+`ngram_chunked_gather` the IR emits.
+
+| # | leg | prediction (written before the run) | dies if |
+|---|---|---|---|
+| Q1 | probe, A770, `--rows 4096 --chunks 3` | compile OK; 3 USM-host tensors; verdict **EXACT** (0 rows wrong) — the Select picks the right port across both boundaries on the card | any row wrong |
+| Q2 | probe, A770, `--rows 53686272 --chunks 1` = 4,294,901,760 B, one object | allocation **accepted** (57,344 B under the cap); `usm_host` grows by 4.00 GiB and `usm_device` does NOT; verdict **EXACT**, including the row at byte offset 4,294,901,680 — `gather_ref.cl` indexes in `uint` and that offset is under 2³² | refused at alloc (the cap counts USM-host differently); or `usm_device` grows by ~4 GiB (a device copy — the shared path was not taken); or the top rows mismatch (index arithmetic overflow) |
+| Q3 | probe, A770, `--over-cap` | **REFUSED** at `engine.cpp:319`, `requested 25600122880 bytes, but max alloc size supported by device is 4294959104 bytes` — the same text the constant drew | the whole table is accepted as one USM-host object |
+| B1 | boot, pass, depth 4 | OK; census as §4.6 P2; the six `ngram_table.K` ports survive the pass untouched | the pass touches or drops them |
+| B2 | boot, **compile, depth 4, A770**, served props (`KV_CACHE_PRECISION` u8) | **OK** — the acceptance of this increment. No allocation of the table happens here (static inputs are lazy) | any refusal, named |
+| B3 | table binding | 6 USM-host tensors, 23.84 GiB, bound; `usm_host` +23.84 GiB, `usm_device` unchanged by them | `usm_device` grows by the table, or a binding is refused |
+| B4 | served feed order | **first refusal at `set_tensor(inputs_embeds)`**: the IR declares `input_ids`, the forward feeds `inputs_embeds` (§4.6, the contract cell's `NOT DECLARED`). This is the France line's served-path signature | the served feed reaches `infer()` |
+| B5 | `--probe` (input_ids in place of inputs_embeds, LABELLED) | infer OK, `finite=True`, `absmax=0.0000e+00`, argmax `0` at all five positions, RAW greedy token **0**; second infer OK | any refusal; any non-zero logit |
+| B6 | decode probe | a `[1, 1]` block against the `[1, 5]` port is refused at `set_tensor` with the shape text | accepted |
+| B7 | the same ladder on the **B60** | as B2–B6 | any difference between the cards, named |
+
+**Not predicted**, on purpose: compile seconds, infer seconds, the host cost
+of 23.84 GiB of USM-host allocation (whether the driver commits the pages on
+allocation), peak host RSS. First readings.
+
+**The §8 France line after this window**, if the table holds: the served-path
+signature (B4) and the labelled probe's token (B5), both dated, in place of
+§4.6's refusal. A token id `0` from zero weights is not an answer and is not
+written as one; it is the first forward the served path's own compiled graph
+has returned on this IR. Paris is still not dated by this increment — the
+weights are unwritten pages — and the frontier order's three suspects (fed
+inputs, the static query block, the rope span) become measurable the moment
+B5 holds, which is what the order asked for.
+
+### The commands, in order (one process per leg, `timeout -s KILL 1200` each)
+
+```
+# probe, A770 (reserved card) — Q1, Q2, Q3
+<venv>/bin/python tools/probe_ngram_table_ports.py --device GPU.1 --rows 4096 --chunks 3
+<venv>/bin/python tools/probe_ngram_table_ports.py --device GPU.1 --rows 53686272 --chunks 1
+<venv>/bin/python tools/probe_ngram_table_ports.py --device GPU.1 --over-cap
+# boot, depth 4 — B1..B6 on the A770, then B7 on the B60
+<venv>/bin/python tools/boot_serving_shape.py --layers 4 --stage pass
+<venv>/bin/python tools/boot_serving_shape.py --layers 4 --device GPU.1 --ids 760,6511,314,9338,369
+<venv>/bin/python tools/boot_serving_shape.py --layers 4 --device GPU.1 --ids 760,6511,314,9338,369 --probe
+<venv>/bin/python tools/boot_serving_shape.py --layers 4 --device GPU.0 --ids 760,6511,314,9338,369 --probe
+```
+
+### Measured — `UNTESTED`, filled by the measurement commit
+
 ## 5. Residency — the SIZE LEDGER, and the number that decides the window
 
 `RUN@wt+2e99661`, 2026-09-12, real checkpoint geometry, T=64, CPU, every row either built
