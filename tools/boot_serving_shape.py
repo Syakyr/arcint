@@ -99,6 +99,12 @@ def main(argv=None):
                     help="after the served forward's first refusal, continue "
                          "with input_ids in place of inputs_embeds (LABELLED)")
     ap.add_argument("--paged-kv", default=PAGED_KV_DEFAULT)
+    ap.add_argument("--cut", default=None,
+                    help="LOCALISER: after the pass, keep only the graph up to "
+                         "the node with this friendly name (a Result is put on "
+                         "it, the rest is dropped) and compile THAT. Names the "
+                         "emitter sets: ple/gathered, ple/out, layerN/mixer_out, "
+                         "layerN/out. Not the served path; its output says so.")
     args = ap.parse_args(argv)
 
     import openvino as ov
@@ -169,6 +175,17 @@ def main(argv=None):
             if tn.startswith("Paged"):
                 hist[tn] = hist.get(tn, 0) + 1
         say("pass", f"paged ops {hist}")
+    if args.cut:
+        hits = [n for n in model.get_ordered_ops() if n.get_friendly_name() == args.cut]
+        if len(hits) != 1:
+            say("cut", f"{args.cut!r} names {len(hits)} node(s); nothing cut")
+            arena.close()
+            return 0
+        res = ov.opset13.result(hits[0].output(0))
+        model = ov.Model([res], model.get_parameters(), f"cut_at_{args.cut}")
+        say("cut", f"LOCALISER: graph cut after {args.cut!r} "
+                   f"({hits[0].get_type_name()}, {dims(hits[0].output(0))}); "
+                   f"{len(model.get_ordered_ops())} ops remain; NOT the served path")
     if args.stage == "pass" or args.device is None:
         arena.close()
         return 0
@@ -309,13 +326,23 @@ def main(argv=None):
     i64 = lambda a, sh: ov.Tensor(np.array(a, dtype=np.int64).reshape(sh))   # noqa: E731
     i32 = lambda a: ov.Tensor(np.array(a, dtype=np.int32).reshape(-1))       # noqa: E731
 
+    def flat_or_2d(name, values):
+        """The pass rewrites `input_ids` and `position_ids` to rank 1
+        (`sdpa_to_paged_attention.cpp`: `set_partial_shape({-1})` + an
+        Unsqueeze the graph owns), so post-pass they take the flat token
+        vector; pre-pass (the control) they are the emitter's [1, T]. Follow
+        the declared rank rather than assume either."""
+        d = dims(declared[name]) if name in declared else None
+        return i64(values, (n,) if d is not None and len(d) == 1 else (1, n))
+
     if args.no_pass:
         # CONTROL: every port the stateful graph declares, fed by name.
         Hn = 16
         candidates = {
-            "input_ids": i64(ids, (1, n)),
-            "position_ids": i64(list(range(n)), (1, n)),
-            "ngram_row_ids": i64([0] * (n * Hn), (1, n, Hn)),
+            "input_ids": flat_or_2d("input_ids", ids),
+            "position_ids": flat_or_2d("position_ids", list(range(n))),
+            "ngram_chunk_ids": ov.Tensor(np.zeros((1, n, Hn), np.int32)),
+            "ngram_local_ids": i64([0] * (n * Hn), (1, n, Hn)),
             "conv_mask": ov.Tensor(np.ones((1, n), np.float32)),
             "attention_mask": i64([1] * n, (1, n)),
             "beam_idx": i32([0]),
@@ -327,15 +354,19 @@ def main(argv=None):
                 say("forward", f"{name}: not declared by the compiled model")
     else:
         # THE SERVED PATH, in the C++'s own order (backend_ov.cpp:6141-6151).
-        sections = 1
-        if "position_ids" in declared and dims(declared["position_ids"]):
-            d0 = dims(declared["position_ids"])[0]
-            sections = d0 if d0 > 0 else 1
+        # the served C++ feeds position_ids at the port's own rank: the
+        # mrope artifact's [sections, n]; this IR's post-pass [n]
         past, tot = 0, n
+        pd = dims(declared["position_ids"]) if "position_ids" in declared else None
+        if pd is not None and len(pd) == 1:
+            pos = i64(list(range(past, tot)), (n,))
+        else:
+            sections = pd[0] if pd and pd[0] > 0 else 1
+            pos = i64([p for _ in range(sections) for p in range(past, tot)],
+                      (sections, n))
         served = [
             ("inputs_embeds", ov.Tensor(np.zeros((n, H), np.float32))),
-            ("position_ids", i64([p for _ in range(sections) for p in range(past, tot)],
-                                 (sections, n))),
+            ("position_ids", pos),
             ("past_lens", i32([past])),
             ("subsequence_begins", i32([0, n])),
             ("block_indices", i32(list(range((tot + KV_BLOCK_TOKENS - 1) // KV_BLOCK_TOKENS)))),
@@ -360,7 +391,7 @@ def main(argv=None):
             say("probe", "LABELLED DEVIATION: input_ids fed in place of "
                          "inputs_embeds; nothing else substituted")
             if "input_ids" in declared:
-                feed("input_ids", i64(ids, (1, n)))
+                feed("input_ids", flat_or_2d("input_ids", ids))
 
     unfed = sorted(set(declared) - set(fed))
     say("forward", f"fed {len(fed)}: {fed}")
@@ -373,7 +404,8 @@ def main(argv=None):
         arena.close()
         return 0
     dt = time.time() - t0
-    lg = req.get_tensor("logits").data
+    lg = (req.get_output_tensor(0).data if args.cut
+          else req.get_tensor("logits").data)
     rows = lg.reshape(-1, lg.shape[-1])
     say("forward", f"INFER OK {dt:.3f}s out{tuple(lg.shape)} "
                    f"finite={bool(np.isfinite(lg).all())} "
@@ -391,18 +423,31 @@ def main(argv=None):
         say("forward", f"INFER #2 FAIL after {time.time() - t0:.3f}s " + one_line(exc))
 
     # ---- the static-T probe: what a DECODE step would meet -----------------------
-    # A decode step feeds one token. The query block is static in T, so the
-    # port the prefill just used is [1, T]; this measures what the runtime says
-    # to a [1, 1] block against it, verbatim, instead of predicting the text.
+    # A decode step feeds one token. The query block is static in T inside the
+    # graph even where the PORT is dynamic ([?] after the pass): this measures
+    # what the runtime says to a one-token block, verbatim -- a set_tensor
+    # refusal if the port is static, or an infer refusal at the first baked
+    # reshape if it is not -- instead of predicting the text.
     port = "input_ids" if "input_ids" in declared else (
         "inputs_embeds" if "inputs_embeds" in declared else None)
     if port is not None and n != 1:
-        one = (i64([int(rows[-1].argmax())], (1, 1)) if port == "input_ids"
-               else ov.Tensor(np.zeros((1, H), np.float32)))
+        pd = dims(declared[port])
+        one = (i64([int(rows[-1].argmax())], (1,) if pd is not None and len(pd) == 1 else (1, 1))
+               if port == "input_ids" else ov.Tensor(np.zeros((1, H), np.float32)))
         exc = feed(port, one)
         if exc is None:
             say("decode-probe", f"set_tensor({port}) with a 1-token block was "
-                                f"ACCEPTED against the [1, {n}] query block")
+                                f"ACCEPTED against the {n}-token query block; "
+                                f"infer:")
+            t0 = time.time()
+            try:
+                req.infer()
+                say("decode-probe", f"  INFER OK {time.time() - t0:.3f}s -- a "
+                                    f"1-token block ran through a graph built "
+                                    f"for {n}")
+            except Exception as exc2:                             # noqa: BLE001
+                say("decode-probe", f"  INFER FAIL after {time.time() - t0:.3f}s "
+                                    + one_line(exc2))
         else:
             say("decode-probe", f"a 1-token block against the [1, {n}] query "
                                 f"block: refused (text above)")

@@ -272,10 +272,18 @@ def test_the_chunked_gather_is_the_whole_table_gather():
     RED CASES, run 2026-09-13 on the dev host (CPU, the pinned OV) before
     this went green, figures pasted from the runs: the nibble order swapped
     (hi first) -> 306 of 320 values wrong; the chunk id computed from `local`
-    instead of `rid` -> 184 of 320 wrong (every row past chunk 0). Both
-    caught by exact equality; neither would be caught by a shape check. And
-    on the old emitter (37d9b33) the cell cannot run at all: there is no
-    chunked gather to call.
+    instead of the global id (the first, in-graph form of the decomposition)
+    -> 184 of 320 wrong (every row past chunk 0). Both caught by exact
+    equality; neither would be caught by a shape check. And on the old
+    emitter (37d9b33) the cell cannot run at all: there is no chunked gather
+    to call.
+
+    WHAT THIS CELL CANNOT SEE, and why the ids are now host-split: on CPU the
+    in-graph i32 decomposition was exact here and on the card it was wrong
+    for every row id not representable in f32 (window-050 §4.7, Q2). A
+    CPU-only cell cannot gate a GPU kernel's arithmetic; what it gates is
+    that the graph's index path -- Equal, Select, Gather -- does what the
+    host-split contract says, and the probe on the card gates the rest.
     """
     n_rows, row_bytes, cap = 10_000, 8, 4096 * 8
     head_dim = 2 * row_bytes
@@ -286,17 +294,25 @@ def test_the_chunked_gather_is_the_whole_table_gather():
     assert rows == [4096, 4096, 1808], rows
 
     ports = ss.ngram_table_ports(n_rows, row_bytes, cap)
-    row_ids = ov.opset13.parameter([1, T, Hn], ov.Type.i64)
-    row_ids.set_friendly_name("ngram_row_ids")
-    out = ss.ngram_chunked_gather(row_ids, ports, head_dim)
-    model = ov.Model([ov.opset13.result(out)], [row_ids] + ports, "chunked_gather")
+    chunk_ids = ov.opset13.parameter([1, T, Hn], ov.Type.i32)
+    chunk_ids.set_friendly_name("ngram_chunk_ids")
+    local_ids = ov.opset13.parameter([1, T, Hn], ov.Type.i64)
+    local_ids.set_friendly_name("ngram_local_ids")
+    out = ss.ngram_chunked_gather(chunk_ids, local_ids, ports, head_dim)
+    model = ov.Model([ov.opset13.result(out)], [chunk_ids, local_ids] + ports,
+                     "chunked_gather")
     req = ov.Core().compile_model(model, "CPU").create_infer_request()
 
     edges = [0, 4095, 4096, 8191, 8192, n_rows - 1]
     ids = np.concatenate([np.array(edges, np.int64),
                           rng.integers(0, n_rows, size=T * Hn - len(edges))])
     ids = ids.reshape(1, T, Hn)
-    req.set_tensor("ngram_row_ids", ov.Tensor(ids))
+    # the host's split, at the first port's row count -- exact integer
+    # arithmetic on the host, none in the graph
+    req.set_tensor("ngram_chunk_ids",
+                   ov.Tensor(np.ascontiguousarray((ids // rows[0]).astype(np.int32))))
+    req.set_tensor("ngram_local_ids",
+                   ov.Tensor(np.ascontiguousarray((ids % rows[0]).astype(np.int64))))
     off = 0
     for k, r in enumerate(rows):
         req.set_tensor(f"ngram_table.{k}", ov.Tensor(np.ascontiguousarray(table[off:off + r])))
@@ -322,7 +338,7 @@ def test_the_chunked_gather_is_the_whole_table_gather():
 def test_the_input_ports_are_the_names_and_shapes_the_serving_path_feeds(built):
     """Names, shapes and element types, exactly.
 
-    `ngram_row_ids` is [1, T, 16] i64. 16 is not a choice: it is
+    `ngram_chunk_ids` / `ngram_local_ids` are [1, T, 16]. 16 is not a choice: it is
     `HashParams::num_ngram_heads() = (ngram_size - 1) * heads_per_ngram`
     (src/exec/ngram_row_ids.h:59), which the same file's header states at :21
     as "16 on Qwen3.8: 8 x 2-gram + 8 x 3-gram", and each head gathers one
@@ -333,14 +349,17 @@ def test_the_input_ports_are_the_names_and_shapes_the_serving_path_feeds(built):
     model, report, _ = built
     cfg = pwe.real_config()
     Hn = (cfg.ngram_size - 1) * cfg.heads_per_ngram
-    assert Hn == 16, f"num_ngram_heads moved to {Hn}; ngram_row_ids' 16 is derived"
+    assert Hn == 16, f"num_ngram_heads moved to {Hn}; the id ports' 16 is derived"
 
     got = {name: (tuple(shape), etype)
            for name, shape, etype in report["inputs"]}
     want = {
         "input_ids":     ((1, _T), "int64_t"),
         "position_ids":  ((1, _T), "int64_t"),
-        "ngram_row_ids": ((1, _T, Hn), "int64_t"),
+        # the hashed row, split by the host at the table's port partition
+        # (increment 5): no arithmetic on the index path in the graph
+        "ngram_chunk_ids": ((1, _T, Hn), "int32_t"),
+        "ngram_local_ids": ((1, _T, Hn), "int64_t"),
         "conv_mask":     ((1, _T), "float32"),
         # Declared for the transformation, which looks them up by name and
         # removes them; -1 is a dynamic dimension (`_dims`). `attention_mask`
@@ -1309,8 +1328,10 @@ def test_the_converted_surface_against_every_tensor_the_forward_feeds(
         # so the name the forward reaches for is not the name declared.
         "input_ids",
         # this emitter's own ports, which no serving forward has ever fed:
-        # the hashed n-gram row ids and the GDN/PLE padding mask.
-        "ngram_row_ids",
+        # the hashed n-gram row's chunk and local ids, and the GDN/PLE
+        # padding mask.
+        "ngram_chunk_ids",
+        "ngram_local_ids",
         "conv_mask",
     }
     # The n-gram table's chunk ports (increment 5): a LOAD-TIME binding, like

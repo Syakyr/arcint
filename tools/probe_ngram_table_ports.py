@@ -90,6 +90,30 @@ def main(argv=None):
     ap.add_argument("--over-cap", action="store_true",
                     help="only: try the WHOLE real table as one USM-host "
                          "object and print the verdict verbatim")
+    ap.add_argument("--order", choices=("write-then-bind", "bind-then-write"),
+                    default="write-then-bind",
+                    help="write-then-bind: sentinels written, then set_tensor "
+                         "+ infer (the served order: the mapping is filled "
+                         "before the request sees it). bind-then-write: "
+                         "set_tensor + one infer FIRST, then the sentinels, "
+                         "then infer again -- separates 'the kernel reads the "
+                         "wrong offset' from 'the GPU maps pages the CPU "
+                         "populated after the bind'")
+    ap.add_argument("--touch-all", action="store_true",
+                    help="write every byte of every chunk (0xEE) before the "
+                         "sentinels, so no page is unpopulated at bind time")
+    ap.add_argument("--seed", type=int, default=11)
+    ap.add_argument("--index", choices=("arith", "select", "direct"),
+                    default="select",
+                    help="how the row id reaches the Gather. arith: the "
+                         "graph decomposes the GLOBAL id into chunk/local with "
+                         "i32 Divide/Multiply/Subtract (the emitter's first "
+                         "form). select: the host feeds chunk ids and local "
+                         "ids, the graph only Equal/Select/Gather. direct: the "
+                         "host feeds one local-id tensor PER CHUNK (0 where the "
+                         "row is elsewhere), the graph only Gather.")
+    ap.add_argument("--verbose", action="store_true",
+                    help="print every probed row with its verdict and byte offset")
     args = ap.parse_args(argv)
 
     import openvino as ov
@@ -133,11 +157,59 @@ def main(argv=None):
         p.set_friendly_name(f"ngram_table.{k}")
         p.output(0).set_names({f"ngram_table.{k}"})
         ports.append(p)
-    row_ids = op.parameter([1, T, HN], ov.Type.i64)
-    row_ids.set_friendly_name("ngram_row_ids")
-    row_ids.output(0).set_names({"ngram_row_ids"})
-    out = ss.ngram_chunked_gather(row_ids, ports, 2 * ROW_BYTES)
-    model = ov.Model([op.result(out)], [row_ids] + ports, "ngram_port_probe")
+    i32c = lambda v: op.constant(np.array(v, np.int32))            # noqa: E731
+    if args.index == "arith":
+        # THE FALSIFIED FORM, kept verbatim as the emitter's first
+        # `ngram_chunked_gather` wrote it, so the defect stays reproducible:
+        # in-graph i32 Divide / Multiply / Subtract on the global row id.
+        row_ids = op.parameter([1, T, HN], ov.Type.i64)
+        row_ids.set_friendly_name("ngram_row_ids")
+        row_ids.output(0).set_names({"ngram_row_ids"})
+        per = rows
+        rid = op.convert(row_ids, ov.Type.i32)
+        chunk = op.divide(rid, i32c(per))
+        local = op.subtract(rid, op.multiply(chunk, i32c(per)))
+        zero = op.multiply(local, i32c(0))
+        picked = None
+        for k, port in enumerate(ports):
+            here = op.equal(chunk, i32c(k))
+            rows_k = op.gather(port, op.select(here, local, zero),
+                               op.constant(np.array(0, np.int64)))
+            picked = rows_k if picked is None else op.select(
+                op.unsqueeze(here, i32c(-1)), rows_k, picked)
+        out = op.convert(picked, ov.Type.f32)
+        idx_params = [row_ids]
+    elif args.index == "select":
+        # THE EMITTER'S CURRENT FORM, called rather than transcribed
+        chunk_ids = op.parameter([1, T, HN], ov.Type.i32)
+        chunk_ids.output(0).set_names({"ngram_chunk_ids"})
+        local_ids = op.parameter([1, T, HN], ov.Type.i64)
+        local_ids.output(0).set_names({"ngram_local_ids"})
+        out = ss.ngram_chunked_gather(chunk_ids, local_ids, ports, 2 * ROW_BYTES)
+        idx_params = [chunk_ids, local_ids]
+    else:
+        local_ids = op.parameter([1, T, HN, nchunks], ov.Type.i64)
+        local_ids.output(0).set_names({"ngram_local_ids"})
+        chunk_ids = op.parameter([1, T, HN], ov.Type.i32)
+        chunk_ids.output(0).set_names({"ngram_chunk_ids"})
+        picked = None
+        for k, port in enumerate(ports):
+            idx = op.squeeze(op.gather(local_ids, i32c([k]), i32c(3)), i32c([3]))
+            rows_k = op.gather(port, idx, op.constant(np.array(0, np.int64)))
+            here = op.equal(chunk_ids, i32c(k))
+            picked = rows_k if picked is None else op.select(
+                op.unsqueeze(here, i32c(-1)), rows_k, picked)
+        out = op.convert(picked, ov.Type.f32)
+        idx_params = [local_ids, chunk_ids]
+    if args.index != "select":
+        # the same nibble unpack the emitter does, so the verdict compares alike
+        x = out
+        hi = op.floor(op.divide(x, op.constant(np.array(16.0, np.float32))))
+        lo = op.subtract(x, op.multiply(hi, op.constant(np.array(16.0, np.float32))))
+        pair = op.concat([op.unsqueeze(lo, i32c(-1)), op.unsqueeze(hi, i32c(-1))], axis=-1)
+        out = op.reshape(pair, op.constant(np.array([1, T, HN, 2 * ROW_BYTES], np.int64)),
+                         special_zero=False)
+    model = ov.Model([op.result(out)], idx_params + ports, "ngram_port_probe")
 
     t0 = time.time()
     try:
@@ -152,7 +224,7 @@ def main(argv=None):
     gpu_mem(core, dev, "after request, before table")
 
     # the sentinel rows: both edges of every chunk, the middle, a few random
-    rng = np.random.default_rng(11)
+    rng = np.random.default_rng(args.seed)
     probe_rows = set()
     for k in range(nchunks):
         base = k * rows
@@ -174,26 +246,69 @@ def main(argv=None):
         tensors.append(t)
     say("alloc", f"{nchunks} x {cap:,} B of {'USM host' if ctx else 'host'} "
                  f"memory in {time.time() - t0:.2f}s")
-    t0 = time.time()
-    for r in ids.ravel():
-        k, local = divmod(int(r), rows)
-        tensors[k].data[local, :] = sentinel_row(int(r), ROW_BYTES)
-    say("alloc", f"{ids.size} sentinel rows written through .data in "
-                 f"{time.time() - t0:.3f}s")
-    for k, t in enumerate(tensors):
-        req.set_tensor(f"ngram_table.{k}", t)
-    req.set_tensor("ngram_row_ids", ov.Tensor(ids))
-    gpu_mem(core, dev, "after set_tensor")
+    if args.touch_all:
+        t0 = time.time()
+        for t in tensors:
+            t.data[...] = 0xEE
+        say("alloc", f"every byte of every chunk written (0xEE) in "
+                     f"{time.time() - t0:.2f}s")
 
-    for i in range(2):
+    def write_sentinels():
+        t0 = time.time()
+        for r in ids.ravel():
+            k, local = divmod(int(r), rows)
+            tensors[k].data[local, :] = sentinel_row(int(r), ROW_BYTES)
+        say("alloc", f"{ids.size} sentinel rows written through .data in "
+                     f"{time.time() - t0:.3f}s")
+
+    def infer(label):
         t0 = time.time()
         try:
             req.infer()
         except Exception as exc:                                  # noqa: BLE001
-            say("infer", f"#{i + 1} FAIL after {time.time() - t0:.3f}s " + one_line(exc))
+            say("infer", f"{label} FAIL after {time.time() - t0:.3f}s " + one_line(exc))
+            return False
+        say("infer", f"{label} OK {time.time() - t0:.3f}s")
+        return True
+
+    if args.order == "write-then-bind":
+        write_sentinels()
+    for k, t in enumerate(tensors):
+        req.set_tensor(f"ngram_table.{k}", t)
+    if args.index == "arith":
+        req.set_tensor("ngram_row_ids", ov.Tensor(ids))
+    else:
+        chunk = (ids // rows).astype(np.int32)
+        local = (ids % rows).astype(np.int64)
+        req.set_tensor("ngram_chunk_ids", ov.Tensor(np.ascontiguousarray(chunk)))
+        if args.index == "select":
+            req.set_tensor("ngram_local_ids", ov.Tensor(np.ascontiguousarray(local)))
+        else:
+            per_chunk = np.zeros(ids.shape + (nchunks,), np.int64)
+            for k in range(nchunks):
+                per_chunk[..., k] = np.where(chunk == k, local, 0)
+            req.set_tensor("ngram_local_ids", ov.Tensor(np.ascontiguousarray(per_chunk)))
+    say("index", f"mode {args.index}")
+    gpu_mem(core, dev, "after set_tensor")
+    if args.order == "bind-then-write":
+        if not infer("#0 (before the sentinels exist)"):
             return 0
-        say("infer", f"#{i + 1} OK {time.time() - t0:.3f}s")
+        write_sentinels()
+    for i in range(2):
+        if not infer(f"#{i + 1}"):
+            return 0
     gpu_mem(core, dev, "after infer")
+
+    # the CPU's own view of the rows it wrote, read back AFTER the GPU ran:
+    # if this disagrees with what was written, the write never landed and the
+    # kernel is not the suspect
+    cpu_bad = 0
+    for r in ids.ravel():
+        k, local = divmod(int(r), rows)
+        if not np.array_equal(tensors[k].data[local, :], sentinel_row(int(r), ROW_BYTES)):
+            cpu_bad += 1
+    say("cpu-readback", f"rows whose CPU view differs from what was written: "
+                        f"{cpu_bad} of {ids.size}")
 
     got = req.get_output_tensor(0).data
     ref = unpack(np.stack([sentinel_row(int(r), ROW_BYTES)
@@ -202,6 +317,14 @@ def main(argv=None):
     say("verdict", f"out{tuple(got.shape)} {got.dtype}; rows wrong "
                    f"{len(bad)} of {ids.size}; values wrong "
                    f"{int((got != ref).sum())} of {ref.size}")
+    if args.verbose:
+        for idx in np.ndindex(ids.shape):
+            r = int(ids[idx])
+            ok = bool((got[idx] == ref[idx]).all())
+            say("row", f"{'ok  ' if ok else 'BAD '} row {r:>11,} chunk {r // rows} "
+                       f"local {r % rows:>11,} byte_off {(r % rows) * ROW_BYTES:>13,} "
+                       f"page {(r % rows) * ROW_BYTES // 4096:>9,}"
+                       + ("" if ok else f" got {got[idx][:6].astype(int).tolist()}"))
     for b in bad[:8]:
         r = int(ids[tuple(b)])
         say("verdict", f"  row {r} (chunk {r // rows}, local {r % rows}): "

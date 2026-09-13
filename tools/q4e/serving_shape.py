@@ -139,8 +139,9 @@ module emits byte-identical in STRUCTURE to the ones the parity suites gate.
   request time from host memory -- the host-mmap tier the served runtime
   already reads through `src/exec/ngram_table.h`, handed to the graph instead
   of gathered beside it. The gather stays IN the graph (`ngram_chunked_gather`:
-  chunk id and local row derived from the fed row id, one Gather per port, a
-  Select to pick the chunk's row). Why u8 and not the declared u4: the GPU
+  chunk id and local row FED by the host -- the in-graph decomposition was
+  measured wrong above 2**24 on the A770, see that function -- one Gather per
+  port, a Select to pick the chunk's row). Why u8 and not the declared u4: the GPU
   plugin rewrites a u4 Parameter to u8 anyway (`transformations_pipeline.cpp`
   `int_convert_precision_map`, pinned source), and a USM-host tensor is shared
   with the graph WITHOUT a device copy only when its element type is the
@@ -508,38 +509,42 @@ def ngram_table_ports(n_rows, row_bytes, cap_bytes=NGRAM_CHUNK_CAP_BYTES):
     return ports
 
 
-def ngram_chunked_gather(row_ids, ports, head_dim):
-    """`[1, T, Hn]` i64 row ids over the chunked table -> `[1, T, Hn, head_dim]`
-    f32, the same tensor a Gather over the whole `[n_rows, head_dim]` u4 table
-    would produce, nibbles unpacked LOW FIRST (element 2j is the low nibble of
-    byte j, 2j+1 the high one).
+def ngram_chunked_gather(chunk_ids, local_ids, ports, head_dim):
+    """`[1, T, Hn]` i32 chunk ids + `[1, T, Hn]` i64 local row ids over the
+    chunked table -> `[1, T, Hn, head_dim]` f32, the same tensor a Gather over
+    the whole `[n_rows, head_dim]` u4 table would produce, nibbles unpacked
+    LOW FIRST (element 2j is the low nibble of byte j, 2j+1 the high one).
 
-    The row id is decomposed IN THE GRAPH, in i32 -- exact, since every row id
-    is below the 320,001,536-row table and so below 2**31, and i32 is the width
-    the measured-broken i64 integer path (q4e.ple's header) is not trusted
-    past. Every chunk is gathered, at its own local row where the id lands in
-    it and at row 0 otherwise, so no Gather ever sees an out-of-range index
+    NO ARITHMETIC ON THE INDEX PATH. The first form of this function took the
+    GLOBAL row id and decomposed it in the graph with i32 Divide / Multiply /
+    Subtract. On the A770 that gathered the WRONG ROW for every id that is
+    not exactly representable in f32 -- 240 of 240 probed rows agreed with
+    that predicate, none with any other (window-050 §4.7, Q2): the GPU plugin
+    runs integer eltwise arithmetic in f32, exact only below 2**24, and the
+    table has 320,001,536 rows. Measured the same day on the same card: a
+    Gather with i64 indices and a Select carrying them are EXACT at every
+    row of a 4 GiB chunk (probe modes `select` and `direct`, 0 wrong of 80,
+    at one and at four chunks). So the decomposition moved to the host, where
+    the hash already lives (src/exec/ngram_row_ids.h; the same boundary
+    q4e.ple's header drew for the hash after the CPU's i64 arithmetic was
+    measured broken), and the graph's index path is Equal, Select and Gather
+    only -- the ops measured exact.
+
+    Every chunk is gathered, at its own local row where the id lands in it and
+    at row 0 otherwise, so no Gather ever sees an out-of-range index
     (OpenVINO's Gather does not throw for one; it reads something). One Select
     per chunk then keeps the row of the chunk the id named. The cost is
     `len(ports)` gathers of T x Hn rows each -- bytes, not the table.
-
-    The chunk size is read off the FIRST port's shape, so the decomposition
-    and the ports cannot disagree; the last chunk may be shorter and is never
-    indexed past its end for a valid id.
     """
     i32 = lambda v: op.constant(np.array(v, np.int32))
-    per = int(ports[0].get_output_partial_shape(0)[0].get_length())
     row_bytes = int(ports[0].get_output_partial_shape(0)[1].get_length())
     assert head_dim == 2 * row_bytes, (head_dim, row_bytes)
 
-    rid = op.convert(row_ids, Type.i32)                        # [1,T,Hn]
-    chunk = op.divide(rid, i32(per))                           # floor, ints
-    local = op.subtract(rid, op.multiply(chunk, i32(per)))
-    zero = op.multiply(local, i32(0))
+    zero = op.multiply(local_ids, op.constant(np.array(0, np.int64)))
     picked = None
     for k, port in enumerate(ports):
-        here = op.equal(chunk, i32(k))                         # [1,T,Hn] bool
-        idx = op.select(here, local, zero)
+        here = op.equal(chunk_ids, i32(k))                     # [1,T,Hn] bool
+        idx = op.select(here, local_ids, zero)
         rows = op.gather(port, idx, op.constant(np.array(0, np.int64)))
         rows.set_friendly_name(f"ple/ngram_gather.{k}")       # [1,T,Hn,row_bytes]
         if picked is None:
@@ -776,8 +781,12 @@ def build_serving_shape_ir(config=None, seq_len=64, arena=None, n_layers=None,
                                              (ngram_table_ports), bound once
                                              per request from host memory;
                                              80 = 160 nibbles of one row
-        ngram_row_ids    [1, T, 16]  i64   -- the hashed n-gram row ids, one per
-                                             n-gram head; 16 = (ngram_size-1) *
+        ngram_chunk_ids  [1, T, 16]  i32   -- which `ngram_table.K` holds the
+        ngram_local_ids  [1, T, 16]  i64      hashed row, and the row inside
+                                             it: the global row id split by
+                                             the host at the port partition
+                                             (row // rows_0, row % rows_0).
+                                             16 = (ngram_size-1) *
                                              heads_per_ngram, exactly
                                              `HashParams::num_ngram_heads()`
                                              (src/exec/ngram_row_ids.h:59) and
@@ -786,7 +795,9 @@ def build_serving_shape_ir(config=None, seq_len=64, arena=None, n_layers=None,
                                              The hash itself is computed by
                                              `lgc::ngram::row_ids`
                                              (ngram_row_ids.h:117); the graph
-                                             consumes the ids, never the tokens.
+                                             consumes ids, never tokens, and
+                                             does NO arithmetic on them (see
+                                             ngram_chunked_gather).
     Output
         logits           [1, T, vocab] f32
 
@@ -814,8 +825,10 @@ def build_serving_shape_ir(config=None, seq_len=64, arena=None, n_layers=None,
             pid = op.parameter([1, T], Type.i64)
             pid.set_friendly_name("position_ids")
             ple_state, head_dim, Hn = _ple_state(ar, cfg)
-            row_ids = op.parameter([1, T, Hn], Type.i64)
-            row_ids.set_friendly_name("ngram_row_ids")
+            chunk_ids = op.parameter([1, T, Hn], Type.i32)
+            chunk_ids.set_friendly_name("ngram_chunk_ids")
+            local_ids = op.parameter([1, T, Hn], Type.i64)
+            local_ids.set_friendly_name("ngram_local_ids")
             # the GDN + PLE padding mask, same port q4e.backbone declares
             # (backbone.py:105-106); ones = full sequence
             conv_mask = op.parameter([1, T], Type.f32)
@@ -837,6 +850,17 @@ def build_serving_shape_ir(config=None, seq_len=64, arena=None, n_layers=None,
             embed_w = ar.f32([V, H])
             emb = op.gather(qgdn._c(embed_w), input_ids, qgdn._i(0))    # [1,T,H]
             hidden = op.tile(emb, op.constant(np.array([1, 1, hc], np.int64)))
+            # PIN THE LAYOUT where the pass's token axis enters. After
+            # `SDPAToPagedAttention` `input_ids` is [-1] + Unsqueeze(1), so the
+            # embedding comes out [tokens, 1, hc*H] while every static tensor
+            # of this graph is [1, T, hc*H]. The two are the same bytes, but a
+            # binary op between them does not refuse -- it BROADCASTS, and the
+            # first forward on a card died at the PLE's additive join with a
+            # [5, 5, 10240] hidden (window-050 §4.7). Pre-pass this reshape is
+            # the identity; post-pass it is the one place the dynamic axis is
+            # folded back into the static block.
+            hidden = op.reshape(hidden, op.constant(np.array([1, T, hc * H], np.int64)),
+                                special_zero=False)
 
             # the n-gram table: PORTS, one per sub-cap chunk, never a constant
             # (module docstring §4). The host-mmap tier serving reads through
@@ -857,13 +881,15 @@ def build_serving_shape_ir(config=None, seq_len=64, arena=None, n_layers=None,
                 if i == ple_layer_idx:
                     # pin 1283: hidden = hidden + ple(...), ADDITIVE
                     gathered = ngram_chunked_gather(
-                        row_ids, table_ports, head_dim)     # [1,T,Hn,head_dim]
+                        chunk_ids, local_ids, table_ports, head_dim)  # [1,T,Hn,hd]
+                    gathered.set_friendly_name("ple/gathered")
                     emb_ple = op.reshape(
                         gathered,
                         op.constant(np.array([1, T, Hn * head_dim], np.int64)),
                         special_zero=False)
                     hidden = op.add(hidden, _ple_tail(
                         hidden, emb_ple, cfg, ple_state, T, conv_mask))
+                    hidden.set_friendly_name("ple/out")
 
                 # attn_hyper_connection (use_combine=True) -> mixer -> combine
                 h, hyper, inj = _split_combine(hidden, cfg, st,
@@ -878,12 +904,16 @@ def build_serving_shape_ir(config=None, seq_len=64, arena=None, n_layers=None,
                         h, pid, cfg, _strip(st, "self_attn."), T, i, beam,
                         attn_mask, sinks)
                 hidden = _recombine(hyper, inj, g, cfg, T)
+                # named so a card-side localiser can cut the graph here
+                # (tools/boot_serving_shape.py --cut); names only, no op
+                hidden.set_friendly_name(f"layer{i}/mixer_out")
 
                 h, hyper, inj = _split_combine(hidden, cfg, st,
                                                "mlp_hyper_connection.", T)
                 m = emit_moe_tiled(h, cfg, st, ar, T, f"layer{i}/moe",
                                    filler=filler, layer=i)
                 hidden = _recombine(hyper, inj, m, cfg, T)
+                hidden.set_friendly_name(f"layer{i}/out")
 
             # the final mixer, use_combine=False (pin 1493-1496), then lm_head
             fin = {
@@ -899,8 +929,8 @@ def build_serving_shape_ir(config=None, seq_len=64, arena=None, n_layers=None,
             res.set_friendly_name("logits")
 
             model = Model([res], sinks,
-                          [input_ids, pid, row_ids, conv_mask, attn_mask, beam]
-                          + table_ports,
+                          [input_ids, pid, chunk_ids, local_ids, conv_mask,
+                           attn_mask, beam] + table_ports,
                           "qwen4_exp_serving_shape")
 
         nodes, const_bytes, counts = pwe.graph_measures(model)
@@ -993,16 +1023,20 @@ def _repeat_kv_broadcast(x, kv_heads, heads, head_dim):
     r = heads // kv_heads
     if r == 1:
         return x
-    s = op.gather(op.shape_of(x, output_type="i64"),
-                  op.constant(np.array([2], np.int64)),
+    shape = op.shape_of(x, output_type="i64")
+    b = op.gather(shape, op.constant(np.array([0], np.int64)),
+                  op.constant(np.array(0, np.int64)))
+    s = op.gather(shape, op.constant(np.array([2], np.int64)),
                   op.constant(np.array(0, np.int64)))
     up = op.unsqueeze(x, op.constant(np.array(2, np.int64)))
+    # the batch is read off the input too: it is the TOKEN axis at the SDPA
+    # (increment 5, emit_stateful_attention) and not 1
     wide = op.broadcast(up, op.concat(
-        [op.constant(np.array([1, kv_heads, r], np.int64)), s,
+        [b, op.constant(np.array([kv_heads, r], np.int64)), s,
          op.constant(np.array([head_dim], np.int64))], axis=0))
     return op.reshape(wide,
-                      op.constant(np.array([1, heads, -1, head_dim], np.int64)),
-                      special_zero=False)
+                      op.constant(np.array([0, heads, -1, head_dim], np.int64)),
+                      special_zero=True)
 
 
 def _additive_causal_mask(T, total, past):
@@ -1315,6 +1349,49 @@ def emit_stateful_attention(hidden, pid, config, state, T, layer, beam,
                       [1, T, kv, d]), [0, 2, 1, 3])
     q, k = qattn._apply_rope(q, k, qattn._c(cosT), qattn._c(sinT), pid,
                                   rotary, T)
+    q.set_friendly_name(f"attn{layer}/q_rope")            # localiser cut points
+    k.set_friendly_name(f"attn{layer}/k_rope")
+
+    # TOKEN-MAJOR AT THE SDPA, and only here (increment 5, read off the
+    # device and then off the pass). `SDPAToPagedAttention` flattens the SDPA's
+    # q/k/v for the PagedAttentionExtension with `Reshape [0, -1]`
+    # (state_management_pattern.cpp, `q_reshape`): dimension 0 is KEPT as the
+    # token axis and everything else is folded into the feature axis. On the
+    # served artifact that is [?, ?] -> [tokens, heads*d], because the pass
+    # also forces `input_ids` to [-1] + Unsqueeze(1), so at runtime the batch
+    # axis carries the tokens and the sequence axis is 1. On this emitter's
+    # [1, heads, T, d] it produced [1, T*heads*d] -- one token of 30,720
+    # features -- and the GPU plugin died on it with a bare `map::at`
+    # (window-050 §4.7). The two linear-attention fusions do NOT have this
+    # asymmetry: PagedGatedDeltaNetFusion (`flatten_batch_length`) and
+    # PagedCausalConv1DFusion (`Reshape [-1, hidden]`) flatten B*L into
+    # tokens themselves, so the GDN and conv constructs stay as they are.
+    #
+    # So q, k and v are presented to the SDPA as [T, heads, 1, d]: the same
+    # bytes, the token axis first. The unfused SDPA over that layout is a
+    # batch of one-token queries -- exactly the served stateful graph's own
+    # status after the pass's reinterpretation -- and is not a numeric
+    # witness; the served path never runs it. The PA output comes back
+    # [T, heads, 1, dv] (the pass's `pa_shape [0, 1, -1, dv]` + transpose)
+    # and is transposed back to [1, heads, T, dv] for the rest of the layer.
+    tm = lambda x: op.transpose(x, op.constant(np.array([2, 1, 0, 3], np.int32)))
+    # ... AND DYNAMIC. With the operands token-major but STATIC ([5, 6144]
+    # after the pass's flatten) the plugin still died with `map::at`, on the
+    # cut just after this node and nowhere before it; every served
+    # PagedAttentionExtension runs with a dynamic token axis ([?, ?]). The
+    # token count is read off `position_ids`, which the pass rewrites to
+    # [-1] (so post-pass it is dynamic and pre-pass it folds to T:
+    # ReduceProd covers both [1, T] and [tokens] / [tokens, 1]), and the
+    # operands are gathered along the token axis by Range(0, n) -- an
+    # identity permutation whose only effect is that the axis is no longer
+    # a compile-time constant. Measured, not argued: window-050 §4.7.
+    n_tok = op.reduce_prod(op.shape_of(pid, output_type="i64"), i64([0]),
+                           keep_dims=False)
+    tok_idx = op.range(i64(0), n_tok, i64(1), Type.i64)
+    dyn = lambda x: op.gather(tm(x), tok_idx, i64(0))
+    q = dyn(q)                                               # [T?, heads, 1, d]
+    k = dyn(k)                                               # [T?, kv, 1, d]
+    v = dyn(v)
 
     # the two state reads, and the two writes that make them state
     full = []
@@ -1323,22 +1400,27 @@ def emit_stateful_attention(hidden, pid, config, state, T, layer, beam,
         init = op.broadcast(op.constant(np.array(0.0, np.float32)),
                             i64([1, kv, 0, d]))
         past = op.gather(op.read_value(init, var), beam, i64(0))
-        joined = op.concat([past, cur], axis=2)          # [1, kv, past+T, d]
+        joined = op.concat([past, cur], axis=2)          # [T?, kv, past+1, d]
         sinks.append(op.assign(joined, var))
         full.append(joined)
 
     # TOTAL is the key length after the join; PAST is what was there before.
+    # The mask is [T, 1, 1, TOTAL] in this layout: one row per token-batch.
     total = op.gather(op.shape_of(full[0], output_type="i64"), i64([2]), i64(0))
     past_len = op.subtract(total, i64([T]))
+    mask = op.reshape(_additive_causal_mask(T, total, past_len),
+                      op.concat([i64([T, 1, 1]), total], axis=0),
+                      special_zero=False)
     att = op.scaled_dot_product_attention(
         q,
         _repeat_kv_broadcast(full[0], kv, heads, d),
         _repeat_kv_broadcast(full[1], kv, heads, d),
-        _additive_causal_mask(T, total, past_len),
+        mask,
         op.constant(np.array(d ** -0.5, np.float32)),
-        causal=False)
+        causal=False)                                        # [T, heads, 1, d]
 
-    out = qgdn._reshape(qgdn._transpose(att, [0, 2, 1, 3]), [1, T, heads * d])
+    out = qgdn._reshape(qgdn._transpose(tm(att), [0, 2, 1, 3]), [1, T, heads * d])
+    out.set_friendly_name(f"attn{layer}/att_out")
     out = qgdn._mul(out, op.sigmoid(gate))                           # pin 898
     return qgdn._mm(out, qattn._c(state["o_proj.weight"]), tb=True)   # pin 900
 
