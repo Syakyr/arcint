@@ -349,6 +349,13 @@ def build_backbone_ir(out_dir, geometry, shards, seq_len=64, tiny=False):
         #     arena blocks on disk  0 KiB        (nothing materialised)
         #     build                 6.5 s, 4.6 GiB RSS
         #
+        # Re-measured 2026-09-13, after the 12 full-attention layers became
+        # STATEFUL (a KV Variable and one ScaledDotProductAttention each, so
+        # that the serving path's own SDPAToPagedAttention has something to
+        # convert): 84,374 nodes, the same 183.07 GiB declared, the same 0 KiB
+        # on disk, 4.52 GiB peak RSS. The 2026-09-12 reading above is kept as
+        # it was taken.
+        #
         # Run `--serving-shape` for that verification. The superseded text is
         # kept below rather than edited away, per the 5d5d6ae precedent.
         raise NotImplementedError(

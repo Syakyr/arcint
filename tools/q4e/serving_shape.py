@@ -112,12 +112,19 @@ module emits byte-identical in STRUCTURE to the ones the parity suites gate.
   Variable per GDN short conv, a rank-4 Variable per GDN recurrent state, and
   a ScaledDotProductAttention over a rank-4 KV Variable. Measured both ways
   2026-09-13; the reading is in `tests/python/test_serving_shape.py` beside
-  the ports table. What this module emits carries none of the three -- it is
-  the static full-sequence shape the piecewise work validates, with no
-  Variables at all, so the pass refuses it by name
-  (`sdpa_to_paged_attention.cpp:75`, "model->get_variables().empty()"). The
-  contract test names that gap with a STRICT xfail so it fails loudly the day
-  it closes rather than passing silently while it is open.
+  the ports table.
+
+  ONE OF THE THREE IS EMITTED (2026-09-13): the full-attention layers carry a
+  KV Variable and a ScaledDotProductAttention (`emit_stateful_attention`), so
+  the pass converts them and the contract's `key_cache.N`, `value_cache.N`,
+  `past_lens`, `subsequence_begins`, `block_indices`,
+  `block_indices_begins` and `max_context_len` exist. The GDN layers are
+  still the static full-sequence form the piecewise work validates: no
+  rank-3 short-conv Variable and no rank-4 recurrent-state Variable, so
+  `conv_state_table.N`, `gated_delta_state_table.N` and the four `la.*`
+  ports do not. The contract test carries the remaining gap as a STRICT
+  xfail over the whole port table, so it fails loudly the day the last row
+  closes rather than passing silently while any of them is open.
 * The PLE n-gram table is declared as a Constant here so that the gather has
   something to index. In SERVING it is the host-mmap tier, read through
   `src/exec/ngram_table.h` (Link 3) and `src/exec/ngram_gather.h`, never an
@@ -132,6 +139,7 @@ import tempfile
 
 import numpy as np
 import openvino as ov
+import openvino.op.util as ovutil
 from openvino import Model, Type
 from openvino import opset13 as op
 
@@ -344,9 +352,12 @@ class SparseArena:
 
 # Every module that imported `_c` from q4e.gdn holds its OWN binding, so all of
 # them have to be swapped. Missing one silently materialises that family's
-# weights: the build still emits the same 84,372 nodes, still declares the same
+# weights: the build still emits the same node count, still declares the same
 # bytes, still occupies 0 KiB on disk, and costs GiB of anonymous memory that
-# nothing observes until the host OOMs.
+# nothing observes until the host OOMs. (The node count used to be written out
+# here as 84,372, which the stateful attention layers moved to 84,374 -- the
+# argument never needed the number, and a number in a comment is a number that
+# rots, so it is gone rather than corrected.)
 #
 # CF-RESIDENT (REVIEW 2a45349 F2, closed 2026-09-12). This comment used to end
 # "-- which is why the contract test measures resident bytes rather than
@@ -652,6 +663,10 @@ def build_serving_shape_ir(config=None, seq_len=64, arena=None, n_layers=None,
     hc = cfg.hc_count
     V = cfg.vocab_size
     ple_layer_idx = 1                      # GGUF ple.layers [1]; pwe REAL_GEOMETRY
+    # The Assign nodes of every stateful layer. They are the model's, not a
+    # layer's: `ov::Model` takes them as its own argument and a graph whose
+    # state is read and never written is not stateful, it is wrong.
+    sinks = []
 
     try:
         with shared_constants():
@@ -666,6 +681,18 @@ def build_serving_shape_ir(config=None, seq_len=64, arena=None, n_layers=None,
             # (backbone.py:105-106); ones = full sequence
             conv_mask = op.parameter([1, T], Type.f32)
             conv_mask.set_friendly_name("conv_mask")
+            # The two ports the TRANSFORMATION consumes and removes. Neither
+            # survives into the compiled model -- the served artifact's
+            # transformed input list has neither -- but the pass looks them up
+            # by name, and `attention_mask` carries the only honest statement
+            # of the total key length in a graph whose query block is static:
+            # it spans past + current, so its dim 1 is TOTAL.
+            attn_mask = op.parameter([1, -1], Type.i64)
+            attn_mask.set_friendly_name("attention_mask")
+            attn_mask.output(0).set_names({"attention_mask"})
+            beam = op.parameter([-1], Type.i32)
+            beam.set_friendly_name("beam_idx")
+            beam.output(0).set_names({"beam_idx"})
 
             # embed -> repeat to the hyper-connection width (backbone.py)
             embed_w = ar.f32([V, H])
@@ -707,8 +734,9 @@ def build_serving_shape_ir(config=None, seq_len=64, arena=None, n_layers=None,
                     g = qgdn.emit_gdn(h, conv_mask, cfg,
                                       _strip(st, "linear_attn."), T)
                 else:
-                    g = qattn.emit_dense_attention(h, pid, cfg,
-                                                   _strip(st, "self_attn."), T)
+                    g = emit_stateful_attention(
+                        h, pid, cfg, _strip(st, "self_attn."), T, i, beam,
+                        attn_mask, sinks)
                 hidden = _recombine(hyper, inj, g, cfg, T)
 
                 h, hyper, inj = _split_combine(hidden, cfg, st,
@@ -730,7 +758,8 @@ def build_serving_shape_ir(config=None, seq_len=64, arena=None, n_layers=None,
             res = op.result(logits)
             res.set_friendly_name("logits")
 
-            model = Model([res], [input_ids, pid, row_ids, conv_mask],
+            model = Model([res], sinks,
+                          [input_ids, pid, row_ids, conv_mask, attn_mask, beam],
                           "qwen4_exp_serving_shape")
 
         nodes, const_bytes, counts = pwe.graph_measures(model)
@@ -747,10 +776,10 @@ def build_serving_shape_ir(config=None, seq_len=64, arena=None, n_layers=None,
             "arena_disk_kib": ar.disk_kib(),
             "fill_census": filler.census() if filler is not None else None,
             "inputs": [(p.get_node().get_friendly_name(),
-                        list(p.get_shape()), str(p.get_element_type()))
+                        _dims(p), str(p.get_element_type()))
                        for p in model.inputs],
             "outputs": [(r.get_node().get_friendly_name(),
-                         list(r.get_shape()), str(r.get_element_type()))
+                         _dims(r), str(r.get_element_type()))
                         for r in model.outputs],
         }
         return model, report
@@ -758,6 +787,179 @@ def build_serving_shape_ir(config=None, seq_len=64, arena=None, n_layers=None,
         if own_arena:
             ar.close()
         raise
+
+
+def _dims(port):
+    """A port's shape as a list, with -1 for a dynamic dimension.
+
+    `get_shape()` THROWS on a dynamic shape ("to_shape was called on a dynamic
+    shape", partial_shape.cpp:261), and the serving shape stopped being fully
+    static the moment it carried a KV Variable: `attention_mask` spans past +
+    current and `beam_idx` is a batch of beams. Every static dimension still
+    reports as the same int it did, so a reader of `report["inputs"]` sees no
+    change where nothing changed.
+    """
+    ps = port.get_partial_shape()
+    return [d.get_length() if d.is_static else -1 for d in ps]
+
+
+def _kv_variable(layer, tag, kv_heads, head_dim):
+    """One rank-4 KV Variable, the shape `load_paged` reads its KV prototypes
+    from before the transformation runs (backend_ov.cpp:2557-2569: rank 4, the
+    leading dim and the sequence dim dynamic, the tail static).
+
+    The variable_id is the stateful-export convention the served artifact
+    carries (`cache_params.past.key.N`); what it is called does not reach the
+    paged port name -- the transformation numbers `key_cache.N` /
+    `value_cache.N` by the order it meets the PagedAttentionExtension nodes --
+    but a graph with two variables of one id is rejected, so it has to be
+    unique per layer and side.
+    """
+    info = ovutil.VariableInfo()
+    info.data_shape = ov.PartialShape([-1, kv_heads, -1, head_dim])
+    info.data_type = Type.f32
+    info.variable_id = f"cache_params.past.{tag}.{layer}"
+    return ovutil.Variable(info)
+
+
+def _repeat_kv_broadcast(x, kv_heads, heads, head_dim):
+    """[1, kv, S, d] -> [1, heads, S, d] with each kv head's copies adjacent.
+
+    `q4e.attention._repeat_heads_h` does the same thing with a Concat of r
+    copies. It is not reusable HERE, and the reason is measured rather than
+    stylistic: it reshapes to `[1, kv, 1, T, d]` with T written in, and the
+    length of the joined KV is `past + T`, which is dynamic. Substituting it
+    fails at BUILD time, before the transformation is reached -- so what this
+    function replaces is a helper that cannot express the shape, not a helper
+    the pass would reject. Whether the pass also prefers one form over the
+    other is NOT established here and is not claimed.
+
+    This is instead the SERVED ARTIFACT'S OWN shape for the operation --
+    Unsqueeze -> Broadcast -> Reshape, read off its first attention layer
+    2026-09-13 -- which is shape-agnostic in the sequence dim. Numerically the
+    two are the same tensor.
+    """
+    r = heads // kv_heads
+    if r == 1:
+        return x
+    s = op.gather(op.shape_of(x, output_type="i64"),
+                  op.constant(np.array([2], np.int64)),
+                  op.constant(np.array(0, np.int64)))
+    up = op.unsqueeze(x, op.constant(np.array(2, np.int64)))
+    wide = op.broadcast(up, op.concat(
+        [op.constant(np.array([1, kv_heads, r], np.int64)), s,
+         op.constant(np.array([head_dim], np.int64))], axis=0))
+    return op.reshape(wide,
+                      op.constant(np.array([1, heads, -1, head_dim], np.int64)),
+                      special_zero=False)
+
+
+def _additive_causal_mask(T, total, past):
+    """The [1, 1, T, TOTAL] additive mask for a query block that starts at
+    `past` inside a sequence of `total` keys: 0 where the key is visible,
+    finfo(f32).min above the diagonal -- the value `q4e.attention` bakes for
+    the same purpose (pin 809, which converts torch's bool mask with
+    `torch.finfo(dtype).min`).
+
+    It is built from Ranges rather than baked as a Constant because TOTAL is
+    dynamic here: the key length is past + T and the past comes out of the KV
+    Variable. The transformation REPLACES this input -- PagedAttention derives
+    visibility from `past_lens` and `subsequence_begins` instead -- so it does
+    not survive into the compiled graph. It is emitted correctly anyway,
+    because a graph that is only right after a pass has run is a graph nobody
+    can check.
+    """
+    i64 = lambda v: op.constant(np.array(v, np.int64))
+    rows = op.add(op.range(i64(0), i64(T), i64(1), Type.i64), past)  # [T]
+    cols = op.range(i64(0), op.squeeze(total, i64(0)), i64(1), Type.i64)
+    visible = op.less_equal(op.unsqueeze(cols, i64(0)),
+                            op.unsqueeze(rows, i64(1)))             # [T, TOT]
+    blocked = op.select(
+        visible, op.constant(np.array(0.0, np.float32)),
+        op.constant(np.finfo(np.float32).min.astype(np.float32)))
+    return op.unsqueeze(blocked, i64([0, 1]))                       # [1,1,T,TOT]
+
+
+def emit_stateful_attention(hidden, pid, config, state, T, layer, beam,
+                            attn_mask, sinks):
+    """The full-attention layer in the STATEFUL shape the serving path's own
+    transformation converts, at real geometry.
+
+    Everything outside the attention core is `q4e.attention`'s, op for op and
+    pin line for pin line -- the fused q_proj and its per-head [query | gate]
+    chunk, q_norm / k_norm over head_dim, v_proj, the gather-and-apply rope,
+    the sigmoid gate and o_proj. What is replaced is the eager core (repeat_kv,
+    scaled q@k^T, the baked causal mask, the f32 softmax and @V): here K and V
+    are carried in a Variable and the core is ONE ScaledDotProductAttention, so
+
+        ReadValue(init = Broadcast(0.0 -> [1, kv, 0, d]))
+          -> Gather(beam_idx, axis 0)
+          -> Concat(past, current, axis 2)        <- Assign takes THIS
+          -> repeat_kv -> SDPA(q, k, v, mask, scale), causal=False
+
+    is the chain `ov::pass::SDPAToPagedAttention` rewrites into a
+    PagedAttentionExtension with `key_cache.N` and `value_cache.N` ports. The
+    five-input SDPA with an explicit scale and `causal=False` is the served
+    artifact's own form, not a preference: read off it 2026-09-13.
+
+    `sinks` is appended to rather than returned because the Assign nodes belong
+    to the MODEL, not to the layer -- `ov::Model` takes them as a separate
+    argument and a layer that dropped one would emit a graph whose state is
+    read and never written.
+    """
+    H = config.hidden_size
+    heads = config.num_attention_heads
+    kv = config.num_key_value_heads
+    d = getattr(config, "head_dim", None) or H // heads
+    eps = config.rms_norm_eps
+    cosT, sinT = qattn._freqs_tables(config, T)
+    rotary = cosT.shape[-1]
+    i64 = lambda v: op.constant(np.array(v, np.int64))
+
+    # pin 867-870, unchanged from q4e.attention: the split is PER HEAD on the
+    # last axis, and the gate is the second half of each head's 2*d block.
+    qg = qgdn._reshape(
+        qgdn._mm(hidden, qgdn._c(state["q_proj.weight"]), tb=True),
+        [1, T, heads, 2 * d])
+    q = qgdn._slice(qg, 0, d, 1, 3)
+    gate = qgdn._reshape(qgdn._slice(qg, d, 2 * d, 1, 3), [1, T, heads * d])
+
+    q = qgdn._transpose(
+        qattn._rmsnorm_hd(q, state["q_norm.weight"], eps, d), [0, 2, 1, 3])
+    k = qgdn._reshape(
+        qgdn._mm(hidden, qgdn._c(state["k_proj.weight"]), tb=True), [1, T, kv, d])
+    k = qgdn._transpose(
+        qattn._rmsnorm_hd(k, state["k_norm.weight"], eps, d), [0, 2, 1, 3])
+    v = qgdn._transpose(
+        qgdn._reshape(qgdn._mm(hidden, qgdn._c(state["v_proj.weight"]), tb=True),
+                      [1, T, kv, d]), [0, 2, 1, 3])
+    q, k = qattn._apply_rope(q, k, qgdn._c(cosT), qgdn._c(sinT), pid, rotary, T)
+
+    # the two state reads, and the two writes that make them state
+    full = []
+    for tag, cur in (("key", k), ("value", v)):
+        var = _kv_variable(layer, tag, kv, d)
+        init = op.broadcast(op.constant(np.array(0.0, np.float32)),
+                            i64([1, kv, 0, d]))
+        past = op.gather(op.read_value(init, var), beam, i64(0))
+        joined = op.concat([past, cur], axis=2)          # [1, kv, past+T, d]
+        sinks.append(op.assign(joined, var))
+        full.append(joined)
+
+    # TOTAL is the key length after the join; PAST is what was there before.
+    total = op.gather(op.shape_of(full[0], output_type="i64"), i64([2]), i64(0))
+    past_len = op.subtract(total, i64([T]))
+    att = op.scaled_dot_product_attention(
+        q,
+        _repeat_kv_broadcast(full[0], kv, heads, d),
+        _repeat_kv_broadcast(full[1], kv, heads, d),
+        _additive_causal_mask(T, total, past_len),
+        op.constant(np.array(d ** -0.5, np.float32)),
+        causal=False)
+
+    out = qgdn._reshape(qgdn._transpose(att, [0, 2, 1, 3]), [1, T, heads * d])
+    out = qgdn._mul(out, op.sigmoid(gate))                           # pin 898
+    return qgdn._mm(out, qgdn._c(state["o_proj.weight"]), tb=True)   # pin 900
 
 
 def _strip(state, prefix):
@@ -878,6 +1080,6 @@ def _expert_slot_bytes(num_expert, ratio_pct, per_expert_bytes, moe_layers):
 
 __all__ = [
     "SparseArena", "shared_constants", "build_serving_shape_ir",
-    "emit_moe_tiled", "slot_pool_from_ir",
+    "emit_moe_tiled", "emit_stateful_attention", "slot_pool_from_ir",
     "EXPERT_DECLARED_TYPE", "NGRAM_DECLARED_TYPE", "EXPERT_GROUP_SIZE",
 ]

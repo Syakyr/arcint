@@ -575,6 +575,19 @@ Q4E_GPU= <venv>/bin/python boot.py <layers> <device> <T>
   feed site, carried as a strict xfail in
   `tests/python/test_serving_shape.py`.
 
+  **CORRECTED 2026-09-13, twice, and the bullet above is kept as it was
+  written because it is what the window recorded.** (a) "not emitted" named
+  the wrong side: no exporter emits those ports on any artifact this fleet
+  serves. `load_paged` runs `ov::pass::SDPAToPagedAttention` over the IR it
+  has just read (`backend_ov.cpp:2574`) and the ports are that pass's output,
+  produced from three constructs of the *stateful* graph. (b) The count is no
+  longer a fixed 13 to recite: the suite's `_PAGED_PORT_TABLE` carries one row
+  per port with its status, both cells read that table, and the number of rows
+  is written nowhere. As of the same day the full-attention layers are
+  stateful and the pass produces seven of them; the GDN layers' two state
+  tables and four `la.*` ports are what the xfail still covers. The design
+  note carries the reading.
+
 ## 4.5 THE FRONTIER GPU PASS — what the next window runs, in order
 
 `RUN@5663a44` for the CPU preparation below; every GPU row is `UNTESTED` and

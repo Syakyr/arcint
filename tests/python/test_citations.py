@@ -131,7 +131,7 @@ _ANCHORED = [
      "src/core/gguf_repack.cpp", "double repack_bound_steps(int32_t ggml_type)"),
     ("tests/python/test_repack_route.py", "design-gguf-native.md:52",
      "docs/design-gguf-native.md", "uses codebooks and sign tables"),
-    ("tests/python/test_repack_route.py", "serving_shape.py:146",
+    ("tests/python/test_repack_route.py", "serving_shape.py:154",
      "tools/q4e/serving_shape.py",
      "shipped tensor is IQ4_NL, which OpenVINO has no element type for"),
 ]

@@ -58,10 +58,16 @@ compiles (backend_ov.cpp:2574), and every one of the ports in the table below
 is that pass's output -- measured both ways, on the real served artifact and on
 this emitter's own, in the block above `paged_census`. The cells here used to
 check the emitter's parameter list against the table and call the gap "NOT
-emitted"; they now run the pass and check what it produces. The gap is real and
-it is bigger than it read: this IR carries none of the three constructs the
-pass converts, and the pass refuses by name at
-`sdpa_to_paged_attention.cpp:75` before it looks at anything else.
+emitted"; they now run the pass and check what it produces. The gap was real
+and it was bigger than it read: at the time of that reading this IR carried
+none of the three constructs the pass converts, and the pass refused by name at
+`sdpa_to_paged_attention.cpp:75` before it looked at anything else.
+
+WHERE THAT STANDS NOW is the ports table's own `status` column and nothing
+else. The full-attention layers became stateful the same day
+(`q4e.serving_shape.emit_stateful_attention`) and the pass converts them; the
+GDN layers have not, so it produces neither state table nor the `la.*` index
+ports. Read the table, not this paragraph.
 """
 import math
 import os
@@ -158,6 +164,11 @@ def test_the_input_ports_are_the_names_and_shapes_the_serving_path_feeds(built):
         "position_ids":  ((1, _T), "int64_t"),
         "ngram_row_ids": ((1, _T, Hn), "int64_t"),
         "conv_mask":     ((1, _T), "float32"),
+        # Declared for the transformation, which looks them up by name and
+        # removes them; -1 is a dynamic dimension (`_dims`). `attention_mask`
+        # spans past + current, so its length is not the query block's.
+        "attention_mask": ((1, -1), "int64_t"),
+        "beam_idx":       ((-1,), "int32_t"),
     }
     print("\n[contract-ports] inputs:")
     for k in sorted(got):
@@ -614,22 +625,22 @@ _PAGED_PORT_TABLE = (
      'name.rfind("conv_state_table.", 0) == 0', _BY_CONV, 48),
     ("gated_delta_state_table.", ABSENT, "classify",
      'name.rfind("gated_delta_state_table.", 0) == 0', _BY_GDN, 48),
-    ("key_cache.", ABSENT, "classify",
+    ("key_cache.", PRESENT, "classify",
      'name.rfind("key_cache.", 0) == 0 || name.rfind("value_cache.", 0) == 0',
      _BY_SDPA, 16),
-    ("value_cache.", ABSENT, "classify",
+    ("value_cache.", PRESENT, "classify",
      'name.rfind("key_cache.", 0) == 0 || name.rfind("value_cache.", 0) == 0',
      _BY_SDPA, 16),
     # fed every forward
-    ("past_lens", ABSENT, "feed",
+    ("past_lens", PRESENT, "feed",
      'set_i32("past_lens"', _BY_PA_INDEX, 1),
-    ("subsequence_begins", ABSENT, "feed",
+    ("subsequence_begins", PRESENT, "feed",
      'set_i32("subsequence_begins"', _BY_PA_INDEX, 1),
-    ("block_indices", ABSENT, "feed",
+    ("block_indices", PRESENT, "feed",
      'set_i32("block_indices"', _BY_PA_INDEX, 1),
-    ("block_indices_begins", ABSENT, "feed",
+    ("block_indices_begins", PRESENT, "feed",
      'set_i32("block_indices_begins"', _BY_PA_INDEX, 1),
-    ("max_context_len", ABSENT, "feed",
+    ("max_context_len", PRESENT, "feed",
      'set_i32("max_context_len"', _BY_PA_INDEX, 1),
     ("la.block_indices", ABSENT, "feed",
      'set_i32("la.block_indices"', _BY_LA_INDEX, 1),
@@ -653,11 +664,22 @@ _PAGED_ABSENT = [r for r in _PAGED_PORTS if r["status"] == ABSENT]
 _PAGED_PRESENT = [r for r in _PAGED_PORTS if r["status"] == PRESENT]
 
 
+def _matches(port, name):
+    """Does one parameter name satisfy one table row?
+
+    A row whose port ends in `.` is a FAMILY -- `key_cache.` stands for
+    `key_cache.0`, `key_cache.1`, one per layer -- and the C++ classifies those
+    by prefix (`name.rfind("key_cache.", 0) == 0`). Every other row is a single
+    whole name, fed by `set_tensor` with that exact string, and prefix-matching
+    one of those is a bug this cell already paid for: `block_indices` is a
+    prefix of `block_indices_begins`, so a prefix rule counts the latter twice
+    and would let a graph declaring only `block_indices_begins` claim both.
+    """
+    return name.startswith(port) if port.endswith(".") else name == port
+
+
 def _declares(port, names):
-    """Does a port-name set satisfy a table row? A prefix row (`key_cache.`)
-    is satisfied by any name that starts with it; a whole-name row by equality.
-    This is the same predicate the C++ classifies with (`rfind(p, 0) == 0`)."""
-    return any(n == port or n.startswith(port) for n in names)
+    return any(_matches(port, n) for n in names)
 
 
 def test_the_paged_port_citations_resolve_to_the_code_they_name():
@@ -742,7 +764,8 @@ def test_the_paged_port_citations_resolve_to_the_code_they_name():
 # is why it must be read before the pass runs -- the transformed ports leave
 # those dims dynamic.
 #
-# The converse, on this emitter's own output, same day and same method:
+# The converse, on this emitter's own output, same day and same method -- THE
+# READING THAT OPENED THIS ITEM, kept as it was taken:
 #
 #     serving-shape IR, 8 layers, T=8
 #     parameters: input_ids, position_ids, ngram_row_ids, conv_mask
@@ -751,11 +774,28 @@ def test_the_paged_port_citations_resolve_to_the_code_they_name():
 #       RuntimeError: Check '!model->get_variables().empty()' failed at
 #       src/core/src/pass/sdpa_to_paged_attention.cpp:75
 #
-# So the gap is not a set of missing parameters. It is that this IR carries
-# NONE OF THE THREE CONSTRUCTS the pass converts, and the pass says so by name
-# before it looks at anything else. `test_the_paged_gap_is_inventoried_
-# precisely` below asserts THE TABLE against what the pass actually produces,
-# and prints that refusal verbatim while it stands.
+# So the gap was not a set of missing parameters. It was that the IR carried
+# NONE OF THE THREE CONSTRUCTS the pass converts, and the pass said so by name
+# before looking at anything else. `test_the_paged_gap_is_inventoried_precisely`
+# below asserts THE TABLE against what the pass actually produces, and prints
+# that refusal verbatim on any tree where it still stands.
+#
+# THE SAME READING, after the full-attention layers became stateful (the first
+# of the three constructs, `q4e.serving_shape.emit_stateful_attention`):
+#
+#     serving-shape IR, 8 layers, T=8
+#     parameters: input_ids, position_ids, ngram_row_ids, conv_mask,
+#                 attention_mask, beam_idx
+#     Variables : 4        ReadValue 4, Assign 4, ScaledDotProductAttention 2
+#     AFTER     : + max_context_len, past_lens, subsequence_begins,
+#                 block_indices, block_indices_begins, key_cache.0/1,
+#                 value_cache.0/1;  PagedAttentionExtension 2
+#                 attention_mask and beam_idx are GONE -- consumed by the pass
+#
+# Two of the eight layers are full-attention (index % 4 == 3), which is why the
+# caches number two. The GDN layers are untouched, so the two state tables and
+# the four la.* ports are still absent -- that is the remaining item, and the
+# table's status column is where it is recorded.
 #
 # ONE xfail over all the rows: `test_the_paged_port_contract_is_satisfied` is
 # all-or-nothing, so it retires on the commit that lands the LAST port, not the
@@ -778,7 +818,19 @@ def paged_census():
         model, _ = ss.build_serving_shape_ir(
             seq_len=_T, arena=arena, n_layers=_CONTRACT_LAYERS)
         before = {p.get_node().get_friendly_name() for p in model.inputs}
-        variables = len(model.get_variables())
+        # The variables AS THE LOAD PATH SEES THEM: read off the stateful graph
+        # before the pass runs, which is what backend_ov.cpp:2557-2569 does and
+        # for the same reason -- the transformed ports leave these dims dynamic.
+        variables = []
+        for var in model.get_variables():
+            info = var.get_info()
+            ps = info.data_shape
+            variables.append({
+                "id": info.variable_id,
+                "dims": [d.get_length() if d.is_static else -1 for d in ps]
+                        if ps.rank.is_static else None,
+                "type": str(info.data_type)})
+        sinks = len(model.get_sinks())
         refusal, after = None, before
         try:
             paged_attention_transformation(model)
@@ -791,20 +843,25 @@ def paged_census():
             hist[node.get_type_name()] = hist.get(node.get_type_name(), 0) + 1
         paged_ops = {k: v for k, v in sorted(hist.items())
                      if k.startswith("Paged")}
+        counts = {r["port"]: sum(1 for n in after if _matches(r["port"], n))
+                  for r in _PAGED_PORTS}
         yield {"before": before, "after": after, "variables": variables,
-               "refusal": refusal, "paged_ops": paged_ops}
+               "sinks": sinks, "refusal": refusal, "paged_ops": paged_ops,
+               "counts": counts}
     finally:
         arena.close()
 
 
 @pytest.mark.xfail(strict=True, reason=(
-    "the serving-shape IR is the STATIC full-sequence shape: no Variables, no "
-    "ScaledDotProductAttention, so ov::pass::SDPAToPagedAttention -- the pass "
-    "backend_ov.cpp:2574 runs before it compiles -- produces none of the {n} "
-    "paged ports the table records, and refuses by name before it tries. "
-    "strict=True: the day the table's last row reads 'present', this cell "
+    "ov::pass::SDPAToPagedAttention -- the pass backend_ov.cpp:2574 runs "
+    "before it compiles -- produces {done} of the {n} paged ports the table "
+    "records from this IR. The {left} it does not are the GDN layers': they "
+    "are still the static full-sequence form, carrying neither the rank-3 "
+    "short-conv Variable nor the rank-4 recurrent-state Variable, so neither "
+    "state table nor the la.* index ports exist. All-or-nothing on purpose: "
+    "strict=True, so the day the table's last row reads 'present' this cell "
     "fails and gets promoted instead of forgotten."
-).format(n=len(_PAGED_PORTS)))
+).format(n=len(_PAGED_PORTS), done=len(_PAGED_PRESENT), left=len(_PAGED_ABSENT)))
 def test_the_paged_port_contract_is_satisfied(paged_census):
     missing = [r for r in _PAGED_PORTS
                if not _declares(r["port"], paged_census["after"])]
@@ -826,7 +883,7 @@ def test_the_paged_gap_is_inventoried_precisely(paged_census):
                 for r in _PAGED_PORTS}
     print(f"\n[contract-paged] the pass produced "
           f"{len(paged_census['after'] - paged_census['before'])} new "
-          f"parameter(s) from {paged_census['variables']} Variable(s); "
+          f"parameter(s) from {len(paged_census['variables'])} Variable(s); "
           f"paged ops: {paged_census['paged_ops'] or 'none'}")
     if paged_census["refusal"]:
         print(f"[contract-paged] the pass REFUSED: {paged_census['refusal']}")
@@ -844,6 +901,79 @@ def test_the_paged_gap_is_inventoried_precisely(paged_census):
             for r, got in wrong)
         + "\nedit the `status` column of _PAGED_PORT_TABLE in the same commit "
           "as the port, rather than either cell.")
+
+
+# ---------------------------------------------------------------------------
+# THE PORTS THAT HAVE LANDED -- one live cell group per construct
+# ---------------------------------------------------------------------------
+# The table says WHICH ports exist. These say the construct behind them is the
+# one the serving path reads, at the geometry it reads it at. A port whose
+# status flips to `present` without this much is a port that satisfies a name
+# check and nothing else.
+
+def test_the_kv_variables_are_the_shape_the_load_path_reads_prototypes_from(
+        paged_census):
+    """`load_paged` reads its KV/state prototypes off the STATEFUL graph
+    (backend_ov.cpp:2557-2569): rank 4, leading dim replaced by 1, the tail
+    static, the sequence dim NOT static -- that is the test it applies
+    (`tail_static` over dims 1.. , and the attention KV is the case it excludes
+    with "attention KV: dynamic seq dim"). Two variables per full-attention
+    layer, key and value, and nothing else carries a variable yet."""
+    cfg = pwe.real_config()
+    kv, d = cfg.num_key_value_heads, cfg.head_dim
+    attn_layers = _CONTRACT_LAYERS // 4
+    print("\n[contract-kv] variables on the stateful graph:")
+    for v in paged_census["variables"]:
+        print(f"  {v['id']:34s} {v['dims']}  {v['type']}")
+    assert len(paged_census["variables"]) == 2 * attn_layers, (
+        f"{len(paged_census['variables'])} variable(s) for {attn_layers} "
+        f"full-attention layer(s); expected one key and one value each")
+    for v in paged_census["variables"]:
+        assert v["dims"] == [-1, kv, -1, d], (
+            f"{v['id']}: {v['dims']} is not [batch?, {kv}, seq?, {d}] -- "
+            f"rank 4 with a dynamic sequence dim is what :2557-2569 reads")
+        assert "f32" in v["type"] or "float32" in v["type"], v["type"]
+    # read and written: a state that is never assigned is not state
+    assert paged_census["sinks"] == len(paged_census["variables"]), (
+        f"{paged_census['sinks']} Assign(s) for "
+        f"{len(paged_census['variables'])} Variable(s)")
+
+
+def test_one_paged_attention_op_and_one_cache_pair_per_full_attention_layer(
+        paged_census):
+    """The pass turns each stateful attention layer into exactly one
+    PagedAttentionExtension with its own `key_cache.N` / `value_cache.N`. The
+    count is the layer count, not a number written down here: a build that
+    silently shared one cache across layers, or emitted a spare, fails."""
+    attn_layers = _CONTRACT_LAYERS // 4
+    ops = paged_census["paged_ops"]
+    counts = paged_census["counts"]
+    print(f"[contract-kv] paged ops {ops}; key_cache x{counts['key_cache.']}, "
+          f"value_cache x{counts['value_cache.']}, "
+          f"{attn_layers} full-attention layer(s)")
+    assert ops.get("PagedAttentionExtension") == attn_layers, ops
+    assert counts["key_cache."] == attn_layers, counts
+    assert counts["value_cache."] == attn_layers, counts
+    # the index ports are shared by every PagedAttention op: one each, always
+    for r in _PAGED_PORTS:
+        if r["produced_by"] is _BY_PA_INDEX:
+            assert counts[r["port"]] == 1, (r["port"], counts[r["port"]])
+
+
+def test_the_transformation_consumes_attention_mask_and_beam_idx(paged_census):
+    """Both are declared so the pass can find them by name, and NEITHER
+    survives it -- the served artifact's transformed input list has neither.
+    A build that left them behind would hand the serving path two ports it
+    never feeds, and `load_paged` would compile a model with dangling inputs.
+    """
+    consumed = {"attention_mask", "beam_idx"}
+    print(f"[contract-kv] before: {sorted(paged_census['before'])}")
+    print(f"[contract-kv] after : {sorted(paged_census['after'])}")
+    assert consumed <= paged_census["before"], (
+        f"the pass looks these up by name: {sorted(consumed)}")
+    assert not (consumed & paged_census["after"]), (
+        f"survived the transformation: "
+        f"{sorted(consumed & paged_census['after'])}")
 
 
 # ---------------------------------------------------------------------------

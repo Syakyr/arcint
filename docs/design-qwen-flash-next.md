@@ -2036,3 +2036,49 @@ its C++ citation resolved from an anchor, and the construct that produces it.
 Both the umbrella strict xfail and the inventory cell read that table and
 nothing else, so a port landing is one edit to its `status` column in the same
 commit as the port, and the row count is never written down anywhere.
+
+#### The first of the three constructs: stateful full-attention (2026-09-13)
+
+`q4e.serving_shape.emit_stateful_attention` replaces the eager attention core
+of the full-attention layers — `repeat_kv`, scaled `q@kᵀ`, the baked causal
+mask, the f32 softmax and `@V` — with a KV Variable and one
+`ScaledDotProductAttention`. Everything outside that core is
+`q4e.attention`'s, op for op: the fused `q_proj` with its per-head
+[query | gate] chunk, `q_norm`/`k_norm` over `head_dim`, `v_proj`, the
+gather-and-apply rope, the sigmoid gate, `o_proj`. The parity-gated emitter is
+not touched — the same precedent as `_ple_tail`.
+
+The chain, transcribed from the served artifact rather than invented:
+
+```
+ReadValue(init = Broadcast(0.0 → [1, kv, 0, d]))
+  → Gather(beam_idx, axis 0)
+  → Concat(past, current, axis 2)        ← Assign takes THIS
+  → Unsqueeze → Broadcast → Reshape      (repeat_kv to the query head count)
+  → ScaledDotProductAttention(q, k, v, mask, scale), causal=False, 5 inputs
+```
+
+Two parameters are added because the pass looks them up by name and removes
+them: `attention_mask` (`[1, ?]` — it spans past + current, so its length is
+not the query block's) and `beam_idx`. Neither survives the transformation, on
+this IR or on the served one.
+
+**Measured, 8 layers at T=8 (2 of the 8 are full-attention, index % 4 == 3):**
+4 Variables, `ReadValue` 4 / `Assign` 4 / `ScaledDotProductAttention` 2 before;
+`PagedAttentionExtension` 2 after, with `key_cache.0/1`, `value_cache.0/1` and
+the five PagedAttention index ports — **7 of the table's rows**, flipped to
+`present` in the same commit. The remaining rows are the GDN layers': the two
+state tables and the four `la.*` index ports.
+
+The query block stays static (`T`), and that was checked rather than assumed:
+the pass converts a static-query stateful graph as readily as a fully dynamic
+one. The KV length is dynamic regardless — it is `past + T` out of the
+Variable — so the additive causal mask is built from `Range` comparisons
+instead of being baked, and the report's shapes render a dynamic dimension as
+`-1` (`get_shape()` throws on one).
+
+**The residency keystone did not move.** 48 layers at real geometry: 84,374
+nodes (from 84,372), the same 183.07 GiB declared, the same 0 KiB on disk,
+**peak RSS 4.52 GiB — unchanged, against an unchanged 5.31 GiB ceiling**. So
+this increment is not the reshape CF-KEYSTONERSS was deferred to ride, and that
+fix stays where it was.
