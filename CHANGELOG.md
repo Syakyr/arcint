@@ -22,6 +22,42 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
 Requires `marfrit-openvino 2026.4.0~dev20260821+p15` (patches 0003–0033) —
 unchanged from 0.4.7. No plugin patch.
 
+### The serving-shape IR carries the paged port contract (2026-09-13)
+
+Nothing declares a paged serving port by hand: the load path runs
+`ov::pass::SDPAToPagedAttention` over the IR it has just read
+(`src/exec/backend_ov.cpp:2574`) and every port is that pass's output. The
+serving-shape emitter (`tools/q4e/serving_shape.py`) now carries the three
+constructs the pass converts, so all thirteen ports the served forward
+classifies or feeds are produced from it: a KV Variable and a
+`ScaledDotProductAttention` per full-attention layer, a rank-3 short-conv
+Variable per GDN layer, and the GDN recurrence as the token-sequential
+`v5::Loop` that `FuseGDNLoop` fuses into the op
+`PagedGatedDeltaNetFusion` matches. The parity-gated `q4e.gdn` keeps its
+chunked default and its unrolled conv — both serving forms reach it through
+hooks, and it emits no different op when nobody passes them.
+
+The suite records this as one table, `_PAGED_PORT_TABLE` in
+`tests/python/test_serving_shape.py`: one row per port with its status, its
+C++ citation resolved from an anchor, and the construct that produces it.
+Both the inventory cell and the umbrella strict xfail read it and nothing
+else; the xfail **retired** when the last row flipped, which is what
+`strict=True` was for.
+
+Residency keystone re-derived, not carried: the Loop collapses the unrolled
+chunked delta rule, so 48 layers go from 84,158 nodes to 16,766 and peak RSS
+from 4.52 GiB to 4.24. Every row of the ceiling's bracket was re-measured one
+module per run and the ceiling tightened 5.31 → 5.12 GiB. The keystone's
+child-RSS probe now reads the kernel's accounting via `os.wait4` in the parent
+instead of trusting the child's self-read (**CF-KEYSTONERSS**), which was blind
+to anything the child allocated after that line — measured at 2.00 GiB missed
+in a deliberate demonstration.
+
+**Not in this release:** the emitted IR still declares `input_ids`,
+`ngram_row_ids` and `conv_mask`, which no serving forward feeds (the forward
+feeds `inputs_embeds`), and its query block is static. Both are gated and
+named, not silent.
+
 ### WP7 — Flash-Next expert-offload serving policy (windowless)
 
 `src/exec/flash_next_offload.h`: pure-arithmetic (no OpenVINO types) residency

@@ -639,7 +639,7 @@ _PAGED_PORT_TABLE = (
     # classified by name prefix at load time
     ("conv_state_table.", PRESENT, "classify",
      'name.rfind("conv_state_table.", 0) == 0', _BY_CONV, 48),
-    ("gated_delta_state_table.", ABSENT, "classify",
+    ("gated_delta_state_table.", PRESENT, "classify",
      'name.rfind("gated_delta_state_table.", 0) == 0', _BY_GDN, 48),
     ("key_cache.", PRESENT, "classify",
      'name.rfind("key_cache.", 0) == 0 || name.rfind("value_cache.", 0) == 0',
@@ -868,17 +868,16 @@ def paged_census():
         arena.close()
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "ov::pass::SDPAToPagedAttention -- the pass backend_ov.cpp:2574 runs "
-    "before it compiles -- produces {done} of the {n} paged ports the table "
-    "records from this IR. The {left} it does not are the GDN layers': they "
-    "are still the static full-sequence form, carrying neither the rank-3 "
-    "short-conv Variable nor the rank-4 recurrent-state Variable, so neither "
-    "state table nor the la.* index ports exist. All-or-nothing on purpose: "
-    "strict=True, so the day the table's last row reads 'present' this cell "
-    "fails and gets promoted instead of forgotten."
-).format(n=len(_PAGED_PORTS), done=len(_PAGED_PRESENT), left=len(_PAGED_ABSENT)))
+# RETIRED 2026-09-13, which is the whole point of having written it strict.
+# This cell carried `@pytest.mark.xfail(strict=True)` from the day the gap was
+# named until the day the table's last row read `present`, at which point
+# strict turned the pass into a FAILURE and the cell had to be looked at
+# instead of forgotten. It was NOT relaxed and it did not move to
+# `xfail(strict=False)`: the decorator is gone and the assertion it always
+# carried is now a live one. The suite's xfail count drops by one with this
+# commit; the other one is test_moe_block.py's and is untouched.
 def test_the_paged_port_contract_is_satisfied(paged_census):
+    """Every port in the table, produced by the pass the load path runs."""
     missing = [r for r in _PAGED_PORTS
                if not _declares(r["port"], paged_census["after"])]
     assert not missing, (
@@ -887,6 +886,9 @@ def test_the_paged_port_contract_is_satisfied(paged_census):
                     f"{r['produced_by']}" for r in missing)
         + (f"\nthe pass refused: {paged_census['refusal']}"
            if paged_census["refusal"] else ""))
+    assert not _PAGED_ABSENT, (
+        f"the table still lists {len(_PAGED_ABSENT)} port(s) absent while the "
+        f"pass produces all of them: {[r['port'] for r in _PAGED_ABSENT]}")
 
 
 def test_the_paged_gap_is_inventoried_precisely(paged_census):
@@ -941,11 +943,14 @@ def test_the_kv_variables_are_the_shape_the_load_path_reads_prototypes_from(
     print("\n[contract-kv] variables on the stateful graph:")
     for v in paged_census["variables"]:
         print(f"  {v['id']:34s} {v['dims']}  {v['type']}")
-    # The rank-4 ones are the attention KV. The GDN short conv's are rank 3 and
-    # have their own cell -- :2557-2569 splits them by exactly this rank, so
-    # splitting them by rank here is reading the C++ rather than the ids.
+    # Rank alone no longer separates them: the GDN recurrent state is rank 4
+    # too. `load_paged` separates them by the SEQUENCE DIM -- a rank-4 variable
+    # whose tail is static is a state prototype, and the attention KV is the
+    # case it excludes with "attention KV: dynamic seq dim" (:2557-2569). So
+    # that is the split used here, which is reading the C++ rather than the ids.
     rank4 = [v for v in paged_census["variables"]
-             if v["dims"] is not None and len(v["dims"]) == 4]
+             if v["dims"] is not None and len(v["dims"]) == 4
+             and any(d == -1 for d in v["dims"][1:])]
     assert len(rank4) == 2 * attn_layers, (
         f"{len(rank4)} rank-4 variable(s) for {attn_layers} full-attention "
         f"layer(s); expected one key and one value each")
@@ -1008,6 +1013,42 @@ def test_the_conv_state_is_one_table_per_gdn_layer_at_the_conv_geometry(
     assert paged_census["paged_ops"].get("PagedCausalConv1D") == gdn_layers, \
         paged_census["paged_ops"]
     assert paged_census["counts"]["conv_state_table."] == gdn_layers, \
+        paged_census["counts"]
+
+
+def test_the_recurrent_state_is_one_table_per_gdn_layer_at_the_head_geometry(
+        paged_census):
+    """The rank-4 recurrent Variable, one per GDN layer, at
+    `[batch, v_heads, key_head_dim, value_head_dim]`.
+
+    This is the shape `matches_linear_attention_loop` binds as
+    `[?, head_num, k_head_size, v_head_size]` inside the Loop body, and the
+    shape `load_paged` takes as a rank-4 prototype with a static tail
+    (backend_ov.cpp:2557-2569). The attention KV Variables are rank 4 too and
+    are NOT prototypes there -- their sequence dim is dynamic, which is the
+    exclusion that same code writes as "attention KV: dynamic seq dim" -- so
+    this cell checks that separation holds on the emitted graph rather than
+    trusting the ids.
+    """
+    cfg = pwe.real_config()
+    HV = cfg.linear_num_value_heads
+    Dk, Dv = cfg.linear_key_head_dim, cfg.linear_value_head_dim
+    gdn_layers = _CONTRACT_LAYERS - _CONTRACT_LAYERS // 4
+    rank4 = [v for v in paged_census["variables"]
+             if v["dims"] is not None and len(v["dims"]) == 4]
+    # the load path's own split: a static tail is a state prototype, a dynamic
+    # sequence dim is attention KV
+    proto = [v for v in rank4 if all(d != -1 for d in v["dims"][1:])]
+    kvish = [v for v in rank4 if any(d == -1 for d in v["dims"][1:])]
+    print(f"\n[contract-gdn] {len(proto)} rank-4 state prototype(s), "
+          f"{len(kvish)} rank-4 attention KV; want [1, {HV}, {Dk}, {Dv}]")
+    assert len(proto) == gdn_layers, [v["id"] for v in proto]
+    for v in proto:
+        assert v["dims"] == [1, HV, Dk, Dv], (v["id"], v["dims"])
+    assert len(kvish) == 2 * (_CONTRACT_LAYERS // 4), [v["id"] for v in kvish]
+    assert paged_census["paged_ops"].get("PagedGatedDeltaNet") == gdn_layers, \
+        paged_census["paged_ops"]
+    assert paged_census["counts"]["gated_delta_state_table."] == gdn_layers, \
         paged_census["counts"]
 
 
@@ -1144,9 +1185,19 @@ def test_the_transformation_consumes_attention_mask_and_beam_idx(paged_census):
 # RAISING THIS TO MAKE A RUN PASS RE-OPENS THE DEFECT. If the authored peak
 # genuinely moves (a different OpenVINO, a different allocator), re-run both
 # sides and re-derive; the two figures are what the constant means.
-PEAK_RSS_AUTHORED_GIB = 4.52
-PEAK_RSS_CHEAPEST_DEFECT_GIB = 6.23
-PEAK_RSS_CEILING_GIB = 5.31        # == round(sqrt(4.52 * 6.23), 2), asserted
+#
+# RE-DERIVED 2026-09-13, because the authored peak genuinely moved and this
+# comment's own instruction for that case is "re-run both sides and re-derive".
+# What moved it: the GDN core became a token-sequential v5::Loop, so 48 layers'
+# worth of unrolled chunked delta rule collapsed into 36 Loop bodies -- 84,158
+# nodes to 16,766, and 4.52 GiB to 4.24. Every row below was re-measured the
+# same day, one module per run, through the CF-KEYSTONERSS measurement path
+# (parent-side os.wait4 over an un-reaped child), not carried over.
+# The ceiling goes DOWN, 5.31 -> 5.12. Nothing here was raised to make a run
+# pass; the run was already inside the old ceiling.
+PEAK_RSS_AUTHORED_GIB = 4.24
+PEAK_RSS_CHEAPEST_DEFECT_GIB = 6.19
+PEAK_RSS_CEILING_GIB = 5.12        # == round(sqrt(4.24 * 6.19), 2), asserted
 
 # Value = peak RSS in GiB of the 48-layer build with exactly that module
 # dropped. `None` = NOT PROBED, with the reason in the row; no row borrows a
@@ -1156,12 +1207,23 @@ PEAK_RSS_CEILING_GIB = 5.31        # == round(sqrt(4.52 * 6.23), 2), asserted
 # The rows at the authored figure are why the keystone cell is not the whole
 # closure: `test_every_module_binding_the_constant_factory_is_swapped` is.
 PEAK_RSS_GIB_WHEN_DROPPED = {
-    "moe":               6.23,   # [qmoe]  <- the CHEAPEST defect
-    "attention":         8.98,   # [qattn] the reviewer's probe, exactly
-    "hc":                9.51,   # [qhc]
-    "gdn":              30.10,   # [qgdn]
-    "ple":               4.52,   # [qple]  == authored: invisible to the RSS leg
-    "piecewise_export":  4.52,   # [pwe]   == authored: invisible to the RSS leg
+    "moe":               6.19,   # [qmoe]  <- the CHEAPEST defect  (was 6.23)
+    "attention":         8.67,   # [qattn] the reviewer's probe    (was 8.98)
+    "hc":                9.49,   # [qhc]                           (was 9.51)
+    "gdn":              29.62,   # [qgdn]                          (was 30.10)
+    "ple":               4.24,   # [qple]  == authored: invisible to the RSS leg
+    "piecewise_export":  4.24,   # [pwe]   == authored: invisible to the RSS leg
+    #
+    # `attention` NEARLY STOPPED BEING A WITNESS, and it is worth the four
+    # lines. The first re-derivation after the reshape measured it at 4.24 --
+    # invisible, the same reading the reviewer's own probe had produced 8.98
+    # for. Cause: `emit_stateful_attention` was reaching for `qgdn._c` to build
+    # the attention projections, as the rest of this module does, so dropping
+    # `attention` from the swap list no longer copied anything. Both factories
+    # are swapped and the graph is identical either way, so nothing would have
+    # gone red -- the CF-RESIDENT leg would simply have had one fewer module it
+    # could see, silently. The call sites now use `qattn._c`, which is where
+    # those weights belong, and the row is a measured 8.67 again.
     # [qbb] NOT PROBED, and deliberately not given 4.52 by analogy.
     # `build_serving_shape_ir` imports `backbone` so `shared_constants()` can
     # swap it, and then never calls it: it reaches for `qgdn._c` directly for
@@ -1196,9 +1258,31 @@ def _build_48_in_a_child():
     other suites, the module-scope 8-layer fixture. A child process is the only
     way the number means "this build", and it is also what makes the ceiling
     above reproducible from a bare shell.
+
+    CF-KEYSTONERSS, landed 2026-09-13 with the reshape it was deferred to ride.
+    The child used to report its OWN `getrusage(RUSAGE_SELF)`, read at one
+    instant in the middle of its own run -- before `json.dumps` of the report,
+    before `arena.close()`, and with no way for the parent to check it. Two
+    holes, and the second is the one that matters:
+
+      * anything the child allocates AFTER that line is invisible, so the
+        number is a high-water mark of a prefix of the run, not of the run;
+      * `subprocess.run` reaps the child itself, so the kernel's own accounting
+        of that child is gone before the parent can look at it. The gated
+        figure had exactly one witness, and it was the thing being measured.
+
+    The parent now waits with `os.wait4` and reads `ru_maxrss` out of the
+    kernel's accounting for that child, which is a high-water mark of the WHOLE
+    child, taken after it exits. Both numbers are kept and the child's is
+    asserted not to EXCEED the parent's -- it cannot, being a prefix of the
+    same walk -- so the two witnesses disagree loudly rather than silently.
+    `Popen` with the streams on temp files rather than pipes, because the child
+    must be un-reaped when `wait4` runs and `communicate()` would both reap it
+    and be the only safe way to drain a pipe.
     """
     import json
     import subprocess
+    import tempfile
     src = r"""
 import json, resource, sys, time
 sys.path.insert(0, %r)
@@ -1209,21 +1293,33 @@ try:
     model, report = ss.build_serving_shape_ir(seq_len=64, arena=arena)
     report["build_seconds"] = time.time() - t0
     report["disk_kib"] = arena.disk_kib()
-    report["peak_rss_gib"] = resource.getrusage(
+    report["child_self_rss_gib"] = resource.getrusage(
         resource.RUSAGE_SELF).ru_maxrss / 2**20
-    report.pop("op_histogram", None)
     sys.stdout.write("REPORT " + json.dumps(report) + "\n")
 finally:
     arena.close()
 """ % str(REPO_ROOT / "tools")
-    r = subprocess.run([sys.executable, "-c", src], capture_output=True,
-                       text=True, timeout=1800)
-    line = [l for l in r.stdout.splitlines() if l.startswith("REPORT ")]
+    with tempfile.TemporaryFile("w+") as out, tempfile.TemporaryFile("w+") as err:
+        proc = subprocess.Popen([sys.executable, "-c", src],
+                                stdout=out, stderr=err)
+        _, status, usage = os.wait4(proc.pid, 0)
+        proc.returncode = status                 # Popen must not wait() again
+        out.seek(0), err.seek(0)
+        stdout, stderr = out.read(), err.read()
+    line = [l for l in stdout.splitlines() if l.startswith("REPORT ")]
     assert line, (
         "the keystone child produced no report.\n"
-        f"rc={r.returncode}\nstdout tail:\n{r.stdout[-2000:]}\n"
-        f"stderr tail:\n{r.stderr[-2000:]}")
-    return json.loads(line[-1][len("REPORT "):])
+        f"status={status}\nstdout tail:\n{stdout[-2000:]}\n"
+        f"stderr tail:\n{stderr[-2000:]}")
+    report = json.loads(line[-1][len("REPORT "):])
+    # The kernel's accounting for the child, after it exited: the whole run.
+    report["peak_rss_gib"] = usage.ru_maxrss / 2**20
+    assert report["child_self_rss_gib"] <= report["peak_rss_gib"] + 1e-9, (
+        f"the child reported {report['child_self_rss_gib']:.2f} GiB for itself "
+        f"but the kernel accounted {report['peak_rss_gib']:.2f} GiB for the "
+        f"same child. The child's read is a prefix of the parent's and cannot "
+        f"exceed it; one of the two is not measuring this process.")
+    return report
 
 
 @pytest.mark.skipif(not os.environ.get("Q4E_SERVING_FULL"),
@@ -1266,7 +1362,32 @@ def test_the_full_48_layer_stack_emits_at_real_geometry():
           f"(printed, never written down -- REVIEW 23938c1 F3)")
     assert report["n_layers"] == cfg.num_hidden_layers == 48
     assert report["gdn_layers"] == 36 and report["attn_layers"] == 12
-    assert report["nodes"] > 50_000, report["nodes"]
+
+    # THE NODE FLOOR IS RETIRED AND REPLACED, not lowered. It read
+    # `nodes > 50_000` and the build now emits 16,766 -- because a v5::Loop is
+    # a compact encoding of what used to be an unrolled chunked delta rule per
+    # layer, and `get_ordered_ops` does not descend into a Loop body. Lowering
+    # the number would have kept a weak proxy weak. What the floor was reaching
+    # for is that 48 REAL layers are present, and the op histogram says that
+    # directly, per layer kind, with every count derived from the layer counts
+    # this cell has already asserted:
+    gdn, attn = report["gdn_layers"], report["attn_layers"]
+    hist = report["op_histogram"]
+    structural = {
+        "Loop": gdn,                        # one sequential delta rule per GDN
+        "GroupConvolution": gdn,            # one short conv per GDN
+        "ScaledDotProductAttention": attn,  # one per full-attention layer
+        "ReadValue": 2 * gdn + 2 * attn,    # conv + ssm; key + value
+        "Assign": 2 * gdn + 2 * attn,
+    }
+    print(f"  structural ops        "
+          f"{ {k: hist.get(k, 0) for k in structural} }")
+    for name, want in structural.items():
+        assert hist.get(name, 0) == want, (
+            f"{name}: {hist.get(name, 0)} in a {report['n_layers']}-layer "
+            f"build ({gdn} GDN + {attn} attention); expected {want}. This is "
+            f"the check that replaced a bare node-count floor -- it says which "
+            f"layer kind is short, which a total never could.")
     # one more sign, not the guard -- see
     # test_no_expert_constant_is_materialised for why `disk_kib` cannot
     # distinguish an unwritten arena from a written one on this filesystem
@@ -1538,25 +1659,38 @@ def test_the_peak_rss_ceiling_is_the_geometric_mean_of_its_bracket():
     from what a mutation OUGHT to produce is a recital whichever side of the
     assertion it sits on. Regenerated below by running each mutation.
 
-    WHAT THE MUTATIONS ACTUALLY PRODUCE (`/tmp` copies of the clean tree, dev
-    host CPU, this cell alone, `-k geometric_mean`). The control is the live
-    tree: `1 passed`, gap 0.1521 pp <= 0.2213 pp.
+    THE ORDERING INVARIANT WAS RIGHT ABOUT THE RULE AND WRONG ABOUT THE
+    DIRECTION, found 2026-09-13 when the bracket was re-derived. It read
+    `0 < below < above < 1`, and its message explained that "`below` must be
+    the SMALLER, because rounding the geometric mean UP to 0.01 GiB is what
+    makes the upper margin the larger one". True of the 4.52 / 6.23 bracket,
+    whose mean 5.3149 rounds UP -- and generalised from that one instance. The
+    4.24 / 6.19 bracket's mean is 5.123046, which rounds DOWN, so the larger
+    margin is the one BELOW and a cell with nothing wrong in it went red. The
+    rule is unchanged and is now stated over the direction rather than assuming
+    it: the larger margin is on the side the rounding moved the ceiling toward.
+    It kills every mutation it killed before, re-run rather than assumed.
 
-        ENG  below vs the AUTHORED PEAK    gap 20.3540 pp   1 failed
-        M1   the two returns SWAPPED       gap  0.1521 pp   1 failed
-        M2   the -1.0 dropped              gap  0.1521 pp   1 failed
-        M3   bracket ends swapped          gap  0.1103 pp   1 failed
+    WHAT THE MUTATIONS ACTUALLY PRODUCE, re-run 2026-09-13 on the re-derived
+    bracket (staged tree, dev host CPU, this cell alone, `-k geometric`). The
+    control is the live tree: `1 passed`, gap 0.1437 pp <= 0.2362 pp.
+
+        ENG  below vs the AUTHORED PEAK    gap 25.2358 pp   1 failed
+        M1   the two returns SWAPPED       gap  0.1437 pp   1 failed
+        M2   the -1.0 dropped              gap  0.1437 pp   1 failed
+        M3   bracket ends swapped          gap  0.0984 pp   1 failed
         M4   both margins the SAME expr    gap  0.0000 pp   1 failed
 
-    ONLY `ENG` IS CAUGHT BY THE GAP BOUND. M1-M4 all sit INSIDE 0.2213 pp and
-    passed everything this cell asserted until H2 added `0 < below < above < 1`
+    ONLY `ENG` IS CAUGHT BY THE GAP BOUND. M1-M4 all sit INSIDE 0.2362 pp and
+    passed everything this cell asserted until H2 added the ordering invariant
     -- REVIEW f8229d8 §14 found them by attacking the cell rather than reading
-    it. M1 is the one that matters: it prints `+17.326% above / +17.478% below`,
-    the two margins ordered backwards, which is F3 itself, the defect this cell
-    was written to prevent walking straight through its own guard. M4 makes
-    "two independently computed margins" vacuous at gap exactly 0. The bound
-    tests that the margins AGREE; it never tested that either is the right
-    formula, and the invariant is what closes that.
+    it. M1 is the one that matters: it orders the two margins backwards, which
+    is F3 itself, the defect this cell was written to prevent walking straight
+    through its own guard. M4 makes "two independently computed margins"
+    vacuous at gap exactly 0. The bound tests that the margins AGREE; it never
+    tested that either is the right formula, and the invariant is what closes
+    that. The figures above are from the six runs, not from what they ought to
+    produce -- the H1 retraction below is what that costs when it is skipped.
 
     The bound is the exact one, not the derivative at `c`: `gap(gm) == 0` and
     `gap(c) = |integral from gm to c of (1/a + d/t**2) dt|`, so with
@@ -1565,7 +1699,9 @@ def test_the_peak_rss_ceiling_is_the_geometric_mean_of_its_bracket():
     0.1521 pp. Taking the derivative at `c` instead gives 0.2211 pp, which is
     below the true supremum and would be a tolerance that can be exceeded
     without a defect; the 1.01 slack factor REVIEW 7c26cce F9 suggested is
-    that same gap covered by a fudge instead of by the integral.
+    that same gap covered by a fudge instead of by the integral. (The 0.2213
+    figure is the OLD bracket's; at 4.24 / 6.19 the same formula gives 0.2362,
+    which the cell generates and prints rather than carrying here.)
     """
     above, below = _rss_ceiling_margins()
     exact = math.sqrt(
@@ -1616,15 +1752,40 @@ def test_the_peak_rss_ceiling_is_the_geometric_mean_of_its_bracket():
     # `0 < .. < 1` by the bracket, both independently of how either is
     # computed. Four mutations that passed the bound alone are red on this line
     # and are listed in the docstring.
-    assert 0 < below < above < 1, (
+    # WHICH MARGIN IS LARGER IS DECIDED BY THE ROUNDING, AND THE ROUNDING GOES
+    # BOTH WAYS. This assertion read `0 < below < above < 1` and its message
+    # said "`below` must be the SMALLER, because rounding the geometric mean UP
+    # to 0.01 GiB is what makes the upper margin the larger one". That is true
+    # of a mean whose third decimal rounds up, which is what the 4.52 / 6.23
+    # bracket did (5.3149 -> 5.31), and it was generalised from that one
+    # instance. Re-deriving the bracket at 4.24 / 6.19 gives 5.123046, which
+    # rounds DOWN, and the invariant went red on a cell where nothing was
+    # wrong. The rule is the same rule, stated over the direction instead of
+    # assuming it: the larger margin is on the side the rounding moved the
+    # ceiling TOWARD.
+    larger = "above" if PEAK_RSS_CEILING_GIB > unrounded else "below"
+    if PEAK_RSS_CEILING_GIB == unrounded:                    # pragma: no cover
+        larger = "neither"
+    print(f"[rss-ceiling] the ceiling rounded "
+          f"{'UP' if larger == 'above' else 'DOWN'} from {unrounded:.6f}, so "
+          f"the larger margin must be the one {larger} it")
+    assert 0 < above < 1 and 0 < below < 1, (
         f"the ceiling's margins are +{above * 100:.3f}% above / "
-        f"+{below * 100:.3f}% below, which breaks `0 < below < above < 1`. "
-        f"Both must be positive (the ceiling sits strictly inside its "
-        f"bracket), both under 1 (neither side doubles), and `below` must be "
-        f"the SMALLER, because rounding the geometric mean UP to 0.01 GiB is "
-        f"what makes the upper margin the larger one. A violation here is a "
-        f"margin computed by the wrong formula, not a bracket that moved -- "
-        f"the bracket has its own assertion above.")
+        f"+{below * 100:.3f}% below. Both must be positive (the ceiling sits "
+        f"strictly inside its bracket) and both under 1 (neither side "
+        f"doubles). A violation here is a margin computed by the wrong "
+        f"formula, not a bracket that moved -- the bracket has its own "
+        f"assertion above.")
+    ordered = below < above if larger == "above" else above < below
+    assert ordered, (
+        f"the ceiling's margins are +{above * 100:.3f}% above / "
+        f"+{below * 100:.3f}% below, but the ceiling rounded "
+        f"{'UP' if larger == 'above' else 'DOWN'} from {unrounded:.6f} to "
+        f"{PEAK_RSS_CEILING_GIB}, so the margin {larger} it must be the "
+        f"LARGER. Ordered the other way, the two margins are not the two "
+        f"formulas they claim to be -- that is F3, the defect this cell "
+        f"exists to prevent, and it is what the ordering catches that the "
+        f"gap bound below cannot.")
     assert abs(above - below) <= gap_bound, (
         f"the ceiling's two relative margins differ by "
         f"{abs(above - below) * 100:.4f} percentage points "

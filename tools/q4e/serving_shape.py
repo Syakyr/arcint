@@ -737,7 +737,8 @@ def build_serving_shape_ir(config=None, seq_len=64, arena=None, n_layers=None,
                 if kind == "gdn":
                     g = qgdn.emit_gdn(
                         h, conv_mask, cfg, _strip(st, "linear_attn."), T,
-                        conv_emitter=stateful_short_conv(i, beam, sinks))
+                        conv_emitter=stateful_short_conv(i, beam, sinks),
+                        core_emitter=stateful_gdn_core(i, beam, sinks))
                 else:
                     g = emit_stateful_attention(
                         h, pid, cfg, _strip(st, "self_attn."), T, i, beam,
@@ -954,6 +955,147 @@ def stateful_short_conv(layer, beam, sinks):
     return emit
 
 
+def _gdn_loop_body(HV, Dk, Dv, T):
+    """One timestep of the delta rule, as the Loop body `FuseGDNLoop` requires.
+
+    Transcribed op for op from `matches_linear_attention_loop`
+    (fuse_gated_delta_net.cpp). The body's results must be, IN THIS ORDER,
+    [execution condition, updated state, scattered output] -- the matcher reads
+    `body_results[1]` and `body_results[2]` by index -- and query, key and value
+    must be rank 4 with a sequence extent of ONE, which is what makes this the
+    token-sequential rule rather than the chunked one.
+
+        gated_state   = state * Unsqueeze(Exp(g), -1)
+        key_unsq      = Unsqueeze(Squeeze(key, 2), -1)
+        projected     = ReduceSum(gated_state * key_unsq, -2, keep_dims=False)
+        delta         = Squeeze(value, 2) - projected
+        updated       = gated_state + key_unsq * Unsqueeze(delta * beta, -2)
+        out           = ReduceSum(updated * Unsqueeze(Squeeze(q,2), -1), -2,
+                                  keep_dims=True)
+        result[2]     = ScatterUpdate(buffer, Unsqueeze(step, 0), out, 2)
+        result[1]     = updated
+    """
+    i64 = lambda v: op.constant(np.array(v, np.int64))
+    step = op.parameter([], Type.i64)                    # current iteration
+    state = op.parameter([1, HV, Dk, Dv], Type.f32)      # recurrent state
+    buf = op.parameter([1, HV, T, Dv], Type.f32)         # output buffer
+    q = op.parameter([1, HV, 1, Dk], Type.f32)
+    k = op.parameter([1, HV, 1, Dk], Type.f32)
+    v = op.parameter([1, HV, 1, Dv], Type.f32)
+    g = op.parameter([1, HV, 1], Type.f32)
+    beta = op.parameter([1, HV, 1], Type.f32)
+
+    gated_state = op.multiply(state, op.unsqueeze(op.exp(g), i64([-1])))
+    key_unsq = op.unsqueeze(op.squeeze(k, i64([2])), i64([-1]))
+    projected = op.reduce_sum(op.multiply(gated_state, key_unsq), i64([-2]),
+                              keep_dims=False)
+    delta = op.subtract(op.squeeze(v, i64([2])), projected)
+    updated = op.add(gated_state,
+                     op.multiply(key_unsq,
+                                 op.unsqueeze(op.multiply(delta, beta),
+                                              i64([-2]))))
+    out = op.reduce_sum(
+        op.multiply(updated,
+                    op.unsqueeze(op.squeeze(q, i64(2)), i64([-1]))),
+        i64([-2]), keep_dims=True)
+    scattered = op.scatter_update(buf, op.unsqueeze(step, i64(0)), out, i64(2))
+
+    params = [step, state, buf, q, k, v, g, beta]
+    body = Model([op.result(op.constant(np.array(True))),
+                  op.result(updated), op.result(scattered)],
+                 params, "gdn_delta_rule_step")
+    return body, params
+
+
+def stateful_gdn_core(layer, beam, sinks):
+    """The gated delta rule as the token-sequential Loop the fusion chain wants.
+
+    Returns a drop-in for `emit_gdn`'s `core_emitter` hook: the same
+    [1, T, HV, Dv] the chunked core produces at the same point, with the
+    recurrent state carried in a rank-4 ov Variable.
+
+    TWO passes stand between this Loop and `gated_delta_state_table.N`, and
+    neither is optional. `FuseGDNLoop` rewrites the Loop into one
+    `ov::op::internal::GatedDeltaNet` node; `PagedGatedDeltaNetFusion` then
+    matches THAT node over a ReadValue. Nothing can emit the internal op
+    directly, which is why this is a Loop and not a call.
+
+    What the first pass pins, all of it read out of the matcher:
+
+      * the Loop's EXTERNAL INPUT ORDER, positions 2 through 8:
+        q_scaled, key, value, gate, beta, init_state, output_buffer -- after
+        trip count and execution condition. Input order here is the order the
+        set_*_input calls are made in, so the call order below IS the contract.
+      * at least 9 inputs and EXACTLY 2 outputs; output 0 the attention output,
+        output 1 the final state, so `get_iter_value` is called in that order.
+      * the query must arrive already DIVIDED by `head_size ** 0.5` where the
+        head size is read from a `ShapeOf` -- `Divide(q, Power(Convert(
+        Gather(ShapeOf(q), 3, 0)), 0.5))`. A folded constant does not match,
+        which is why the chunked path's `q * Dk**-0.5` is skipped and this
+        does its own scaling.
+
+    The recurrent state is declared `[1, HV, Dk, Dv]` rather than the served
+    artifact's `[?, ...]`. It reaches `load_paged`'s rank-4 prototype scan
+    either way -- that code replaces dim 0 with 1 regardless
+    (backend_ov.cpp:2557-2569) -- and this is the form that was measured to
+    fuse. The attention KV Variables stay out of that scan on their own, by
+    the dynamic sequence dim the same code excludes.
+    """
+    def emit(q, k, v, beta_t, decay_t, T, HV, Dk, Dv):
+        i64 = lambda val: op.constant(np.array(val, np.int64))
+
+        # the head-size scale, in the matcher's shape and not a folded constant
+        head_size = op.convert(
+            op.gather(op.shape_of(q, output_type="i64"), i64(3), i64(0)),
+            Type.f32)
+        q_scaled = op.divide(
+            q, op.power(head_size, op.constant(np.array(0.5, np.float32))))
+
+        info = ovutil.VariableInfo()
+        info.data_shape = ov.PartialShape([1, HV, Dk, Dv])
+        info.data_type = Type.f32
+        info.variable_id = f"cache_params.past.ssm.{layer}"
+        var = ovutil.Variable(info)
+        init = op.broadcast(op.constant(np.array(0.0, np.float32)),
+                            i64([1, HV, Dk, Dv]))
+        past = op.gather(op.read_value(init, var), beam, i64(0))
+
+        body, (p_step, p_state, p_buf, p_q, p_k, p_v, p_g,
+               p_beta) = _gdn_loop_body(HV, Dk, Dv, T)
+        loop = op.loop(i64(T), op.constant(np.array(True)))
+        loop.set_function(body)
+        # body parameter 0 is the iteration counter, body result 0 the condition
+        loop.set_special_body_ports([0, 0])
+        # ORDER IS THE CONTRACT (see the docstring): q, k, v, gate, beta,
+        # state, buffer -- every one sliced on the sequence axis except the two
+        # merged ones, which carry across iterations.
+        for param, src in ((p_q, q_scaled), (p_k, k), (p_v, v),
+                           (p_g, decay_t), (p_beta, beta_t)):
+            loop.set_sliced_input(param, src.output(0), 0, 1, 1, -1, 2)
+        loop.set_merged_input(p_state, past.output(0),
+                              body.get_results()[1].output(0))
+        loop.set_merged_input(
+            p_buf,
+            op.broadcast(op.constant(np.array(0.0, np.float32)),
+                         i64([1, HV, T, Dv])).output(0),
+            body.get_results()[2].output(0))
+        attn_out = loop.get_iter_value(body.get_results()[2].output(0), -1)
+        state_out = loop.get_iter_value(body.get_results()[1].output(0), -1)
+        loop.validate_and_infer_types()
+
+        # `get_iter_value` hands back an Output and Assign wants a Node; a
+        # same-shape Reshape is the cheapest node that carries it. The paged
+        # fusion does not look at the Assign side -- it drops the Variable by
+        # id -- so nothing about this reshape is load-bearing for the match.
+        sinks.append(op.assign(
+            op.reshape(state_out, i64([1, HV, Dk, Dv]), special_zero=False),
+            var))
+        return op.transpose(attn_out,
+                            op.constant(np.array([0, 2, 1, 3], np.int32)))
+
+    return emit
+
+
 def emit_stateful_attention(hidden, pid, config, state, T, layer, beam,
                             attn_mask, sinks):
     """The full-attention layer in the STATEFUL shape the serving path's own
@@ -993,7 +1135,7 @@ def emit_stateful_attention(hidden, pid, config, state, T, layer, beam,
     # pin 867-870, unchanged from q4e.attention: the split is PER HEAD on the
     # last axis, and the gate is the second half of each head's 2*d block.
     qg = qgdn._reshape(
-        qgdn._mm(hidden, qgdn._c(state["q_proj.weight"]), tb=True),
+        qgdn._mm(hidden, qattn._c(state["q_proj.weight"]), tb=True),
         [1, T, heads, 2 * d])
     q = qgdn._slice(qg, 0, d, 1, 3)
     gate = qgdn._reshape(qgdn._slice(qg, d, 2 * d, 1, 3), [1, T, heads * d])
@@ -1001,13 +1143,14 @@ def emit_stateful_attention(hidden, pid, config, state, T, layer, beam,
     q = qgdn._transpose(
         qattn._rmsnorm_hd(q, state["q_norm.weight"], eps, d), [0, 2, 1, 3])
     k = qgdn._reshape(
-        qgdn._mm(hidden, qgdn._c(state["k_proj.weight"]), tb=True), [1, T, kv, d])
+        qgdn._mm(hidden, qattn._c(state["k_proj.weight"]), tb=True), [1, T, kv, d])
     k = qgdn._transpose(
         qattn._rmsnorm_hd(k, state["k_norm.weight"], eps, d), [0, 2, 1, 3])
     v = qgdn._transpose(
-        qgdn._reshape(qgdn._mm(hidden, qgdn._c(state["v_proj.weight"]), tb=True),
+        qgdn._reshape(qgdn._mm(hidden, qattn._c(state["v_proj.weight"]), tb=True),
                       [1, T, kv, d]), [0, 2, 1, 3])
-    q, k = qattn._apply_rope(q, k, qgdn._c(cosT), qgdn._c(sinT), pid, rotary, T)
+    q, k = qattn._apply_rope(q, k, qattn._c(cosT), qattn._c(sinT), pid,
+                                  rotary, T)
 
     # the two state reads, and the two writes that make them state
     full = []
@@ -1033,7 +1176,7 @@ def emit_stateful_attention(hidden, pid, config, state, T, layer, beam,
 
     out = qgdn._reshape(qgdn._transpose(att, [0, 2, 1, 3]), [1, T, heads * d])
     out = qgdn._mul(out, op.sigmoid(gate))                           # pin 898
-    return qgdn._mm(out, qgdn._c(state["o_proj.weight"]), tb=True)   # pin 900
+    return qgdn._mm(out, qattn._c(state["o_proj.weight"]), tb=True)   # pin 900
 
 
 def _strip(state, prefix):
@@ -1155,6 +1298,6 @@ def _expert_slot_bytes(num_expert, ratio_pct, per_expert_bytes, moe_layers):
 __all__ = [
     "SparseArena", "shared_constants", "build_serving_shape_ir",
     "emit_moe_tiled", "emit_stateful_attention", "stateful_short_conv",
-    "slot_pool_from_ir",
+    "stateful_gdn_core", "slot_pool_from_ir",
     "EXPERT_DECLARED_TYPE", "NGRAM_DECLARED_TYPE", "EXPERT_GROUP_SIZE",
 ]

@@ -277,13 +277,21 @@ def _rmsnorm_gated(core, z, weight_vec, eps, last_axis):
 
 # --- top-level emitter -----------------------------------------------------
 def _gdn_subgraph(hidden, amask, config, state, T, ut_mode=None,
-                  conv_emitter=None):
+                  conv_emitter=None, core_emitter=None):
     """The GDN block body: hidden [1,T,H] f32 + amask [1,T] f32 -> out [1,T,H].
     Shared by build_gdn_model (standalone) and emit_gdn (the assembled
     backbone); the emitted ops are unchanged from the inc1 monolith.
 
     `ut_mode` selects how the chunk axis reaches the forward-substitution
     unroll -- see UT_EMIT_MODE. None takes the module default.
+
+    `core_emitter` replaces the chunked gated delta rule, and only it: the
+    projections, the conv, the norms, the gated RMSNorm and out_proj are the
+    same ops either way. It exists for the same reason `conv_emitter` does --
+    the serving path's transformation fuses a TOKEN-SEQUENTIAL v5::Loop into
+    the op that becomes `gated_delta_state_table.N`, and the chunked rule this
+    module writes is a different computation, not a near miss of that pattern.
+    None takes the chunked default and nothing here emits a different op.
 
     `conv_emitter` replaces the depthwise causal conv, and ONLY that step. It
     is called exactly as `_causal_conv_silu` is and must return the same
@@ -354,6 +362,24 @@ def _gdn_subgraph(hidden, amask, config, state, T, ut_mode=None,
 
     q = _l2norm_last(q, 3)
     k = _l2norm_last(k, 3)
+
+    def _finish(core_bthd):
+        """RMSNormGated over Dv, then out_proj. Shared by both cores so the
+        tail cannot drift between them."""
+        normed = _rmsnorm_gated(core_bthd, z, w("norm.weight"), eps, 3)
+        return _mm(_reshape(normed, [1, T, value_dim]),
+                   _c(w("out_proj.weight")), tb=True)      # [1,T,H]
+
+    if core_emitter is not None:
+        # The chunked core below is skipped ENTIRELY -- not parameterised, not
+        # partly reused. `core_emitter` gets the normalised q/k/v and the two
+        # per-head sequences and returns the same [1, T, HV, Dv] the chunked
+        # path has at its own `core = _transpose(...)`. Note q is handed over
+        # UNSCALED: the serving core applies the head-size scale in the form
+        # its own matcher demands, which is a Divide by a ShapeOf-derived
+        # Power and not this Multiply by a folded constant.
+        return _finish(core_emitter(q, k, v, beta_t, decay_t, T, HV, Dk, Dv))
+
     q = _mul(q, _c(np.float32(Dk ** -0.5)))
 
     if pad > 0:
@@ -472,18 +498,14 @@ def _gdn_subgraph(hidden, amask, config, state, T, ut_mode=None,
     core = _transpose(core, [0, 2, 1, 3])                # [1,T,HV,Dv]
 
     # RMSNormGated(core, z) over Dv, then out_proj
-    core = _rmsnorm_gated(core, z, w("norm.weight"), eps, 3)
-    core = _reshape(core, [1, T, value_dim])
-    out = _mm(core, _c(w("out_proj.weight")), tb=True)   # [1,T,H]
-
-    return out
+    return _finish(core)
 
 
 def emit_gdn(hidden, amask, config, state, seq_len, ut_mode=None,
-             conv_emitter=None):
+             conv_emitter=None, core_emitter=None):
     """The GDN subgraph for the assembled backbone (E2 inc5b)."""
     return _gdn_subgraph(hidden, amask, config, state, int(seq_len), ut_mode,
-                         conv_emitter)
+                         conv_emitter, core_emitter)
 
 
 def build_gdn_model(config, state, seq_len, ut_mode=None):

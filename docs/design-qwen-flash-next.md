@@ -2225,3 +2225,80 @@ sequential recurrence above, not a near miss of it. So the choices are:
 
 Option 2 is not a way to skip the port; it is a way to boot something that
 cannot answer at depth. Recorded so the choice is made deliberately.
+
+#### The third construct: the token-sequential Loop — all thirteen ports (2026-09-13)
+
+`q4e.serving_shape.stateful_gdn_core` emits the delta rule as the `v5::Loop`
+the fusion chain requires, reaching the parity-gated emitter through a second
+hook — `emit_gdn(..., core_emitter=...)`, defaulting to the chunked core, which
+is skipped *entirely* rather than parameterised. With it, the pass produces
+**every port in the table**: `PagedAttentionExtension` ×attn,
+`PagedCausalConv1D` ×gdn, `PagedGatedDeltaNet` ×gdn, both state tables, both
+cache families and all nine index ports.
+
+Built to the matcher. Three things it pins, none of them guessable:
+
+* **the Loop's external input order**, positions 2…8 — `q_scaled`, `key`,
+  `value`, `gate`, `beta`, `init_state`, `output_buffer` — after trip count and
+  execution condition. Input order is the order the `set_*_input` calls are
+  made in, so the call order *is* the contract;
+* **≥ 9 inputs and exactly 2 outputs**, output 0 the attention output and
+  output 1 the final state, so `get_iter_value` is called in that order;
+* **the query must arrive already divided** by `head_size ** 0.5` with the head
+  size read from a `ShapeOf` — a folded constant does not match, which is why
+  the chunked path's `q * Dk**-0.5` is skipped and the serving core does its
+  own scaling.
+
+**The strict xfail retired.** It carried the gap from the day it was named
+until the table's last row read `present`, at which point `strict=True` turned
+the pass into a failure and the cell had to be looked at. It was not relaxed
+and did not move to `strict=False`: the decorator is gone and the assertion it
+always carried is live. The suite's xfail count drops by one.
+
+#### The keystone reshape, and CF-KEYSTONERSS riding it
+
+This is the increment that moved the residency keystone, and the deferred
+`wait4` fix lands with it as planned.
+
+48 layers at real geometry: **84,158 nodes → 16,766**, peak RSS **4.52 → 4.24
+GiB**. A `v5::Loop` is a compact encoding of what was an unrolled chunked delta
+rule per layer, and `get_ordered_ops` does not descend into a Loop body.
+
+*The node floor was retired, not lowered.* `nodes > 50_000` was a weak proxy
+for "48 real layers are present"; it is replaced by the op histogram asserted
+per layer kind, every count derived from the layer counts — `Loop` and
+`GroupConvolution` per GDN layer, `ScaledDotProductAttention` per attention
+layer, `ReadValue`/`Assign` over both. That says *which* layer kind is short,
+which a total never could.
+
+*The RSS bracket was re-derived, one module per run,* as this file's own
+instruction for a moved peak requires: authored 4.24, cheapest visible defect
+6.19 (`moe`), ceiling `round(sqrt(4.24 × 6.19), 2)` = **5.12** — tightened from
+5.31, not raised.
+
+*One witness nearly disappeared silently.* The first re-derivation measured
+`attention` at 4.24 — invisible, where the reviewer's probe that originally
+found CF-RESIDENT had measured 8.98. Cause: the new attention emitter reached
+for `qgdn._c` as the rest of the module does, so dropping `attention` from the
+swap list no longer copied anything. Both factories are swapped and the graph
+is identical either way, so *nothing would have gone red* — the CF-RESIDENT leg
+would simply have had one fewer module it could see. The call sites now use
+`qattn._c`, and the row is a measured 8.67 again.
+
+*The ordering invariant was right about the rule and wrong about the
+direction.* `0 < below < above < 1` encoded "rounding the geometric mean UP
+makes the upper margin larger" — true of 5.3149 → 5.31, generalised from that
+one instance. 5.123046 rounds **down**, so the larger margin is the one below,
+and a cell with nothing wrong went red. It now derives the expected ordering
+from the rounding direction. All four mutations plus the engineered one were
+re-run on the new bracket and are still red.
+
+**CF-KEYSTONERSS.** The child used to report its own
+`getrusage(RUSAGE_SELF)`, read at one instant mid-run — before the report was
+serialised, before teardown — and `subprocess.run` reaped the child, so the
+kernel's accounting was gone before the parent could look. The gated figure had
+exactly one witness and it was the thing being measured. The parent now waits
+with `os.wait4` and reads `ru_maxrss` for that child; both numbers are kept and
+the child's is asserted not to exceed the parent's. **The hole was demonstrated,
+not argued:** a child that allocates 2 GiB after its self-read reports 0.52 GiB
+where the kernel accounts 2.52 — 2.00 GiB invisible to the old method.
