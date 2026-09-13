@@ -56,6 +56,25 @@ capture's uint16 log-prob rows (transcribed from `perplexity.cpp`, pinned to
 the quantisation step by a cell) and reports mean per-token KL below and at
 or above row 2051. Report only.
 
+### Full depth: built, and refused by the host at compile (2026-09-13)
+
+The same tool at `--layers 48` (window-050 §4.10): 1,030 dense tensors
+(15.99 GiB f32), 144 u4 expert bodies (60.2 GiB), a 76.32 GiB `.bin`, 82
+minutes of fill at 32.8 GiB peak host; allowlisted as `qwen3.8-flash-next`.
+The served binary on the A770 loads it and spends six minutes in
+`compile_model` staging every constant in USM **host** memory (`fdinfo`
+`drm-resident-gtt` to 11.8 GiB, `vram0` flat at 7.6 MiB) until the physical
+host runs out — `page allocation failure` from `xe_gem_create_ioctl` at 37 GiB
+of shmem, then `[CL ext] Can not allocate 419430400 bytes for USM Host ...
+error: -6` on one expert body. Refusal predicted before the fill (092df69);
+the mechanism predicted was the card's allocator, the device named the host.
+The B60 leg was not run (host-side, card-independent; the engineer's call,
+recorded for the operator). The France question at full depth is not
+reached; the KLD gate's measurement is not reached; both instruments are
+ready. 69 GiB of constants against 46 GiB of host and 15–23 GiB of card
+leaves one route: compiling fewer than 48 layers' experts at once
+(HANDOFF's change request).
+
 ### The serving-shape IR carries the paged port contract (2026-09-13)
 
 Nothing declares a paged serving port by hand: the load path runs

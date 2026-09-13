@@ -11,8 +11,11 @@ TEST(registry_holds_exactly_the_target_models) {
     // Seven since 2026-09-13: the Flash-Next serving-shape IR at depth 4, the
     // served path's first Flash-Next artifact (hashes pinned off the dev-host
     // directory the same day).
+    // Eight with the full-depth (48-layer) serving-shape artifact, built the
+    // same day; the two Flash-Next entries differ in depth and hashes only.
     const auto ids = model_ids();
-    CHECK_EQ(ids.size(), 7u);
+    CHECK_EQ(ids.size(), 8u);
+    CHECK(find_model("qwen3.8-flash-next") != nullptr);
     CHECK(find_model("qwen3.6-27b-a3b-coder") != nullptr);
     CHECK(find_model("qwen3.6-35b-a3b") != nullptr);
     CHECK(find_model("qwen3.8-27b") != nullptr);
@@ -40,6 +43,18 @@ TEST(registry_flash_next_d4_is_the_serving_shape_at_depth_4) {
     CHECK(!e->has_mtp_head);
     CHECK_EQ(e->template_hash, std::string("12827f24b742ea4e"));
     CHECK_EQ(e->arch_hash, std::string("2910a860bf9dc6bb"));
+
+    const ModelEntry* full = find_model("qwen3.8-flash-next");
+    CHECK(full != nullptr);
+    if (full == nullptr) return;
+    CHECK(find_by_artifact("qwen38-flash-next-ov") == full);
+    CHECK(find_by_artifact("qwen38-flash-next-ov") != e);
+    CHECK_EQ(full->n_layer, 48);
+    CHECK_EQ(full->n_attn_layer, 12);
+    CHECK_EQ(full->n_gdn_layer, 36);
+    CHECK(full->arch_hash != e->arch_hash);
+    CHECK_EQ(full->template_hash, e->template_hash);
+    CHECK_EQ(full->tokenizer_hash, e->tokenizer_hash);
 }
 
 TEST(registry_rejects_everything_else) {

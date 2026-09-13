@@ -127,5 +127,24 @@
     "status": "measurement artifact: depth 4 of 48, served-path boot; not the model's answers",
     "mtp_num_hidden_layers": 1,
     "mtp_head_exported": false
+  },
+  "qwen38-flash-next-ov": {
+    "_note": "2026-09-13: the serving-shape IR at ALL 48 layers, real weights (tools/export_serving_artifact.py --layers 48, tree 092df69; serving-shape.json beside it). Hashes read off /models/ov/qwen38-flash-next-ov on the dev host. Built to be pointed at by the served binary; window-050 §4.10 predicts and records the residency refusal (measured on the A770: the plugin stages every constant in USM host memory at compile and the host runs out first).",
+    "arch": [
+      "Qwen4ExpForConditionalGeneration"
+    ],
+    "model_type": "qwen4_exp",
+    "hidden": 2560,
+    "layers": 48,
+    "experts": 512,
+    "ctx": 262144,
+    "full_attention_interval": 4,
+    "template_sha": "12827f24b742ea4e",
+    "tokenizer_sha": "87a7830d63fcf43b",
+    "lm_xml_sha": "3f574b776a8dd2c6",
+    "lm_bin_bytes": 81948724009,
+    "status": "full depth, 48 of 48: built; the served-path compile on the A770 was refused by HOST memory (USM host staging of 69 GiB of constants, window-050 §4.10); not servable on this host",
+    "mtp_num_hidden_layers": 1,
+    "mtp_head_exported": false
   }
 }

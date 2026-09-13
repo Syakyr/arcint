@@ -93,9 +93,14 @@ answer, 44 layers missing (one A770 leg hung its first forward in a fence
 wait while another session held the host; re-run quiet, it boots and
 answers identically). KLD gate served half: /v1/completions takes token-id prompts,
 ARCINT_LOGITS_DUMP records every paged forward, tools/kld_served.py replays
-the pinned llama.cpp capture and reports KL below/above row 2051. Full
-depth: 60.2 GiB of u4 expert bodies do not fit either card or, beside the
-26.8 GiB table, the 48 GiB host -- §4.10's prediction, before the fill.
+the pinned llama.cpp capture and reports KL below/above row 2051 (red at
+depth 4: 11.6 nats). Full depth (§4.10): the 48-layer artifact exists (76.3
+GiB .bin, 82 min fill, allowlist qwen3.8-flash-next); the served compile on
+the A770 stages every constant in USM HOST memory and the host runs out
+(page allocation failure at 37 GiB shmem, CL_OUT_OF_HOST_MEMORY on one
+expert body) -- refused as predicted, by the host rather than the card;
+France and KLD at full depth not reached; the route left is compiling
+fewer than 48 layers' experts at once (segmented forward, HANDOFF CR).
 
 Two M2 walls came down. Slicing logits to the last token before the LM head
 removed an out-of-memory wall at ~8k tokens (the graph computed logits for

@@ -273,6 +273,43 @@ std::vector<ModelEntry> build_registry() {
         r.push_back(std::move(e));
     }
 
+    {
+        // FULL-DEPTH (2026-09-13): the same serving-shape IR at ALL 48 layers
+        // (tools/export_serving_artifact.py --layers 48, tree 092df69): 1,030
+        // dense f32 tensors, 144 u4 expert bodies, ~78 GiB .bin. Allowlisted
+        // so the served binary can be pointed at it; window-050 §4.10 predicted
+        // that neither card holds its 69 GiB of constants and measured, on the
+        // A770, that the plugin stages every constant in USM HOST memory at
+        // compile and the host runs out first (CL_OUT_OF_HOST_MEMORY at one
+        // expert body). Hashes read off the dev-host directory.
+        ModelEntry e;
+        e.id                      = "qwen3.8-flash-next";
+        e.family                  = "qwen3.8";
+        e.artifact_aliases        = {"qwen38-flash-next-ov"};
+        e.ov_arch                 = "Qwen4ExpForConditionalGeneration";
+        e.model_type              = "qwen4_exp";
+        e.moe                     = true;
+        e.has_mtp_head            = false;
+        e.mtp_head_pinned         = true;   // inspected 2026-09-13 (the export writes none)
+        e.mtp_in_checkpoint       = true;
+        e.n_embd                  = 2560;
+        e.n_expert                = 512;
+        e.full_attention_interval = 4;
+        e.n_layer                 = 48;
+        e.n_ctx_train             = 262144;
+        e.quants                  = {Quant::Q4};
+        e.arch_hash               = "3f574b776a8dd2c6";
+        e.template_hash           = "12827f24b742ea4e";
+        e.tokenizer_hash          = "87a7830d63fcf43b";
+        e.weights_bytes           = 81948724009ull;
+        e.status                  = "full depth, 48 of 48: built; the served-path compile on the A770 was "
+                                    "refused by HOST memory (USM host staging of 69 GiB of constants, "
+                                    "window-050 §4.10); not servable on this host";
+        e.sampler = qwen_card_defaults();
+        split_layers(e);
+        r.push_back(std::move(e));
+    }
+
     return r;
 }
 
