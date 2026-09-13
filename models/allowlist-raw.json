@@ -146,5 +146,24 @@
     "status": "full depth, 48 of 48: built; the served-path compile on the A770 was refused by HOST memory (USM host staging of 69 GiB of constants, window-050 §4.10); not servable on this host",
     "mtp_num_hidden_layers": 1,
     "mtp_head_exported": false
+  },
+  "qwen38-flash-next-d12-ov": {
+    "_note": "2026-09-13: the serving-shape IR of Qwen3.8 Flash-Next (qwen4exp) at DEPTH 12 of 48 -- the depth ladder's first rung (docs/window-051.md row (b)), real weights from the UD-Q3_K_XL shards (tools/export_serving_artifact.py --layers 12, tree d93508c, serving-shape.json beside it). Hashes read off /models/ov/qwen38-flash-next-d12-ov on the dev host (build 1,450.9 s, peak host 30.39 GiB). A measurement artifact: 36 layers are missing, its answers are not the model's.",
+    "arch": [
+      "Qwen4ExpForConditionalGeneration"
+    ],
+    "model_type": "qwen4_exp",
+    "hidden": 2560,
+    "layers": 12,
+    "experts": 512,
+    "ctx": 262144,
+    "full_attention_interval": 4,
+    "template_sha": "12827f24b742ea4e",
+    "tokenizer_sha": "87a7830d63fcf43b",
+    "lm_xml_sha": "7738fa87cddca8e2",
+    "lm_bin_bytes": 22613492905,
+    "status": "measurement artifact: depth 12 of 48, the depth ladder's first rung; not the model's answers",
+    "mtp_num_hidden_layers": 1,
+    "mtp_head_exported": false
   }
 }
