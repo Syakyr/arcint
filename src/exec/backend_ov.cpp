@@ -73,6 +73,7 @@
 #include "exec/fit.h"
 #include "exec/gguf_graph.h"
 #include "exec/graph_rewrites.h"
+#include "exec/ngram_ports.h"
 #include "exec/ngram_table.h"
 #include "core/gguf_dequant.h"
 #include "exec/kquant_op.h"
@@ -792,6 +793,13 @@ public:
         int              index = 0;
         ov::InferRequest req;        // the paged language model; unused on --no-paged
         ov::InferRequest embed;      // the embeddings gather
+        // FEED-THE-PORTS: the ids `embed_paged` last embedded for this lane
+        // (`paged_forward` receives the embeddings, not the ids, and the
+        // n-gram row hash needs the ids), and the hash CONTEXT -- the
+        // ngram_size-1 tokens before the next chunk, eos for a fresh
+        // sequence -- carried across chunks by paged_forward itself.
+        std::vector<int>     last_ids;
+        std::vector<int64_t> ngram_ctx;
         // The MTP head carries its own attention KV over the prefix, so it
         // needs its own request per lane as well: a shared head would let one
         // sequence draft from the other's prefix, which is cross-slot bleed in
@@ -3355,6 +3363,9 @@ private:
             pa_host_inputs_ = true;
             log::info("load", "paged index inputs in USM host memory (ARCINT_PA_HOST_INPUTS)");
         }
+        // FEED-THE-PORTS: an IR that carries the n-gram table as ports gets it
+        // bound here, once, from the open GGUF; every other IR is untouched.
+        bind_ngram_ports(rctx, device);
 
         // ---- reservation: measure the activation peak with a probe pool ------
         //
@@ -6015,6 +6026,7 @@ private:
     // layout, and the head's food -- it crosses host memory either way).
     ov::Tensor embed_paged(Lane& lane, const std::vector<int>& ids) {
         const size_t n = ids.size();
+        lane.last_ids = ids;             // the n-gram feed reads them in paged_forward
         if (gguf_embed_.t != nullptr) {
             // The file's own rows, on the host: no device call, no turn taken.
             ov::Tensor out(ov::element::f32, ov::Shape{n, gguf_embed_.width});
@@ -6149,6 +6161,7 @@ private:
         set_i32("la.block_indices_begins", {0, static_cast<int32_t>(la_rows.size())});
         set_i32("la.past_lens", {static_cast<int32_t>(past)});
         set_i32("la.cache_interval", {interval});
+        feed_ngram_ports(lane, past, n);
         // ARCINT_FORWARD_SPLIT=1: wall clock of the three parts of a paged
         // forward, averaged over 64 forwards and logged, so a served step's
         // cost can be attributed to the graph, the logits readback or the
@@ -7825,6 +7838,141 @@ private:
     // its per-PLE-layer hash constants (--flash-next-ngram). Empty on the cold
     // path. Held for the decode-time PLE injection the checkpoint fork wires in.
     std::optional<ngram::NGramLookup> ngram_lookup_;
+
+    // FEED-THE-PORTS: the serving-shape IR's table PORTS (exec/ngram_ports.h).
+    // Empty on every artifact that does not declare them (the served
+    // hybrids); on one that does, the chunks are USM-host tensors holding the
+    // GGUF's own IQ4_NL rows, shared by every lane's request, and the hash
+    // constants are derived once for the IR's PLE layer.
+    ngram::PortPlan                 ngram_ports_;
+    std::vector<ov::RemoteTensor>   ngram_table_tensors_;
+    std::optional<ngram::HashParams> ngram_hash_;
+
+    // Bind the table to the ports, once, after the lanes exist. The source
+    // is the GGUF the weights came from (`--gguf`), tensor
+    // per_layer_token_embd.weight, validated against the ports
+    // (ngram::check_table_source) and copied chunk by chunk into USM-host
+    // memory -- the plugin shares such a tensor with the graph without a
+    // device copy (measured, window-050 §4.7). Refuses by name when the IR
+    // declares the ports and the source is missing, or the device has no USM
+    // host memory to bind them in.
+    void bind_ngram_ports(ov::RemoteContext& rctx, const std::string& device) {
+        std::vector<ngram::PortDims> inputs;
+        for (const auto& in : paged_model_.inputs()) {
+            std::vector<int64_t> dims;
+            const auto& ps = in.get_partial_shape();
+            if (ps.rank().is_static()) {
+                for (int64_t i = 0; i < ps.rank().get_length(); ++i)
+                    dims.push_back(ps[i].is_static() ? ps[i].get_length() : -1);
+            }
+            inputs.emplace_back(in.get_any_name(), std::move(dims));
+        }
+        ngram_ports_ = ngram::plan_ngram_ports(inputs);
+        if (ngram_ports_.empty()) return;
+
+        if (!gguf_file_) {
+            throw std::runtime_error(log::format(
+                "the IR declares %zu ngram_table.K port(s) but no GGUF is open to bind them from "
+                "(--gguf); the table is the file's own %s",
+                ngram_ports_.chunks.size(), ngram::kTableTensor));
+        }
+        const gguf::TensorInfo* t = gguf_file_->tensor(ngram::kTableTensor);
+        if (t == nullptr) {
+            throw std::runtime_error(log::format("%s: no %s tensor to bind the ngram_table ports from",
+                                                 gguf_path_.c_str(), ngram::kTableTensor));
+        }
+        const std::string why = ngram::check_table_source(*t, gguf_file_->bytes(*t), ngram_ports_);
+        if (!why.empty()) throw std::runtime_error("ngram table source refused: " + why);
+        if (device.rfind("GPU", 0) != 0) {
+            throw std::runtime_error(log::format(
+                "the ngram_table ports need USM host memory to bind %zu rows x %zu B without a "
+                "device copy; %s has none",
+                ngram_ports_.total_rows, ngram_ports_.row_bytes, device.c_str()));
+        }
+        const auto& nc = artifact_.ngram_config;
+        if (nc.ngram_size < 2 || nc.heads_per_ngram < 1 || nc.ngram_vocab_size_base <= 0 ||
+            nc.vocab_size <= 0 || nc.ngram_boundary_token_id < 0 || nc.ple_layer_ids.empty()) {
+            throw std::runtime_error(
+                "the IR declares the ngram id ports but the artifact's config carries no complete "
+                "n-gram declaration (ngram_size, heads_per_ngram, ngram_vocab_size_base, "
+                "vocab_size, ple_layer_ids, eos) to derive the row hash from");
+        }
+        // The IR carries ONE PLE layer; its hash constants are the ordinal-0
+        // derivation, as the reference derives them for the first entry of
+        // ple_layer_ids (modeling_qwen4_exp.py: ple_layer_ids.index(layer_idx+1)).
+        ngram::HashParams hp = ngram::derive_hash_constants(
+            nc.vocab_size, nc.ngram_size, nc.heads_per_ngram, nc.ngram_vocab_size_base,
+            /*ple_layer_index=*/0);
+        hp.eos_token_id = nc.ngram_boundary_token_id;
+        hp.validate();
+        ngram_hash_ = std::move(hp);
+
+        const auto     t0   = std::chrono::steady_clock::now();
+        const uint8_t* base = gguf_file_->data(*t);
+        size_t         off  = 0;
+        for (const auto& chunk : ngram_ports_.chunks) {
+            const ov::Shape sh{chunk.rows, ngram_ports_.row_bytes};
+            ov::RemoteTensor rt = rctx.create_tensor(
+                ov::element::u8, sh,
+                {{ov::intel_gpu::shared_mem_type.name(), ov::intel_gpu::SharedMemType::USM_HOST_BUFFER}});
+            void* dst = rt.get_params().at(ov::intel_gpu::mem_handle.name()).as<void*>();
+            std::memcpy(dst, base + off, chunk.rows * ngram_ports_.row_bytes);
+            off += chunk.rows * ngram_ports_.row_bytes;
+            for (auto& lane : lanes_) lane->req.set_tensor(chunk.name, rt);
+            ngram_table_tensors_.push_back(std::move(rt));
+        }
+        log::info("load",
+                  "ngram table bound: %zu port(s), %zu rows x %zu B = %.2f GiB of USM host memory "
+                  "from %s in %.1f s; id ports %s, conv_mask %s; hash ordinal 0",
+                  ngram_ports_.chunks.size(), ngram_ports_.total_rows, ngram_ports_.row_bytes,
+                  static_cast<double>(off) / (1u << 30), ngram::kTableTensor, seconds_since(t0),
+                  ngram_ports_.declares_ids ? "declared" : "absent",
+                  ngram_ports_.declares_conv_mask ? "declared" : "absent");
+    }
+
+    // The per-forward feeds the ports need: the hashed rows of this chunk's
+    // tokens, split at the partition, and the padding mask (ones). The ids
+    // are the ones `embed_paged` last embedded for this lane; the hash
+    // context is eos for a forward at position 0 and the last ngram_size-1
+    // tokens fed otherwise. Cheap: T x 16 ids, no table access here.
+    void feed_ngram_ports(Lane& lane, size_t past, size_t n) {
+        if (ngram_ports_.empty()) return;
+        if (lane.last_ids.size() != n) {
+            throw std::runtime_error(log::format(
+                "ngram feed: lane %d embedded %zu id(s) but this forward has %zu token(s)",
+                lane.index, lane.last_ids.size(), n));
+        }
+        const int ctx_len = ngram_hash_->ngram_size - 1;
+        if (past == 0) {
+            lane.ngram_ctx.assign(static_cast<size_t>(ctx_len), ngram_hash_->eos_token_id);
+        } else if (static_cast<int>(lane.ngram_ctx.size()) != ctx_len) {
+            throw std::runtime_error(log::format(
+                "ngram feed: lane %d at position %zu with no hash context", lane.index, past));
+        }
+        std::vector<int64_t> tokens(lane.last_ids.begin(), lane.last_ids.end());
+        const std::vector<int64_t> global = ngram::row_ids(*ngram_hash_, lane.ngram_ctx, tokens);
+        std::vector<int32_t> chunk;
+        std::vector<int64_t> local;
+        ngram::split_by_partition(global, ngram_ports_, chunk, local);
+        const size_t heads = static_cast<size_t>(ngram_hash_->num_ngram_heads());
+        if (ngram_ports_.declares_ids) {
+            ov::Tensor ct(ov::element::i32, ov::Shape{1, n, heads});
+            ov::Tensor lt(ov::element::i64, ov::Shape{1, n, heads});
+            std::memcpy(ct.data(), chunk.data(), chunk.size() * sizeof(int32_t));
+            std::memcpy(lt.data(), local.data(), local.size() * sizeof(int64_t));
+            lane.req.set_tensor(ngram::kChunkIdsPort, ct);
+            lane.req.set_tensor(ngram::kLocalIdsPort, lt);
+        }
+        if (ngram_ports_.declares_conv_mask) {
+            ov::Tensor m(ov::element::f32, ov::Shape{1, n});
+            std::fill_n(m.data<float>(), n, 1.0f);
+            lane.req.set_tensor(ngram::kConvMaskPort, m);
+        }
+        // carry the context: the last ctx_len of (context ++ tokens)
+        std::vector<int64_t> packed(lane.ngram_ctx);
+        packed.insert(packed.end(), tokens.begin(), tokens.end());
+        lane.ngram_ctx.assign(packed.end() - ctx_len, packed.end());
+    }
 };
 
 }  // namespace

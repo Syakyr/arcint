@@ -84,6 +84,26 @@ def gen_row_ids(config, ple_idx, tokens):
     return np.array(rows, dtype=np.int64)[None]  # [1, T, Hn]
 
 
+def ple_ordinal(config, layer_idx):
+    """WHICH hash constants a PLE layer uses: the reference derives them from
+    the layer's ORDINAL among the PLE layers -- modeling_qwen4_exp.py:1268,
+    `config.ple_layer_ids.index(layer_idx + 1)` (the ids are 1-based) -- and
+    the served loader does the same (`derive_hash_constants(..., k)` for the
+    k-th entry of ple_layer_ids). NOT the decoder layer index: the real
+    model's PLE sits at decoder layer 1, is the first (only) PLE layer, and
+    hashes with ordinal 0. The parity cells use 1 on both of their sides,
+    which is consistent there and wrong here -- the boot driver fed 1 in its
+    first real-weight run and that run is retracted on that point
+    (window-050 §4.8)."""
+    ids = getattr(config, "ple_layer_ids", None)
+    if ids:
+        ids = list(ids)
+        if layer_idx + 1 in ids:
+            return ids.index(layer_idx + 1)
+        raise ValueError(f"decoder layer {layer_idx} is not a PLE layer: ple_layer_ids={ids}")
+    return 0
+
+
 def split_by_partition(global_ids, rows_per_chunk):
     """The HOST'S half of the chunked table contract: global row ids ->
     (chunk ids i32, local ids i64) at the port partition read off the first
@@ -95,4 +115,4 @@ def split_by_partition(global_ids, rows_per_chunk):
             np.ascontiguousarray((g % per).astype(np.int64)))
 
 
-__all__ = ["derive", "row_ids", "gen_row_ids", "split_by_partition"]
+__all__ = ["derive", "row_ids", "gen_row_ids", "ple_ordinal", "split_by_partition"]

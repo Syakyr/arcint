@@ -415,8 +415,10 @@ def main(argv=None):
     cfg = pwe.real_config()
     table_rows0 = (dims(declared[table_ports[0]])[0] if table_ports else 1)
 
+    ple_ord = nid.ple_ordinal(cfg, 1)                          # decoder layer 1 -> ordinal 0
+
     def id_feeds(tokens):
-        g = nid.gen_row_ids(cfg, 1, tokens)                    # [1,T,Hn] i64
+        g = nid.gen_row_ids(cfg, ple_ord, tokens)              # [1,T,Hn] i64
         c, l = nid.split_by_partition(g, table_rows0)
         return {"ngram_chunk_ids": ov.Tensor(c), "ngram_local_ids": ov.Tensor(l),
                 "conv_mask": ov.Tensor(np.ones((1, len(tokens)), np.float32))}, g
@@ -476,7 +478,8 @@ def main(argv=None):
         else:
             say("forward", "SERVED PATH: every name the C++ feeds was accepted")
         extras, g = id_feeds(ids)
-        say("driver-feed", f"row ids for the prompt (q4e.ngram_ids, PLE layer 1): "
+        say("driver-feed", f"row ids for the prompt (q4e.ngram_ids, PLE at decoder "
+                           f"layer 1 = ordinal {ple_ord}): "
                            f"min {int(g.min()):,} max {int(g.max()):,}; split at "
                            f"{table_rows0:,} rows/chunk; plus conv_mask=ones. "
                            f"THE DRIVER'S FEEDS, not the runtime's")

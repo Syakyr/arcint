@@ -228,6 +228,7 @@ if(ARCINT_TESTS)
     tests/test_ngram_gather.cpp
     tests/test_ngram_row_ids.cpp
     tests/test_ngram_lookup.cpp
+    tests/test_ngram_ports.cpp
     tests/test_decode_stats.cpp
     tests/test_profile_cycle.cpp
     tests/test_rope_precision.cpp
