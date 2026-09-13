@@ -13,8 +13,11 @@ TEST(registry_holds_exactly_the_target_models) {
     // directory the same day).
     // Eight with the full-depth (48-layer) serving-shape artifact, built the
     // same day; the two Flash-Next entries differ in depth and hashes only.
+    // Nine with the 12-layer rung (0.5.1 WP3, the depth ladder's first
+    // measured step between 4 and 48).
     const auto ids = model_ids();
-    CHECK_EQ(ids.size(), 8u);
+    CHECK_EQ(ids.size(), 9u);
+    CHECK(find_model("qwen3.8-flash-next-d12") != nullptr);
     CHECK(find_model("qwen3.8-flash-next") != nullptr);
     CHECK(find_model("qwen3.6-27b-a3b-coder") != nullptr);
     CHECK(find_model("qwen3.6-35b-a3b") != nullptr);
@@ -55,6 +58,21 @@ TEST(registry_flash_next_d4_is_the_serving_shape_at_depth_4) {
     CHECK(full->arch_hash != e->arch_hash);
     CHECK_EQ(full->template_hash, e->template_hash);
     CHECK_EQ(full->tokenizer_hash, e->tokenizer_hash);
+
+    // THE 12-LAYER RUNG (0.5.1 WP3): 3 attention + 9 GDN, its own XML hash,
+    // the same template and tokenizer as the other two rungs.
+    const ModelEntry* d12 = find_model("qwen3.8-flash-next-d12");
+    CHECK(d12 != nullptr);
+    if (d12 == nullptr) return;
+    CHECK(find_by_artifact("qwen38-flash-next-d12-ov") == d12);
+    CHECK_EQ(d12->n_layer, 12);
+    CHECK_EQ(d12->n_attn_layer, 3);
+    CHECK_EQ(d12->n_gdn_layer, 9);
+    CHECK_EQ(d12->model_type, std::string("qwen4_exp"));
+    CHECK(d12->arch_hash != e->arch_hash && d12->arch_hash != full->arch_hash);
+    CHECK_EQ(d12->arch_hash, std::string("7738fa87cddca8e2"));
+    CHECK_EQ(d12->template_hash, e->template_hash);
+    CHECK_EQ(d12->tokenizer_hash, e->tokenizer_hash);
 }
 
 TEST(registry_rejects_everything_else) {

@@ -274,6 +274,41 @@ std::vector<ModelEntry> build_registry() {
     }
 
     {
+        // THE 12-LAYER RUNG (0.5.1 WP3, 2026-09-13): the serving-shape IR at
+        // depth 12 of 48 -- three attention layers, nine GDN -- the first rung
+        // of the depth ladder docs/window-051.md row (b) prices before the
+        // segmented forward lands. Single model, expert bodies as constants
+        // (the staging edge is what its compile measures). Hashes read off
+        // the dev-host directory. A measurement artifact: 36 layers are
+        // missing and nothing it says is the model's answer.
+        ModelEntry e;
+        e.id                      = "qwen3.8-flash-next-d12";
+        e.family                  = "qwen3.8";
+        e.artifact_aliases        = {"qwen38-flash-next-d12-ov"};
+        e.ov_arch                 = "Qwen4ExpForConditionalGeneration";
+        e.model_type              = "qwen4_exp";
+        e.moe                     = true;
+        e.has_mtp_head            = false;
+        e.mtp_head_pinned         = true;   // the export writes none
+        e.mtp_in_checkpoint       = true;
+        e.n_embd                  = 2560;
+        e.n_expert                = 512;
+        e.full_attention_interval = 4;
+        e.n_layer                 = 12;     // of 48: layers 3, 7, 11 are attention
+        e.n_ctx_train             = 262144;
+        e.quants                  = {Quant::Q4};
+        e.arch_hash               = "7738fa87cddca8e2";
+        e.template_hash           = "12827f24b742ea4e";  // the GGUF's own chat template
+        e.tokenizer_hash          = "87a7830d63fcf43b";  // passthrough; vocab == the GGUF's
+        e.weights_bytes           = 22613492905ull;
+        e.status                  = "measurement artifact: depth 12 of 48, the depth ladder's "
+                                    "first rung; not the model's answers";
+        e.sampler = qwen_card_defaults();
+        split_layers(e);
+        r.push_back(std::move(e));
+    }
+
+    {
         // FULL-DEPTH (2026-09-13): the same serving-shape IR at ALL 48 layers
         // (tools/export_serving_artifact.py --layers 48, tree 092df69): 1,030
         // dense f32 tensors, 144 u4 expert bodies, ~78 GiB .bin. Allowlisted
