@@ -197,6 +197,43 @@ def ngram_row_bytes(head_dim):
 # runs before the allocation type is looked at). A build for a card with a
 # wider cap passes its own; nothing here reads the device.
 NGRAM_CHUNK_CAP_BYTES = 4_294_959_104
+
+
+def tiny_config(n_layers, ngram_vocab_size_base=200):
+    """The suite's REDUCED GEOMETRY at a chosen depth (a multiple of 4, so
+    every 4-aligned segment holds one full-attention layer): hidden 256,
+    vocab 512, 8 experts of 128, one IQ4_NL block per PLE table row. The
+    n-gram table is sized from the hash constants the same rule derives for
+    the real model (`ngram_ids.derive`), so `ngram_ids.gen_row_ids` on this
+    config addresses rows the table has -- a forward on the CPU plugin is
+    then a device-free cell (tests/python, the boot driver's `--tiny`).
+    Never the served path; the real geometry is `piecewise_export.real_config`.
+    """
+    from . import ngram_ids as nid
+    cfg = pwe.real_config()
+    small = type(cfg)(
+        hidden_size=256, num_hidden_layers=n_layers,
+        num_attention_heads=4, num_key_value_heads=2, head_dim=64,
+        num_experts=8, num_experts_per_tok=2, moe_intermediate_size=128,
+        shared_expert_intermediate_size=128,
+        hc_count=cfg.hc_count, hc_lowrank=32,
+        ple_embed_dim=512, ple_conv_kernel_size=cfg.ple_conv_kernel_size,
+        ngram_size=cfg.ngram_size, heads_per_ngram=cfg.heads_per_ngram,
+        ngram_vocab_size_base=ngram_vocab_size_base,
+        vocab_size=512, rms_norm_eps=cfg.rms_norm_eps,
+        linear_key_head_dim=32, linear_num_key_heads=2,
+        linear_value_head_dim=32, linear_num_value_heads=4,
+        linear_conv_kernel_dim=cfg.linear_conv_kernel_dim,
+        hidden_act="silu",
+        layer_types=["qwen_sparse_attention" if i % 4 == 3 else "linear_attention"
+                     for i in range(n_layers)],
+        ple_layer_ids=[2],                       # decoder layer 1, as the real model
+        eos_token_id=511,
+    )
+    _mult, sizes, _offs = nid.derive(small.vocab_size, small.ngram_size,
+                                     small.heads_per_ngram, ngram_vocab_size_base, 0)
+    small.ngram_total_vocab = int(sum(sizes))    # every derived row id has a row
+    return small
 # Chunk row counts are rounded down to a multiple of this so a chunk boundary
 # never falls inside a page of the host mapping that serves it.
 NGRAM_CHUNK_ROW_ALIGN = 4096

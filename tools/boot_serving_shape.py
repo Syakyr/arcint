@@ -163,10 +163,21 @@ def main(argv=None):
                          "the pinned plugin's own switch for the asynchronous "
                          "static-shape kernel swap); a key the plugin refuses "
                          "fails the compile by name")
+    ap.add_argument("--tiny", action="store_true",
+                    help="TEST GEOMETRY: the suite's reduced config "
+                         "(q4e.serving_shape.tiny_config: hidden 256, vocab "
+                         "512, 8 experts, a table the hash rule can address) "
+                         "at --layers, so a device-free cell can run every "
+                         "stage on the CPU plugin. Never the served path; its "
+                         "output says so")
     args = ap.parse_args(argv)
 
     import openvino as ov
     from q4e import serving_shape as ss
+    from q4e import piecewise_export as pwe
+    cfg = ss.tiny_config(args.layers) if args.tiny else pwe.real_config()
+    if args.tiny:
+        say("env", "TINY GEOMETRY (q4e.serving_shape.tiny_config): NOT the served path")
 
     ids = parse_ids(args.ids)
     if args.zeros:
@@ -235,7 +246,8 @@ def main(argv=None):
                      f"the served binary's bytes, not a build")
     else:
         try:
-            model, rep = ss.build_serving_shape_ir(arena=arena, n_layers=args.layers,
+            model, rep = ss.build_serving_shape_ir(config=cfg if args.tiny else None,
+                                                   arena=arena, n_layers=args.layers,
                                                    filler=filler, feed=feed_)
         except Exception as exc:                                  # noqa: BLE001
             say("build", "FAIL " + one_line(exc))
@@ -455,15 +467,20 @@ def main(argv=None):
                 say("request", f"{name}: no prototype on the stateful graph")
                 continue
             sh[0] = ROWS_PER_LANE
-            t = (ctx.create_tensor(ov.Type.f16, ov.Shape(sh), {}) if ctx
-                 else ov.Tensor(ov.Type.f16, ov.Shape(sh)))
+            # the PORT's own element type (f16 under the plugin's default,
+            # f32 under an f32 INFERENCE_PRECISION_HINT), never a hard-coded
+            # f16: the runtime binds f16 rows because its ports are f16
+            et_state = port.get_element_type()
+            t = (ctx.create_tensor(et_state, ov.Shape(sh), {}) if ctx
+                 else ov.Tensor(et_state, ov.Shape(sh)))
             feed(name, t)
             la_i += 1
-        say("request", f"state rows bound: {la_i} (f16, rows={ROWS_PER_LANE}); "
+        say("request", f"state rows bound: {la_i} ({et_state.get_type_name() if la_i else '-'}, "
+                       f"rows={ROWS_PER_LANE}); "
                        f"KV pools: {kv_i} (blocks={nblk})")
 
     # ---- forward ----------------------------------------------------------------
-    H = 2560
+    H = int(cfg.hidden_size)                                    # 2560 real
     rep_vocab = lambda: rep["outputs"][0][1][-1]                            # noqa: E731
     i64 = lambda a, sh: ov.Tensor(np.array(a, dtype=np.int64).reshape(sh))   # noqa: E731
     i32 = lambda a: ov.Tensor(np.array(a, dtype=np.int32).reshape(-1))       # noqa: E731
@@ -509,8 +526,6 @@ def main(argv=None):
     # the prompt; the runtime has no site for either yet (that is the C++
     # half of the increment), so these are labelled as the driver's.
     from q4e import ngram_ids as nid
-    from q4e import piecewise_export as pwe
-    cfg = pwe.real_config()
     table_rows0 = (dims(declared[table_ports[0]])[0] if table_ports else 1)
 
     ple_ord = nid.ple_ordinal(cfg, 1)                          # decoder layer 1 -> ordinal 0
@@ -670,10 +685,10 @@ def main(argv=None):
         for name, portp in declared.items():
             if name.startswith("conv_state_table."):
                 sh = list(conv_proto[0]); sh[0] = ROWS_PER_LANE
-                et2 = ov.Type.f16
+                et2 = portp.get_element_type()          # the port's, not f16 by hand
             elif name.startswith("gated_delta_state_table."):
                 sh = list(gdn_proto[0]); sh[0] = ROWS_PER_LANE
-                et2 = ov.Type.f16
+                et2 = portp.get_element_type()
             elif name.startswith(("key_cache.", "value_cache.")):
                 sh = list(served_feeds[name].get_shape())
                 et2 = portp.get_element_type()
@@ -785,8 +800,9 @@ def main(argv=None):
                 continue
             else:
                 continue
-            req2.set_tensor(name, ctx.create_tensor(ov.Type.f16, ov.Shape(sh), {})
-                            if ctx else ov.Tensor(ov.Type.f16, ov.Shape(sh)))
+            et_l = portp.get_element_type()             # the port's, as above
+            req2.set_tensor(name, ctx.create_tensor(et_l, ov.Shape(sh), {})
+                            if ctx else ov.Tensor(et_l, ov.Shape(sh)))
         req2.set_tensor("inputs_embeds", ov.Tensor(embeds_for(toks)))
         req2.set_tensor("position_ids", i64(list(range(L)), (L,)))
         for name, t in [("past_lens", i32([0])), ("subsequence_begins", i32([0, L])),

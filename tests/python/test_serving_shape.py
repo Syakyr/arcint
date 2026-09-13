@@ -2150,27 +2150,10 @@ def test_the_constant_factory_scanner_detects_a_missing_module():
 # ---------------------------------------------------------------------------
 
 def _tiny_config(n_layers):
-    """The round-trip test's reduced geometry, at a chosen depth (a multiple
-    of 4 so every 4-aligned segment holds one full-attention layer)."""
-    cfg = pwe.real_config()
-    small = type(cfg)(
-        hidden_size=256, num_hidden_layers=n_layers,
-        num_attention_heads=4, num_key_value_heads=2, head_dim=64,
-        num_experts=8, num_experts_per_tok=2, moe_intermediate_size=128,
-        shared_expert_intermediate_size=128,
-        hc_count=cfg.hc_count, hc_lowrank=32,
-        ple_embed_dim=512, ple_conv_kernel_size=cfg.ple_conv_kernel_size,
-        ngram_size=cfg.ngram_size, heads_per_ngram=cfg.heads_per_ngram,
-        vocab_size=512, rms_norm_eps=cfg.rms_norm_eps,
-        linear_key_head_dim=32, linear_num_key_heads=2,
-        linear_value_head_dim=32, linear_num_value_heads=4,
-        linear_conv_kernel_dim=cfg.linear_conv_kernel_dim,
-        hidden_act="silu",
-        layer_types=["qwen_sparse_attention" if i % 4 == 3 else "linear_attention"
-                     for i in range(n_layers)],
-    )
-    small.ngram_total_vocab = 4096
-    return small
+    """The reduced geometry, one source since the boot driver's `--tiny`:
+    `ss.tiny_config` (it also carries ple_layer_ids, an eos id and a table
+    the hash rule can address, so a CPU forward over it is a cell)."""
+    return ss.tiny_config(n_layers)
 
 
 def _port_names(model):
