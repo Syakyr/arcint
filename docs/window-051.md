@@ -20,6 +20,9 @@ token for "The capital of France is" exists at full depth, on this host, with
 its residency bounded by REAL host headroom. Paris ships inside it because the
 answer IS the depth proof (operator CR #2, 2026-09-13).
 
+> [AMENDED 2026-09-13, REVIEW MEDIUM-1: the refill source is the artifact's `expert_bodies.u8` blob, NOT the GGUF - the bodies are the filler's re-quantisation (contradiction recorded at d93508c). The GGUF-mmap wording stands as the pre-contradiction plan of record, marked not erased.]
+
+
 Route (a) of the HANDOFF's change request, priced there; route (b), the
 12-layer rung, is its first number and prices the depth ladder before the
 segmentation lands.
@@ -73,6 +76,9 @@ segmentation lands.
 - **Nothing is pinned by a cgroup**: the staging budget is REAL host
   headroom (`free`'s available minus the table minus the buffer set minus
   the process), measured before every compile, refused with the numbers.
+
+> [AMENDED 2026-09-13, REVIEW MEDIUM-1: the refill source is the artifact's `expert_bodies.u8` blob, NOT the GGUF - the bodies are the filler's re-quantisation (contradiction recorded at d93508c). The GGUF-mmap wording stands as the pre-contradiction plan of record, marked not erased.]
+
 
 ## 3. Acceptance rows — EMPTY at this commit
 
@@ -175,6 +181,9 @@ and it names the card when it is filled. (4) The kernel-level localisation
 is an open row: `--cut` at the emitter's next finer names inside layer 0,
 B60, cold and warm.
 
+> [AMENDED 2026-09-13, REVIEW HIGH-1: "settled" here and in the A770 floor row means the OBSERVED floor pair of THIS run, never a cache-state claim from any earlier run - see window-050 §4.11.1 review amendment.]
+
+
 ### (c) Cold-boot determinism
 
 Two cold boots of the segmented 48-layer service (process restarted, page
@@ -210,7 +219,7 @@ plus the clamp's tail. **F_ref** is that error measured at 248,320-wide on
 real rows: served f32 rows round-tripped through the writer's transcription
 (`tests/python/test_kld_served.py::llama_row`) and compared with
 `kl_ref_vs_served` (the 257-wide cell measured 2.9e-6 nats). llama.cpp's own
-run-to-run floor is measured **0** (bit-reproducible, window-050 §4.11).
+run-to-run floor is measured **0** (bit-reproducible, window-050 §4.11) [AMENDED 2026-09-13, REVIEW HIGH-1: the cited §4.11 warm/cold generalisation was refuted on re-run - A770 steps once at an unpredictable forward; settle is defined by the observed FLOOR pair.].
 
 **The bar, stated before any number**: `bar_0.5.1 = 100 × F_ref` below row
 2051, and `bar_0.5.1 + the measured QSA price` (2.385560e-02 over the rows
