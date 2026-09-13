@@ -323,13 +323,19 @@ F_served is unreadable and the row says UNREADABLE, not PASS. The inherited
 
 | quantity | predicted | measured |
 |---|---|---|
-| F_ref (uint16 reconstruction error at 248,320-wide, mean over the capture's rows) | between 2.9e-6 (the 257-wide cell) and 8/65535 = 1.2e-4 nats | EMPTY |
-| F_served at depth 48 (KL(A‖B) mean, ≥ 2 replays, both windows) | of the order of depth 4's 2.1e-4, per-window event | EMPTY |
-| bar_0.5.1 below 2051 = 100 × F_ref | 3e-4 .. 1.2e-2 nats | EMPTY |
-| bar_0.5.1 at/above 2051 = bar + QSA price | + 2.385560e-02 | EMPTY |
+| F_ref (uint16 reconstruction error at 248,320-wide, mean over the capture's rows) | between 2.9e-6 (the 257-wide cell) and 8/65535 = 1.2e-4 nats | **3.0905e-05 nats** mean over 816 served rows (max 1.0533e-02, min 2.5e-10), `RUN@c00500f` A770 d4 f16 T=816, 2026-09-13 22:03Z — C6 holds on the mean; the per-row max is the clamp-tail term (below) |
+| F_served at depth 48 (KL(A‖B) mean, ≥ 2 replays, both windows) | of the order of depth 4's 2.1e-4, per-window event | EMPTY at depth 48; at depth 4 on the rows above: **bit-identical ×3** (KL(A‖B) 1.0e-18, max \|diff\| 0), the observed floor pair of that process |
+| bar_0.5.1 below 2051 = 100 × F_ref | 3e-4 .. 1.2e-2 nats | **3.0905e-03 nats** (PROVISIONAL: derived from served f16 rows, see the note) |
+| bar_0.5.1 at/above 2051 = bar + QSA price | + 2.385560e-02 | **2.6946e-02 nats** |
 | mean KL(P_ref‖P_served) below 2051 | not predicted (the first full-depth number) | EMPTY |
 | mean KL(P_ref‖P_served) at/above 2051 | not predicted | EMPTY |
 | verdict (REPORT ONLY at this commit; the gate is the tag's) | — | EMPTY |
+
+**Measured — A.2, `RUN@c00500f` (tree byte-verified 1c2a9b5f5b73fdae), A770 (GPU.1), depth-4 artifact with real weights, capture window 0's first 816 ids, 2026-09-13 21:50–22:09Z (logs `~/wp/logs/wpA2-fref/`, rows `/models/ov/_kld/wpA2/`, the instrument `tools/kld_bar.py`).** The rows the derivation reads are the SERVED PATH's own f16 rows, not f32 ones: the f32 hint compiled (56.9 s, 8.82 GiB resident) and the forward was refused, verbatim — at T=816 `primitive_onednn_base.h:559: could not execute a primitive` (10.3 s in, rc=134), at T=512 `paged_attention.cpp:72: Check 'valid_block_size' failed ... Incorrect block size for Paged Attention operation for key cache quant mode BY_CHANNEL` (104 s in); the f32-hint + `--paged-kv f16` variant refused at COMPILE after 62.3 s — `program_builder.cpp:168: ProgramBuilder build failed ... ocl_kernel_builder.hpp:73: clBuildProgram, error code: -11 CL_BUILD_PROGRAM_FAILURE` (22:08Z). Three f32 attempts, three refusals: the served graph at depth 4 has no f32 forward on the A770 under this plugin, and the f32 row of the round-trip pair is NOT AVAILABLE from the card. The f16 leg: compile 47.6 s, 6.79 GiB, three forwards of the same request bit-identical (digest `0fddacdb5d44`), a 1-token decode probe after the block accepted. F_ref is the writer transcription's error on real rows of the served path's width and distribution; whether f32 rows would move it is UNMEASURED on this card, so the bar keeps its PROVISIONAL tag with a different reason than before: the rows are f16-served, dated, attributed.
+
+> [AMENDED 2026-09-14, A.2: **C6 did not price the clamp-tail term.** The writer clamps the row's minimum at max−16, so every logit further down reconstructs to exactly max−16, and at 248,320-wide those entries carry e^-16 each — a tail the half-step bound never counts. `tests/python/test_kld_bar.py` found it red-first (40-nat synthetic rows: F_ref a decade over the step bound) and pins it as its own cell; on the served rows the MEAN stays inside C6's band (3.09e-5) while the per-row maximum (1.05e-2) does not. C6 stands as written for the mean; its bound is not a per-row bound.]
+
+> [AMENDED 2026-09-14, A.2: the inherited **0.0599** (window-050 §7, another model's number) is SUPERSEDED BY LINEAGE by bar_0.5.1 = 3.0905e-03 below / 2.6946e-02 above 2051 wherever this document reads a bar; it stays printed beside every verdict for continuity and decides nothing — mark, not erasure. The new bar is itself PROVISIONAL on the f16-rows caveat above.]
 
 ### (e) THE PARIS LINE — EMPTY, with its falsifiable clause
 
