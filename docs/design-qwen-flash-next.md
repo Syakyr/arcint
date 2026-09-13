@@ -2339,3 +2339,70 @@ body.
 
 Red cases run, not asserted: dropping the `Exp` from the gate decay → `nan`,
 red; dropping `beta` from the delta → 205,316× the floor, red.
+
+## The KLD gate's reference half — the reference is not a fork any more (2026-09-13)
+
+The KLD gate is 0.5.0's quality adjudicator: arcint's served logits against a
+reference implementation's, **below and above the QSA boundary**. This section
+is the reference half only. The comparison needs served logits and there are
+none yet, so it is deliberately not built.
+
+### `qwen4exp` is in upstream llama.cpp master
+
+The roadmap recorded the reference as "the llama.cpp qwen4exp fork", carrying a
+companion PR. **Superseded.** Verified on the pinned checkout: upstream master
+registers `LLM_ARCH_QWEN4EXP` in `src/llama-arch.cpp` and gives it its own
+translation unit, `src/models/qwen4exp.cpp`. The shipped GGUF declares
+`general.architecture = "qwen4exp"` — the same arch string. **Pin a master
+commit, not a PR branch.**
+
+Upstream's own `llama-perplexity --kl-divergence-base FNAME` (alias
+`--save-all-logits`) *is* the capture, and its `--kl-divergence` is the
+comparison half. Nothing is reimplemented.
+
+### Feasibility, measured rather than assumed
+
+The reference loads the 84 GB shipped artifact on the 48 GiB dev container
+(mmap, paging from the NVMe pool) and runs:
+
+| | measured |
+|---|---|
+| load → threadpool init | ~45–51 s |
+| pass at `-c 512` | **36.18 s** (8 threads) |
+| 2 chunks of 512 = 1024 tokens, wall | 124 s |
+| capture file, 1024 tokens | 253,294,596 B |
+
+The first attempt refused for a trivial and useful reason —
+`llama-perplexity` needs at least two windows' worth of tokens — which is why
+the tool below enforces a minimum chunk count instead of letting a run produce
+no capture at all.
+
+### `tools/kld_capture.py` — and the refusal that is its whole point
+
+Every path is an argument; nothing operator-local is written down. What the
+tool adds over a bare invocation is a **refusal** and a **manifest** (every
+input and the output hashed, so a capture found on disk later can be attributed
+rather than remembered).
+
+**A capture whose window the QSA price never touches is refused by name.** The
+gate compares both sides of the boundary; a capture taken at `-c 2051` or less
+carries no row above it, and looks exactly like a usable capture on disk.
+
+The count of touched rows is `T − 2051`, **derived from the two measured
+points** rather than from reasoning about position indices:
+
+| T | measured | `T − 2051` | `T − 1 − 2051` |
+|---|---|---|---|
+| 2052 | 1 / 2052 rows | **1** ✓ | 0 ✗ |
+| 2080 | 29 / 2080 rows | **29** ✓ | 28 ✗ |
+
+The first draft used the right-hand column in both the arithmetic and the test
+that was supposed to pin it. Both were wrong by one and both looked right — so
+the test now pins the formula to the measured rows themselves, and restoring
+the off-by-one turns the suite red (2 failures + 1 error, run). The smallest
+window the price touches is **2052**, not 2053; the budget is 2048 and the
+boundary is 2051, and the tool refuses 2048 by name for exactly that reason.
+
+`python3 tools/kld_capture.py ... --dry-run` runs every check and prints the
+command without running it. 14 unit tests, Python 3 stdlib only, no venv, no
+model, no card.
