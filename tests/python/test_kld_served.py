@@ -221,3 +221,32 @@ def test_the_report_carries_the_bar_as_provisional_with_its_provenance(tmp_path)
     assert rep["threshold_status"] == "PROVISIONAL"
     assert "0.0399" in rep["threshold_provenance"] and "2026-08-11" in rep["threshold_provenance"]
     assert ks.THRESHOLD_NATS is kh.THRESHOLD_NATS
+
+
+def test_warmup_posts_extra_windows_before_the_counted_replays(monkeypatch, tmp_path):
+    """--warmup N posts every window N more times before the --repeat replays
+    (the kernel set settles first, window-050 §4.11); the request order is
+    warmups, then replays. Red first: --warmup was an unknown option."""
+    import urllib.request
+    n_ctx, vocab = 6, 5
+    cap = tmp_path / "ref.dat"
+    w = np.zeros((n_ctx, vocab), np.float32)
+    write_capture(cap, n_ctx, vocab, [w, w], np.arange(2 * n_ctx))
+    posted = []
+
+    class _Resp:
+        def __init__(self, body): self._b = body
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self): return self._b
+
+    def fake_urlopen(req, timeout=None):
+        import json as _j
+        posted.append(_j.loads(req.data)["prompt"])
+        return _Resp(b'{"usage": {}, "choices": [{"text": "x"}]}')
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    assert ks.main(["--ref", str(cap), "--replay", "--repeat", "2", "--warmup", "3",
+                    "--url", "http://x"]) == 0
+    assert len(posted) == (3 + 2) * 2                    # 5 passes x 2 windows
+    assert posted[0] == list(range(6)) and posted[1] == list(range(6, 12))

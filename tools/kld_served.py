@@ -190,7 +190,15 @@ def replay(args):
     import urllib.request
     n_ctx, n_vocab, n_chunk, tokens, _rows = read_capture(args.ref)
     print(f"capture {args.ref}: n_ctx {n_ctx} n_vocab {n_vocab} windows {n_chunk}", flush=True)
-    for rep in range(int(args.repeat)):
+    # THE MECHANISM OF THE FLOOR (window-050 §4.11, RUN@cc28ce3..e53d75b on
+    # the A770): the served output changes ONCE, permanently, each time the
+    # plugin's asynchronously compiled static-shape kernel for a primitive
+    # arrives and replaces the shape-agnostic one it started with -- a
+    # staircase of discrete output classes whose timing depends on the kernel
+    # cache, not noise. `--warmup N` posts every window N extra times BEFORE
+    # the counted replays, so the floor is read over a settled kernel set
+    # and a step inside the counted replays is visible as what it is.
+    for rep in range(-int(args.warmup), int(args.repeat)):
       for w in range(n_chunk):
         if args.windows and w not in args.windows:
             continue
@@ -203,7 +211,8 @@ def replay(args):
         with urllib.request.urlopen(req, timeout=args.timeout) as resp:
             reply = json.loads(resp.read())
         usage = reply.get("usage", {})
-        print(f"replay {rep} window {w}: {len(ids)} ids -> HTTP OK in {time.time() - t0:.1f}s; "
+        print(f"{'warmup' if rep < 0 else 'replay'} {rep} window {w}: {len(ids)} ids -> "
+              f"HTTP OK in {time.time() - t0:.1f}s; "
               f"usage {usage}; text {reply.get('choices', [{}])[0].get('text', '')!r}", flush=True)
     return 0
 
@@ -325,6 +334,12 @@ def main(argv=None):
     ap.add_argument("--windows", type=int, nargs="*", default=None)
     ap.add_argument("--repeat", type=int, default=1,
                     help="replay every window this many times (2 = the floor)")
+    ap.add_argument("--warmup", type=int, default=0,
+                    help="post every window this many extra times first, not "
+                         "so the kernel set settles (§4.11). --compare cannot "
+                         "tell a warmup from a replay in the dump: it pairs "
+                         "EVERY replayed window against the last, so a step "
+                         "during the warmups shows in the earlier pairs")
     ap.add_argument("--timeout", type=float, default=3600.0)
     ap.add_argument("--dump", default=None, help="the ARCINT_LOGITS_DUMP file")
     ap.add_argument("--out", default=None, help="write the report JSON here")

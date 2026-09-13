@@ -1668,6 +1668,87 @@ bar. The reference means re-read against replay B: 11.65 / 11.48 (11.6835 /
 from the single-replay run. Every gate reading from now on carries this
 row beside it; the mechanism is not narrated here.
 
+### 4.11.1 THE FLOOR'S MECHANISM — measured, not narrated (WP0.1 rider, 2026-09-13)
+
+**Instrument.** `tools/boot_serving_shape.py` on the depth-4 artifact with
+the real table bound (`--artifact --shards`), the KLD capture's own window-0
+ids as the prompt (`--capture … --take 1024`), the state rows zeroed before
+every forward exactly as `zero_paged_rows` does (`copy_from` of a zero row —
+the first chain read the *carried state* instead: 887 of 1,024 argmaxes
+moved between two identical forwards, run 1, withdrawn), `--repeat N`
+comparing every forward with the first and with its predecessor, a sha256
+digest per output, `--cut` for the per-node localiser, `--plugin-prop` for
+the plugin's own switches. A770 (GPU.1), f16 default, KV u8, 22 legs
+`RUN@c836354` … `RUN@e53d75b`, 16:27–17:35Z, one process per leg, cards
+free between legs.
+
+**What the device wrote.** The output of an identical forward changes
+**once, permanently, per event**, never back — a staircase of discrete
+output classes (digests), each step starting at an earlier row than the
+last; the step count and timing depend on the process, not the input:
+
+| leg | kernel cache | forwards | classes (by digest) | steps at forward | first differing row | max \|logit diff\| | argmaxes moved / 1,024 | per-forward s before → after |
+|---|---|---|---|---|---|---|---|---|
+| L1 same request ×6 | warm-ish (first of the day) | 6 | 2 | #3 | 0 | 1.89 | 52 | 7.0 → 5.2 |
+| L2 fresh request ×6 | warm-ish | 6 | 2 | #5 | 0 | 1.24e-4 | 0 | 9.5 → 5.4 |
+| L9 same ×12 | warm (after L1–L8) | 12 | **1** | — | — | 0 | 0 | 6.7 → 5.2 |
+| L10 T=512 ×12 | warm | 12 | **1** | — | — | 0 | 0 | 3.7 → 2.6 |
+| L18 cold (`NEO_CACHE_PERSISTENT=0`) ×12 | cold | 12 | 2 | #11 | 0 | 1.25e-4 | 0 | 7.3 → 7.1 (no drop) |
+| L20 cold again ×12 | cold | 12 | **4** | #3, #6, #12 | 84 → 16 → 0 | 1.42 → 2.15 → 1.83 | 18 → 57 → 67 | 7.0 → 5.2 at #4 |
+| L22 f16 after the cold legs ×12 | partly warm | 12 | 2 | #4 | 0 | 1.24e-4 | 0 | 6.3 → 5.2 |
+| L8 / L16 / L17 cuts at `layer3/mixer_out`, `layer2/out` (warm) | warm | 6–8 | 1 | — | — | 0 | — | flat |
+
+Two magnitudes of step recur across legs: a **small** one (max \|diff\|
+1.24–1.25e-4, no argmax moves; L2, L18, L22) and a **large** one (1.4–2.2 in
+one logit, 18–67 argmaxes of 1,024 at depth 4; L1, L20). The first forwards
+of two cold processes (L18 `44f5d3c3beba`, L20 `5689b99aa3e2`) already
+differ from each other and from a warm process's (L9 `1f7b36ad7284`), so
+"the first forward" is not one class either. With every kernel present at
+compile (L9, L10, after the same shapes had run in earlier processes on the
+same card) **no step occurs in 12 forwards** — the output is bit-identical
+throughout.
+
+**The plugin's own name for it.** The pinned source
+(`src/plugins/intel_gpu/include/intel_gpu/runtime/options.inl:138`) carries
+`GPU_DISABLE_ASYNC_COMPILATION` — *"Disable feature that allows to
+asynchronously prepare static-shaped implementations for the primitives
+with shape-agnostic kernels selected during compilation"*. That is the
+behaviour measured above: the graph starts on shape-agnostic kernels, each
+static-shape kernel that finishes compiling replaces its primitive's
+implementation between two forwards (a different kernel, a different
+summation order, a different f16 rounding — a permanent step in the output),
+and a warm kernel cache hands every static kernel over at compile time so
+nothing arrives later. The switch itself is a debug option **compiled out
+of the release plugin**: `Option not found: GPU_DISABLE_ASYNC_COMPILATION`
+(L11, L12, L19, 1.2 s each), so the mechanism was pinned by the cold/warm
+contrast, not by turning it off. An f32 leg (L21) was refused before its
+first forward: the MoE tile `[512, 1024, 2560]` in f32 is 5,368,709,120 B
+against the A770's 4,294,959,104 B cap (the 1,638-token block cap of §4.7 is
+the f16 figure); f32 at T ≤ 819 was not run.
+
+**What this changes.** The served floor of §4.11 (2.1e-4 mean, one window
+with 41 argmaxes moved) is the *small* step caught between two replays of
+the same process; the large step (up to 67 argmaxes of 1,024 at depth 4) is
+what a reading straddles if a kernel arrives mid-run. Two replays after the
+kernel set has settled are bit-identical, so the floor is a property of the
+process's compile timeline, not of the input. `tools/kld_served.py --replay
+--warmup N` posts every window N extra uncounted times first; `--compare`
+pairs every replayed window against the last, so a step inside the warm-ups
+shows in the earlier pairs. A gate reading names its warm-up count and its
+floor beside the means; a run whose floor pairs are not bit-identical
+carries a kernel step and says so. The per-node cuts (`RUN@e53d75b`,
+17:22–17:36Z, 8 forwards each, warm cache: `layer0/out`, `ple/out`,
+`layer1/out`, `layer2/out`, `layer3/mixer_out` — 354 / 600 / 918 / 1,236 /
+1,473 ops) were **all bit-identical over 8 forwards** (digests
+`7b02e562e407`, `4dbc5a100364`, `5dde8404d7d4`, `f3b4171fc19f`,
+`e4d1bb672152`): every kernel of every cut was cached by then, so the cuts
+localised nothing, as the rule above says they cannot without a cold JIT. The
+localisation of WHICH primitive steps first is therefore not on the record;
+the instrument for it exists (`--cut` under `NEO_CACHE_PERSISTENT=0`,
+repeated until the step falls inside the run) and the row stays open. What
+is on the record is the mechanism at the plugin level and the three facts a
+reading needs: one-time, permanent, cache-dependent.
+
 ## 5. Residency — the SIZE LEDGER, and the number that decides the window
 
 `RUN@wt+2e99661`, 2026-09-12, real checkpoint geometry, T=64, CPU, every row either built
