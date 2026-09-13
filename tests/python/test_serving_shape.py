@@ -2142,3 +2142,207 @@ def test_the_constant_factory_scanner_detects_a_missing_module():
             f"{missing}")
     print(f"[contract-cmodules] scanner rejects each of {len(listed)} "
           f"single-module deletions")
+
+
+# ---------------------------------------------------------------------------
+# SEGMENTED FORWARD (0.5.1, docs/window-051.md §2): layer ranges, the
+# hidden-state boundary ports, and the expert bodies as u8 ports
+# ---------------------------------------------------------------------------
+
+def _tiny_config(n_layers):
+    """The round-trip test's reduced geometry, at a chosen depth (a multiple
+    of 4 so every 4-aligned segment holds one full-attention layer)."""
+    cfg = pwe.real_config()
+    small = type(cfg)(
+        hidden_size=256, num_hidden_layers=n_layers,
+        num_attention_heads=4, num_key_value_heads=2, head_dim=64,
+        num_experts=8, num_experts_per_tok=2, moe_intermediate_size=128,
+        shared_expert_intermediate_size=128,
+        hc_count=cfg.hc_count, hc_lowrank=32,
+        ple_embed_dim=512, ple_conv_kernel_size=cfg.ple_conv_kernel_size,
+        ngram_size=cfg.ngram_size, heads_per_ngram=cfg.heads_per_ngram,
+        vocab_size=512, rms_norm_eps=cfg.rms_norm_eps,
+        linear_key_head_dim=32, linear_num_key_heads=2,
+        linear_value_head_dim=32, linear_num_value_heads=4,
+        linear_conv_kernel_dim=cfg.linear_conv_kernel_dim,
+        hidden_act="silu",
+        layer_types=["qwen_sparse_attention" if i % 4 == 3 else "linear_attention"
+                     for i in range(n_layers)],
+    )
+    small.ngram_total_vocab = 4096
+    return small
+
+
+def _port_names(model):
+    return {p.get_node().get_friendly_name(): ss._dims(p) for p in model.inputs}
+
+
+def test_a_layer_range_segment_declares_the_boundary_ports_and_no_head():
+    """Segment 0 of a tiny 8-layer model takes `inputs_embeds` at H and emits
+    `hidden_out` at hc*H with no head; the last segment takes `inputs_embeds`
+    at hc*H, carries the head, and declares no n-gram port (the PLE is global
+    layer 1); a range without a full-attention layer is refused by name.
+    Red first: against the previous emitter `layer_range` is an unknown
+    keyword."""
+    small = _tiny_config(8)
+    hcH = small.hc_count * small.hidden_size
+    arena = ss.SparseArena(capacity_bytes=1 << 32)
+    try:
+        seg0, rep0 = ss.build_serving_shape_ir(config=small, arena=arena, layer_range=(0, 4))
+        seg1, rep1 = ss.build_serving_shape_ir(config=small, arena=arena, layer_range=(4, 8))
+        p0, p1 = _port_names(seg0), _port_names(seg1)
+        assert p0["inputs_embeds"] == [1, -1, small.hidden_size]
+        assert p1["inputs_embeds"] == [1, -1, hcH]
+        assert [r.get_node().get_friendly_name() for r in seg0.outputs] == ["hidden_out"]
+        assert ss._dims(seg0.outputs[0]) == [1, -1, hcH]
+        assert [r.get_node().get_friendly_name() for r in seg1.outputs] == ["logits"]
+        assert ss._dims(seg1.outputs[0]) == [1, -1, small.vocab_size]
+        assert any(n.startswith("ngram_table.") for n in p0) and "ngram_chunk_ids" in p0
+        assert not any(n.startswith("ngram") for n in p1)
+        for p in (p0, p1):
+            for must in ("position_ids", "conv_mask", "attention_mask", "beam_idx"):
+                assert must in p, (must, sorted(p))
+        assert (rep0["layer_range"], rep0["segment_first"], rep0["segment_last"]) == ([0, 4], True, False)
+        assert (rep1["layer_range"], rep1["segment_first"], rep1["segment_last"]) == ([4, 8], False, True)
+        assert rep0["attn_layers"] == 1 and rep1["attn_layers"] == 1
+        # the depth cut without layer_range is unchanged: head on, H-wide input
+        cut, repc = ss.build_serving_shape_ir(config=small, arena=arena, n_layers=4)
+        assert _port_names(cut)["inputs_embeds"] == [1, -1, small.hidden_size]
+        assert repc["segment_last"] is True and cut.outputs[0].get_node().get_friendly_name() == "logits"
+        with pytest.raises(ValueError, match="full-attention"):
+            ss.build_serving_shape_ir(config=small, arena=arena, layer_range=(1, 3))
+    finally:
+        arena.close()
+
+
+class _RowsSource:
+    """A synthetic expert source: deterministic rows per (layer, kind)."""
+
+    def __init__(self, cfg, seed=11):
+        self.cfg, self.seed = cfg, seed
+
+    def __call__(self, layer, kind):
+        E, H, I = self.cfg.num_experts, self.cfg.hidden_size, self.cfg.moe_intermediate_size
+        shape = (E, H, I) if kind == "down" else (E, I, H)
+        rng = np.random.default_rng(self.seed * 1000 + layer * 10 + {"gate": 0, "up": 1, "down": 2}[kind])
+        return rng.standard_normal(shape).astype(np.float32) * 0.05
+
+
+def _compile_cpu(model):
+    core = ov.Core()
+    return core.compile_model(model, "CPU", {"INFERENCE_PRECISION_HINT": "f32"})
+
+
+def test_expert_port_bodies_unpack_bit_exact_against_the_shipped_codes(tmp_path):
+    """THE BIT-EXACT UNPACK CELL (0.5.1 WP4.1), two halves.
+
+    (1) THE CODES: the u8 port's in-graph nibble unpack, run on the CPU
+    plugin, returns exactly the u4 codes the artifact ships -- compared bit
+    for bit (digest form) against `expert_fill.unpack_u4`, the C++ unpack
+    transcribed (gguf_repack.cpp:225), NOT against the packer. Red first: the
+    port fed with its nibbles swapped must not match, and does not.
+
+    (2) THE DEQUANT: the same codes through the port graph and through the
+    u4-Constant graph the artifact carries today agree to ONE f32 ULP, not
+    bit for bit, and the count is printed: the plugin folds the Constant
+    chain at compile time (bit-identical to numpy's (q - zp) * s) while the
+    port chain runs its fused runtime eltwise, which rounds the product
+    differently by <= 1 ulp -- measured 1.49e-8 max over 110,101 of 262,144
+    elements at this geometry (2026-09-13). A stricter bound is not a
+    property of the unpack, so it is not asserted here; the served path's
+    own floor (window-050 §4.11) is where that difference is read.
+    """
+    import hashlib
+    from openvino import opset13 as op
+    from q4e import expert_fill as ef
+    small = _tiny_config(4)
+    E, H, I = small.num_experts, small.hidden_size, small.moe_intermediate_size
+    gs = ss.EXPERT_GROUP_SIZE
+    filler_c = ef.ExpertFiller(_RowsSource(small), gs)
+    filler_p = ef.ExpertFiller(_RowsSource(small), gs)
+    arena = ss.SparseArena(capacity_bytes=1 << 32)
+    try:
+        with ss.shared_constants():
+            xc = ss._compressed_expert(arena, E, I, H, "cell/experts_gate", filler_c, 0, "gate")
+            const_model = ov.Model([op.result(xc)], [], "constant_path")
+            sink = ss.ExpertPortSink()
+            xp = ss._compressed_expert(arena, E, I, H, "cell/experts_gate", filler_p, 0, "gate",
+                                       port_sink=sink)
+            port_model = ov.Model([op.result(xp)], sink.params, "port_path")
+            # the unpack alone, codes out
+            p = op.parameter([E, I, H // gs, gs // 2], ov.Type.u8)
+            p.set_friendly_name("codes_in")
+            codes_model = ov.Model([op.result(ss._unpack_u8_to_u4_f32(p, E, I, H // gs, gs))],
+                                   [p], "codes")
+        assert [n for n, _, _ in sink.bodies] == ["cell/experts_gate/weight_u8"]
+        name, shape, packed = sink.bodies[0]
+        assert shape == (E, I, H // gs, gs // 2)
+        assert packed.size == int(np.prod(shape)) and packed.dtype == np.uint8
+
+        # (1) the codes, bit for bit against the C++ transcription
+        want_codes = ef.unpack_u4(packed, E * I * H).reshape(E, I, H // gs, gs).astype(np.float32)
+        rq = _compile_cpu(codes_model).create_infer_request()
+        rq.set_tensor("codes_in", ov.Tensor(packed.reshape(shape)))
+        rq.infer()
+        got_codes = np.array(rq.get_output_tensor(0).data, dtype=np.float32, copy=True)
+        d_want = hashlib.sha256(want_codes.tobytes()).hexdigest()[:16]
+        d_got = hashlib.sha256(got_codes.tobytes()).hexdigest()[:16]
+        print(f"\n[unpack-cell] codes: C++ unpack {d_want} graph unpack {d_got} over {want_codes.shape}")
+        assert got_codes.shape == want_codes.shape
+        assert want_codes.max() == 15 and want_codes.min() == 0   # every nibble value occurs
+        assert d_got == d_want and np.array_equal(want_codes, got_codes)
+        swapped = ((packed >> 4) | ((packed & 0xF) << 4)).astype(np.uint8)   # RED
+        rq.set_tensor("codes_in", ov.Tensor(swapped.reshape(shape)))
+        rq.infer()
+        assert not np.array_equal(want_codes, np.array(rq.get_output_tensor(0).data))
+
+        # (2) the dequant: port vs constant, one ulp, counted
+        ref = _compile_cpu(const_model).create_infer_request()
+        ref.infer()
+        want = np.array(ref.get_output_tensor(0).data, dtype=np.float32, copy=True)
+        req = _compile_cpu(port_model).create_infer_request()
+        req.set_tensor(name, ov.Tensor(packed.reshape(shape)))
+        req.infer()
+        got = np.array(req.get_output_tensor(0).data, dtype=np.float32, copy=True)
+        assert want.shape == got.shape == (E, I, H) and np.abs(want).max() > 0
+        diff = np.abs(want - got)
+        # the bound is one ulp of the PRODUCTS (q * s, zp * s, |q|, |zp| <= 15),
+        # not of the result: the fused runtime eltwise evaluates x * s - zp * s
+        # (two roundings, then a cancellation), so the absolute error is an
+        # ulp of the larger product and can be many ulps of a small result
+        sc = arena.scales["cell/experts_gate/scale"]                  # [E, I, groups, 1]
+        bound = np.broadcast_to(np.spacing(np.float32(16) * np.abs(sc)).astype(np.float32),
+                                (E, I, H // gs, gs)).reshape(E, I, H)
+        n_diff = int((diff > 0).sum())
+        print(f"[unpack-cell] dequant: port vs constant max |diff| {diff.max():.3e}, "
+              f"{n_diff} of {diff.size} elements differ, all within one ulp of the "
+              f"products: {bool((diff <= bound).all())}")
+        assert (diff <= bound).all()
+    finally:
+        arena.close()
+
+
+def test_expert_ports_are_declared_per_body_of_the_segment_and_the_constants_are_gone():
+    """With an `ExpertPortSink`, a 4-layer segment declares 12 u8 ports (3 a
+    layer), the report lists them with their byte counts, and no u4 weight
+    Constant remains (the zero-points stay u4 Constants: 12 of them)."""
+    small = _tiny_config(4)
+    E, H, I, gs = small.num_experts, small.hidden_size, small.moe_intermediate_size, ss.EXPERT_GROUP_SIZE
+    arena = ss.SparseArena(capacity_bytes=1 << 32)
+    try:
+        sink = ss.ExpertPortSink()
+        model, rep = ss.build_serving_shape_ir(config=small, arena=arena, layer_range=(0, 4),
+                                               expert_ports=sink)
+        ports = {n: s for n, s, _ in sink.bodies}
+        assert len(ports) == 12 and all(n.endswith("/weight_u8") for n in ports)
+        assert ports["layer0/moe/experts_gate/weight_u8"] == (E, I, H // gs, gs // 2)
+        assert ports["layer0/moe/experts_down/weight_u8"] == (E, H, I // gs, gs // 2)
+        declared = _port_names(model)
+        assert all(n in declared and declared[n] == list(s) for n, s in ports.items())
+        assert len(rep["expert_ports"]) == 12
+        assert sum(b for _, _, b in rep["expert_ports"]) == sum(int(np.prod(s)) for s in ports.values())
+        u4_consts = [n.get_friendly_name() for n in model.get_ordered_ops()
+                     if n.get_type_name() == "Constant" and n.get_output_element_type(0) == ov.Type.u4]
+        assert all(n.endswith("/zero_point") for n in u4_consts) and len(u4_consts) == 12
+    finally:
+        arena.close()

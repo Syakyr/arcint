@@ -90,3 +90,17 @@ def test_the_embedding_model_is_dynamic_in_t():
         out = req.get_output_tensor(0).data
         assert out.shape == (1, len(ids), 3)
         np.testing.assert_array_equal(out[0], table[ids])
+
+
+def test_segment_ranges_cover_the_depth_and_refuse_a_segment_without_attention():
+    """SEGMENTED (0.5.1): 4 x 12 over 48, a short tail when the depth is not a
+    multiple, None = one segment; a segment length that is not a multiple of
+    4 or a tail without an attention layer is refused by name."""
+    assert esa.segment_ranges(48, 12) == [(0, 12), (12, 24), (24, 36), (36, 48)]
+    assert esa.segment_ranges(48, 8) == [(0, 8), (8, 16), (16, 24), (24, 32), (32, 40), (40, 48)]
+    assert esa.segment_ranges(12, 8) == [(0, 8), (8, 12)]
+    assert esa.segment_ranges(12, None) == [(0, 12)]
+    with pytest.raises(ValueError, match="multiple of 4"):
+        esa.segment_ranges(48, 6)
+    with pytest.raises(ValueError, match="no full-attention"):
+        esa.segment_ranges(14, 12)          # tail (12, 14) has no index 3 mod 4

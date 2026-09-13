@@ -208,6 +208,27 @@ def serving_config(n_layers, ple_eos_token_id, geometry=None):
     return cfg
 
 
+def segment_ranges(layers, segment_layers):
+    """The layer ranges of a segmented artifact: [(0, N), (N, 2N), ...] over
+    `layers`, the last one shorter if `layers` is not a multiple of N. N must
+    be a positive multiple of 4 so every segment holds a full-attention layer
+    (index 3 mod 4) -- the paged transformation's own requirement. None = one
+    segment, the single model as before."""
+    layers = int(layers)
+    if segment_layers is None:
+        return [(0, layers)]
+    n = int(segment_layers)
+    if n <= 0 or n % 4:
+        raise ValueError(f"segment_layers {segment_layers!r}: a positive multiple of 4")
+    ranges = [(lo, min(lo + n, layers)) for lo in range(0, layers, n)]
+    tail = ranges[-1]
+    if not any((i % 4) == 3 for i in range(tail[0], tail[1])):
+        raise ValueError(f"the last segment {tail} holds no full-attention layer; "
+                         f"choose a depth that leaves every segment one (layers "
+                         f"{layers}, segment {n})")
+    return ranges
+
+
 def build_embed_model(table_f32):
     """token_embd as its own model, T DYNAMIC: input_ids [1, T] i64 ->
     [1, T, H] f32. `pwe.build_embed_piece` is static in T; the served
@@ -245,7 +266,18 @@ def main(argv=None):
     ap.add_argument("--skip-hash", action="store_true",
                     help="do not sha256 the written IR files (the manifest "
                          "then says so)")
+    ap.add_argument("--segment-layers", type=int, default=None,
+                    help="SEGMENTED (0.5.1): write the language model as "
+                         "ceil(layers / N) sub-models of N layers each "
+                         "(segment0/, segment1/, ...; N a multiple of 4 so "
+                         "every segment holds a full-attention layer), the "
+                         "hidden state as ports between them, and every "
+                         "expert body as a u8 port whose bytes go to "
+                         "expert_bodies.u8 with an index in the manifest")
     args = ap.parse_args(argv)
+    if args.segment_layers is not None and (args.segment_layers <= 0
+                                            or args.segment_layers % 4):
+        ap.error("--segment-layers must be a positive multiple of 4")
 
     import openvino as ov
     from q4e import serving_shape as ss
@@ -293,37 +325,100 @@ def main(argv=None):
                      f"from {tok_src}")
 
     # ---- the language model: build + fill + save ---------------------------
-    arena_path = args.arena or str(out / ".arena.bin")
-    arena = ss.SparseArena(path=arena_path)
-    t0 = time.time()
-    try:
-        model, rep = ss.build_serving_shape_ir(arena=arena, n_layers=args.layers,
-                                               filler=filler, feed=feed)
-    except Exception as exc:                                      # noqa: BLE001
-        say("build", f"FAIL {type(exc).__name__}: {exc}")
+    ranges = segment_ranges(args.layers, args.segment_layers)
+    segments = []                       # per-segment manifest rows
+    body_index = []                     # the expert_bodies.u8 index
+    blob = None
+    blob_path = out / "expert_bodies.u8"
+    if args.segment_layers is not None:
+        blob = open(blob_path, "wb")
+
+    def blob_writer(name, packed):
+        off = blob.tell()
+        blob.write(packed.tobytes())
+        return off
+
+    dense = []
+    fill_census = None
+    total_nodes = 0
+    rep = None
+    for k, (lo, hi) in enumerate(ranges):
+        seg_dir = out if args.segment_layers is None else out / f"segment{k}"
+        seg_dir.mkdir(parents=True, exist_ok=True)
+        arena_path = (args.arena if args.arena and args.segment_layers is None
+                      else str(seg_dir / ".arena.bin"))
+        arena = ss.SparseArena(path=arena_path)
+        sink = ss.ExpertPortSink(writer=blob_writer) if blob is not None else None
+        t0 = time.time()
+        try:
+            model, rep = ss.build_serving_shape_ir(
+                arena=arena, n_layers=args.layers, filler=filler, feed=feed,
+                layer_range=None if args.segment_layers is None else (lo, hi),
+                expert_ports=sink)
+        except Exception as exc:                                  # noqa: BLE001
+            say("build", f"FAIL segment {k} layers {lo}..{hi - 1}: {type(exc).__name__}: {exc}")
+            arena.close()
+            if blob is not None:
+                blob.close()
+            return 1
+        seg_dense = rep["dense_fill_census"]
+        dense += seg_dense
+        fill_census = rep["fill_census"]
+        total_nodes += rep["nodes"]
+        say("build", f"OK segment {k} layers {lo}..{hi - 1} {time.time() - t0:.1f}s "
+                     f"nodes={rep['nodes']} ({rep['gdn_layers']} GDN + {rep['attn_layers']} "
+                     f"attn) dense fill {len(seg_dense)} tensors "
+                     f"{sum(b for _, b in seg_dense) / 2 ** 30:.2f} GiB; expert "
+                     f"{'ports ' + str(len(rep['expert_ports'])) if sink else 'fill ' + str(rep['fill_census'])}; "
+                     f"arena written {rep['arena_written_bytes'] / 2 ** 30:.2f} GiB; "
+                     f"inputs_embeds width {rep['inputs_embeds_width']}; "
+                     f"out {rep['outputs'][0][0]}; peak_host_GiB={peak_rss_gib():.2f}")
+        if rep["has_ple"]:
+            say("build", f"ngram table: {rep['ngram_table_rows']:,} rows x "
+                         f"{rep['ngram_row_bytes']} B over {len(rep['ngram_table_ports'])} "
+                         f"port(s) under cap {rep['ngram_chunk_cap_bytes']:,}")
+        lm_xml = seg_dir / "openvino_language_model.xml"
+        t0 = time.time()
+        ov.save_model(model, str(lm_xml), compress_to_fp16=False)
+        lm_bin = lm_xml.with_suffix(".bin")
+        say("save", f"{lm_xml.relative_to(out)} + .bin ({lm_bin.stat().st_size / 2 ** 30:.2f} GiB) "
+                    f"in {time.time() - t0:.1f}s, compress_to_fp16=False")
+        del model
         arena.close()
-        return 1
-    dense = rep["dense_fill_census"]
-    say("build", f"OK {time.time() - t0:.1f}s nodes={rep['nodes']} layers="
-                 f"{rep['n_layers']} ({rep['gdn_layers']} GDN + {rep['attn_layers']} "
-                 f"attn) dense fill {len(dense)} tensors "
-                 f"{sum(b for _, b in dense) / 2 ** 30:.2f} GiB; expert fill "
-                 f"{rep['fill_census']}; arena written "
-                 f"{rep['arena_written_bytes'] / 2 ** 30:.2f} GiB; "
-                 f"peak_host_GiB={peak_rss_gib():.2f}")
-    say("build", f"ngram table: {rep['ngram_table_rows']:,} rows x "
-                 f"{rep['ngram_row_bytes']} B over {len(rep['ngram_table_ports'])} "
-                 f"port(s) under cap {rep['ngram_chunk_cap_bytes']:,}")
-    lm_xml = out / "openvino_language_model.xml"
-    t0 = time.time()
-    ov.save_model(model, str(lm_xml), compress_to_fp16=False)
-    lm_bin = lm_xml.with_suffix(".bin")
-    say("save", f"{lm_xml.name} + .bin ({lm_bin.stat().st_size / 2 ** 30:.2f} GiB) "
-                f"in {time.time() - t0:.1f}s, compress_to_fp16=False")
-    del model
-    arena.close()
-    if not args.keep_arena and os.path.exists(arena_path):
-        os.unlink(arena_path)
+        if not args.keep_arena and os.path.exists(arena_path):
+            os.unlink(arena_path)
+        seg_row = {
+            "index": k, "dir": str(seg_dir.relative_to(out)) if seg_dir != out else ".",
+            "layers": [lo, hi], "first": rep["segment_first"], "last": rep["segment_last"],
+            "inputs_embeds_width": rep["inputs_embeds_width"], "has_ple": rep["has_ple"],
+            "nodes": rep["nodes"], "gdn_layers": rep["gdn_layers"],
+            "attn_layers": rep["attn_layers"],
+            "inputs": [[n, d, t] for n, d, t in rep["inputs"]],
+            "outputs": [[n, d, t] for n, d, t in rep["outputs"]],
+            "dense_fill_bytes": int(sum(b for _, b in seg_dense)),
+            "arena_written_bytes": int(rep["arena_written_bytes"]),
+            "lm_bin_bytes": lm_bin.stat().st_size,
+            "expert_ports": [],
+        }
+        if k == 0:
+            segments_ports0 = rep["ngram_table_ports"]
+        if sink is not None:
+            for name, shp, nbytes, off in sink.written:
+                # name = layer{i}/moe/experts_{kind}/weight_u8
+                layer = int(name.split("/")[0][len("layer"):])
+                kind = name.split("/")[2][len("experts_"):]
+                entry = {"name": name, "segment": k, "layer": layer, "kind": kind,
+                         "shape": list(shp), "offset": int(off), "bytes": int(nbytes)}
+                body_index.append(entry)
+                seg_row["expert_ports"].append(entry)
+            blob.flush()
+            say("bodies", f"segment {k}: {len(sink.written)} bodies, "
+                          f"{sum(n for _, _, n, _ in sink.written) / 2 ** 30:.2f} GiB "
+                          f"appended to {blob_path.name} (now {blob.tell() / 2 ** 30:.2f} GiB)")
+        segments.append(seg_row)
+    if blob is not None:
+        blob.close()
+    lm_bin_total = sum(s["lm_bin_bytes"] for s in segments)
 
     # ---- the embedding model -----------------------------------------------
     t0 = time.time()
@@ -362,13 +457,18 @@ def main(argv=None):
     hashes = {}
     if not args.skip_hash:
         t0 = time.time()
-        for name in ("openvino_language_model.xml", "openvino_language_model.bin",
-                     "openvino_text_embeddings_model.xml",
-                     "openvino_text_embeddings_model.bin", "tokenizer.json",
-                     "chat_template.jinja", "config.json"):
+        names = ["openvino_text_embeddings_model.xml", "openvino_text_embeddings_model.bin",
+                 "tokenizer.json", "chat_template.jinja", "config.json"]
+        for s in segments:
+            d = "" if s["dir"] == "." else s["dir"] + "/"
+            names += [d + "openvino_language_model.xml", d + "openvino_language_model.bin"]
+        if blob is not None:
+            names.append(blob_path.name)
+        for name in names:
             hashes[name] = sha256_file(out / name)
-        say("hash", f"sha256 of 7 files in {time.time() - t0:.1f}s; "
-                    f"lm_xml_sha={hashes['openvino_language_model.xml'][:16]} "
+        lm0 = ("" if segments[0]["dir"] == "." else segments[0]["dir"] + "/") + "openvino_language_model.xml"
+        say("hash", f"sha256 of {len(names)} files in {time.time() - t0:.1f}s; "
+                    f"lm_xml_sha={hashes[lm0][:16]} "
                     f"template_sha={hashes['chat_template.jinja'][:16]} "
                     f"tokenizer_sha={hashes['tokenizer.json'][:16]}")
     shards = []
@@ -380,19 +480,25 @@ def main(argv=None):
         "tree": args.tree,
         "written_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "openvino": ov.get_version(),
-        "layers": rep["n_layers"], "gdn_layers": rep["gdn_layers"],
-        "attn_layers": rep["attn_layers"], "nodes": rep["nodes"],
+        "layers": args.layers,
+        "gdn_layers": sum(s["gdn_layers"] for s in segments),
+        "attn_layers": sum(s["attn_layers"] for s in segments), "nodes": total_nodes,
         "rope_span": rep["rope_span"],
         "ngram_table_rows": rep["ngram_table_rows"],
         "ngram_row_bytes": rep["ngram_row_bytes"],
         "ngram_chunk_cap_bytes": rep["ngram_chunk_cap_bytes"],
-        "ngram_table_ports": [list(p) for p in rep["ngram_table_ports"]],
-        "inputs": [[n, d, t] for n, d, t in rep["inputs"]],
+        "ngram_table_ports": [list(p) for p in segments_ports0],
+        "inputs": segments[0]["inputs"],
         "dense_fill_tensors": len(dense),
         "dense_fill_bytes": int(sum(b for _, b in dense)),
-        "expert_fill": rep["fill_census"],
-        "arena_written_bytes": int(rep["arena_written_bytes"]),
-        "lm_bin_bytes": lm_bin.stat().st_size,
+        "expert_fill": fill_census,
+        "arena_written_bytes": int(sum(s["arena_written_bytes"] for s in segments)),
+        "lm_bin_bytes": lm_bin_total,
+        # SEGMENTED (0.5.1): absent or 1 segment = the single model as before
+        "segment_layers": args.segment_layers,
+        "segments": segments,
+        "expert_bodies": ({"file": blob_path.name, "bytes": blob_path.stat().st_size,
+                           "entries": body_index} if blob is not None else None),
         "ple_eos_token_id": int(ple_eos), "generation_eos_token_id": int(gen_eos),
         "tokenizer_from": str(tok_src),
         "tokenizer_ids_compared": n_defined,

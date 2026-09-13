@@ -634,8 +634,65 @@ def ngram_dequant_iq4nl(row_bytes_f32, head_dim):
 # The tiled MoE layer, expert bodies slot-referenced
 # --------------------------------------------------------------------------
 
+class ExpertPortSink:
+    """SEGMENTED FORWARD (0.5.1): the expert bodies as PORTS instead of
+    Constants. Every `_compressed_expert` built with a sink declares its
+    packed u4 codes as a u8 Parameter `<name>/weight_u8` of shape
+    [E, out, groups, group_size/2] -- the same bytes `pack_u4` writes, two
+    codes a byte, even index in the low nibble -- and unpacks them in-graph
+    (`_unpack_u8_to_u4_f32`). The sink collects the Parameters (the model
+    declares them) and the bytes the artifact writer streams to disk, so the
+    runtime can bind one segment's bodies at a time from host memory instead
+    of the compile staging all 144 of them at once (window-050 §4.10).
+
+    The zero-points and scales stay Constants: 3.3 MB and 26 MB a body
+    against 400 MiB of codes."""
+
+    def __init__(self, writer=None):
+        self.params = []                  # the Parameters, in emission order
+        self.bodies = []                  # (port name, shape, np.uint8 bytes or None)
+        # `writer(name, packed_u8)` streams a body to disk as it is produced
+        # and returns whatever the artifact wants recorded (an offset); with
+        # a writer the bytes are NOT retained -- 36 bodies of 400 MiB would
+        # be 14 GiB of host memory for one 12-layer segment otherwise
+        self.writer = writer
+        self.written = []                 # (port name, shape, nbytes, writer's return)
+
+    def declare(self, name, shape, packed):
+        p = op.parameter(list(shape), Type.u8)
+        p.set_friendly_name(name)
+        p.output(0).set_names({name})
+        self.params.append(p)
+        shp = tuple(int(s) for s in shape)
+        if packed is not None:
+            packed = np.ascontiguousarray(packed, dtype=np.uint8)
+            assert packed.size == int(np.prod(shp)), (
+                f"{name}: {packed.size} packed bytes for a port of {shp}")
+        if self.writer is not None and packed is not None:
+            self.written.append((name, shp, int(packed.size), self.writer(name, packed)))
+            self.bodies.append((name, shp, None))
+        else:
+            self.bodies.append((name, shp, packed))
+        return p
+
+
+def _unpack_u8_to_u4_f32(packed, e, out, groups, gs):
+    """[E, out, groups, gs/2] u8 -> [E, out, groups, gs] f32 of the codes,
+    even index from the low nibble, odd from the high -- `pack_u4`'s layout,
+    which is also the C++ unpack (expert_fill.unpack_u4, gguf_repack.cpp:225).
+    Arithmetic in f32, no bitwise op: the GPU plugin runs integer eltwise in
+    f32 anyway (memory: GPU plugin graph contracts), and 0..255 is exact."""
+    x = op.convert(packed, Type.f32)
+    hi = op.floor(op.multiply(x, op.constant(np.array(1.0 / 16.0, np.float32))))
+    lo = op.subtract(x, op.multiply(hi, op.constant(np.array(16.0, np.float32))))
+    both = op.concat([op.unsqueeze(lo, op.constant(np.array(-1, np.int64))),
+                      op.unsqueeze(hi, op.constant(np.array(-1, np.int64)))], axis=-1)
+    return op.reshape(both, op.constant(np.array([e, out, groups, gs], np.int64)),
+                      special_zero=False)
+
+
 def _compressed_expert(arena, e, out, inn, name, filler=None,
-                       layer=None, kind=None):
+                       layer=None, kind=None, port_sink=None):
     """One expert-stacked weight in the tiled lowering's shape.
 
     rank-4 [E, out, groups, group_size] u4 Constant
@@ -660,25 +717,36 @@ def _compressed_expert(arena, e, out, inn, name, filler=None,
     gs = EXPERT_GROUP_SIZE
     assert inn % gs == 0, f"{name}: inner {inn} is not a multiple of group {gs}"
     groups = inn // gs
-    if filler is None:
-        w = arena.constant([e, out, groups, gs], EXPERT_DECLARED_TYPE)
-        zp = arena.constant([e, out, groups, 1], EXPERT_DECLARED_TYPE)
-        scale = op.constant(np.ones((e, out, groups, 1), np.float32))
-    else:
+    pw = pzp = sc = None
+    if filler is not None:
         pw, pzp, sc = filler.body(layer, kind, e, out, inn)
         assert sc.shape == (e, out, groups, 1), (
             f"{name}: filler returned scales {sc.shape}, the constant is "
             f"{(e, out, groups, 1)}")
+    if port_sink is not None:
+        # SEGMENTED: the codes are a u8 PORT, bound by the runtime; only the
+        # zero-points and scales are constants of this segment's graph
+        w = port_sink.declare(name + "/weight_u8", [e, out, groups, gs // 2], pw)
+        x = _unpack_u8_to_u4_f32(w, e, out, groups, gs)
+    elif filler is None:
+        w = arena.constant([e, out, groups, gs], EXPERT_DECLARED_TYPE)
+        w.set_friendly_name(name + "/weight_u4")
+        x = op.convert(w, Type.f32)
+    else:
         w = arena.constant([e, out, groups, gs], EXPERT_DECLARED_TYPE,
                            fill=pw, name=name + "/weight_u4")
+        w.set_friendly_name(name + "/weight_u4")
+        x = op.convert(w, Type.f32)
+    if filler is None:
+        zp = arena.constant([e, out, groups, 1], EXPERT_DECLARED_TYPE)
+        scale = op.constant(np.ones((e, out, groups, 1), np.float32))
+    else:
         zp = arena.constant([e, out, groups, 1], EXPERT_DECLARED_TYPE,
                             fill=pzp, name=name + "/zero_point")
         scale = arena.f32_filled(sc)
         arena.scales[name + "/scale"] = sc
-    w.set_friendly_name(name + "/weight_u4")
     zp.set_friendly_name(name + "/zero_point")
     scale.set_friendly_name(name + "/scale")
-    x = op.convert(w, Type.f32)
     x = op.subtract(x, op.convert(zp, Type.f32))
     x = op.multiply(x, scale)
     x = op.reshape(x, op.constant(np.array([e, out, inn], np.int64)),
@@ -688,7 +756,7 @@ def _compressed_expert(arena, e, out, inn, name, filler=None,
 
 
 def emit_moe_tiled(hidden_bth, config, state, arena, T, tag, filler=None,
-                   layer=None):
+                   layer=None, port_sink=None):
     """The MoE layer in the shape measured to fuse on the card
     (export_mtp.py:401 moe_block_tiled), at real geometry, expert bodies
     slot-referenced. Returns a [1,T,H] node."""
@@ -726,11 +794,11 @@ def emit_moe_tiled(hidden_bth, config, state, arena, T, tag, filler=None,
                       special_zero=False)                              # [E,M,H]
 
     gate_w = _compressed_expert(arena, E, I, H, f"{tag}/experts_gate",
-                                filler, layer, "gate")
+                                filler, layer, "gate", port_sink)
     up_w = _compressed_expert(arena, E, I, H, f"{tag}/experts_up",
-                              filler, layer, "up")
+                              filler, layer, "up", port_sink)
     down_w = _compressed_expert(arena, E, H, I, f"{tag}/experts_down",
-                                filler, layer, "down")
+                                filler, layer, "down", port_sink)
 
     g = op.swish(op.matmul(m_h3, gate_w, transpose_a=False, transpose_b=True))
     u = op.matmul(m_h3, up_w, transpose_a=False, transpose_b=True)
@@ -859,7 +927,7 @@ def _ple_state(arena, config, layer=None, feed=None, census=None):
 def build_serving_shape_ir(config=None, arena=None, n_layers=None,
                            filler=None, feed=None,
                            ngram_chunk_cap_bytes=NGRAM_CHUNK_CAP_BYTES,
-                           rope_span=None):
+                           rope_span=None, layer_range=None, expert_ports=None):
     """The full-geometry serving-shape backbone as an ov::Model, DYNAMIC IN T
     (feed-the-ports increment): no port, reshape or slice carries the block
     length. `T` below is the runtime token count of a forward.
@@ -915,18 +983,58 @@ def build_serving_shape_ir(config=None, arena=None, n_layers=None,
     graph (it is fed) and the n-gram table is bound to the ports at request
     time; both come from the same shards on the driver's side.
 
+    SEGMENTED FORWARD (0.5.1, docs/window-051.md §2). `layer_range=(lo, hi)`
+    emits GLOBAL layers lo..hi-1 as ONE segment of the 48-layer model:
+        segment 0 (lo == 0)      takes `inputs_embeds` [1, T, H] as today
+        a later segment          takes `inputs_embeds` [1, T, hc*H] -- the
+                                 hyper-connection-width hidden state the
+                                 previous segment emitted (the pass looks the
+                                 port up by this name, so the name stays)
+        the last segment         (hi == num_hidden_layers) carries the final
+                                 mixer and the head and emits `logits`
+        every other segment      emits `hidden_out` [1, T, hc*H] f32
+    The PLE (global layer 1) and its n-gram ports exist only in the segment
+    that holds layer 1; the rope tables, `conv_mask`, `attention_mask` and
+    `beam_idx` in every segment; a segment must hold at least one
+    full-attention layer (index 3 mod 4) or the paged transformation refuses
+    it, and this function refuses first, by name. Without `layer_range` the
+    depth cut 0..n_layers-1 with the head is emitted, as before.
+
+    `expert_ports` (an `ExpertPortSink`) turns every expert body of the
+    segment into a u8 PORT (the packed codes) with an in-graph unpack; the
+    sink collects the Parameters and the bytes for the artifact writer.
+
     Returns (model, report) where `report` carries the measured structure.
     """
     cfg = config if config is not None else pwe.real_config()
     T = -1                                 # dynamic: every reshape uses -1
     own_arena = arena is None
     ar = arena if arena is not None else SparseArena()
-    nl = int(n_layers if n_layers is not None else cfg.num_hidden_layers)
+    n_total = int(cfg.num_hidden_layers)
+    depth = int(n_layers if n_layers is not None else n_total)   # the head sits after layer depth-1
+    if layer_range is None:
+        lo, hi = 0, depth
+        first, last = True, True           # the depth cut: head on, whatever hi
+    else:
+        lo, hi = (int(layer_range[0]), int(layer_range[1]))
+        if not (0 <= lo < hi <= depth <= n_total):
+            raise ValueError(f"layer_range {layer_range!r} outside 0..{depth} "
+                             f"(depth {depth} of {n_total})")
+        first, last = lo == 0, hi == depth
+    if layer_range is not None and not any((i % 4) == 3 for i in range(lo, hi)):
+        # a depth cut of 1..3 layers is a legitimate structure build (the
+        # round-trip cell uses one); a SEGMENT without an SDPA is not servable
+        raise ValueError(f"layers {lo}..{hi - 1} hold no full-attention layer "
+                         f"(index 3 mod 4): SDPAToPagedAttention would refuse "
+                         f"the segment; the smallest 4-aligned range is 4 layers")
+    nl = hi - lo
 
     H = cfg.hidden_size
     hc = cfg.hc_count
     V = cfg.vocab_size
     ple_layer_idx = 1                      # GGUF ple.layers [1]; pwe REAL_GEOMETRY
+    has_ple = lo <= ple_layer_idx < hi
+    in_width = H if first else hc * H
     # The Assign nodes of every stateful layer. They are the model's, not a
     # layer's: `ov::Model` takes them as its own argument and a graph whose
     # state is read and never written is not stateful, it is wrong.
@@ -935,18 +1043,22 @@ def build_serving_shape_ir(config=None, arena=None, n_layers=None,
 
     try:
         with shared_constants():
-            inputs_embeds = op.parameter([1, T, H], Type.f32)
+            inputs_embeds = op.parameter([1, T, in_width], Type.f32)
             inputs_embeds.set_friendly_name("inputs_embeds")
             inputs_embeds.output(0).set_names({"inputs_embeds"})
             pid = op.parameter([1, T], Type.i64)
             pid.set_friendly_name("position_ids")
             pid.output(0).set_names({"position_ids"})
-            ple_state, head_dim, Hn = _ple_state(ar, cfg, ple_layer_idx, feed,
-                                                 dense_census)
-            chunk_ids = op.parameter([1, T, Hn], Type.i32)
-            chunk_ids.set_friendly_name("ngram_chunk_ids")
-            local_ids = op.parameter([1, T, Hn], Type.i64)
-            local_ids.set_friendly_name("ngram_local_ids")
+            Hn = (cfg.ngram_size - 1) * cfg.heads_per_ngram
+            head_dim = cfg.ple_embed_dim // Hn
+            ple_state = chunk_ids = local_ids = None
+            if has_ple:
+                ple_state, head_dim, Hn = _ple_state(ar, cfg, ple_layer_idx, feed,
+                                                     dense_census)
+                chunk_ids = op.parameter([1, T, Hn], Type.i32)
+                chunk_ids.set_friendly_name("ngram_chunk_ids")
+                local_ids = op.parameter([1, T, Hn], Type.i64)
+                local_ids.set_friendly_name("ngram_local_ids")
             # the GDN + PLE padding mask, same port q4e.backbone declares
             # (backbone.py:105-106); ones = full sequence
             conv_mask = op.parameter([1, T], Type.f32)
@@ -974,9 +1086,13 @@ def build_serving_shape_ir(config=None, arena=None, n_layers=None,
             # §4.7). The reshape folds it to [1, T, H] -- the identity
             # pre-pass, the seam post-pass.
             emb = op.reshape(inputs_embeds,
-                             op.constant(np.array([1, -1, H], np.int64)),
+                             op.constant(np.array([1, -1, in_width], np.int64)),
                              special_zero=False)
-            hidden = op.tile(emb, op.constant(np.array([1, 1, hc], np.int64)))
+            # segment 0: the H-wide embedding repeated to the hc*H width; a
+            # later segment receives the hc*H-wide state as it left the
+            # previous one -- no tile, no projection, the same bytes
+            hidden = (op.tile(emb, op.constant(np.array([1, 1, hc], np.int64)))
+                      if first else emb)
 
             # the n-gram table: PORTS, one per sub-cap chunk, never a constant
             # (module docstring §4). The host-mmap tier serving reads through
@@ -985,8 +1101,9 @@ def build_serving_shape_ir(config=None, arena=None, n_layers=None,
                           if hasattr(cfg, "ngram_total_vocab")
                           else pwe.REAL_GEOMETRY["ngram_total_vocab"])
             row_bytes = ngram_row_bytes(head_dim)
-            table_ports = ngram_table_ports(ngram_rows, row_bytes,
-                                            ngram_chunk_cap_bytes)
+            table_ports = (ngram_table_ports(ngram_rows, row_bytes,
+                                             ngram_chunk_cap_bytes)
+                           if has_ple else [])
 
             # ONE rope table pair for every full-attention layer, spanning
             # the whole context. It used to be baked per layer for positions
@@ -1002,12 +1119,12 @@ def build_serving_shape_ir(config=None, arena=None, n_layers=None,
             rope_sin.set_friendly_name("rope/sin")
 
             kinds = []
-            for i in range(nl):
+            for i in range(lo, hi):        # GLOBAL layer indices
                 kind = "attn" if (i % 4) == 3 else "gdn"
                 kinds.append(kind)
                 st = _layer_state(ar, cfg, kind, i, feed, dense_census)
 
-                if i == ple_layer_idx:
+                if has_ple and i == ple_layer_idx:
                     # pin 1283: hidden = hidden + ple(...), ADDITIVE
                     gathered = ngram_dequant_iq4nl(
                         ngram_chunked_gather(chunk_ids, local_ids, table_ports),
@@ -1041,35 +1158,56 @@ def build_serving_shape_ir(config=None, arena=None, n_layers=None,
                 h, hyper, inj = _split_combine(hidden, cfg, st,
                                                "mlp_hyper_connection.", T)
                 m = emit_moe_tiled(h, cfg, st, ar, T, f"layer{i}/moe",
-                                   filler=filler, layer=i)
+                                   filler=filler, layer=i, port_sink=expert_ports)
                 hidden = _recombine(hyper, inj, m, cfg, T)
                 hidden.set_friendly_name(f"layer{i}/out")
 
-            # the final mixer, use_combine=False (pin 1493-1496), then lm_head
-            fin = {
-                "hc_norm.weight": ar.f32([hc * H]),
-                "input_mix_weight_down.weight": ar.f32([cfg.hc_lowrank, hc * H]),
-                "input_mix_weight_up.weight": ar.f32([hc * H, cfg.hc_lowrank]),
-            }
-            if feed is not None:
-                _fill_dense(fin, feed, "hyper_connection_mixer.", dense_census)
-            last = qhc.emit_hc(hidden, cfg, fin, None)                  # [1,T,H]
-            head_w = ar.f32([V, H])
-            if feed is not None:
-                _fill_dense({"lm_head.weight": head_w}, feed, "", dense_census)
-            logits = op.matmul(last, qgdn._c(head_w),
-                               transpose_a=False, transpose_b=True)
-            res = op.result(logits)
-            res.set_friendly_name("logits")
+            if last:
+                # the final mixer, use_combine=False (pin 1493-1496), then lm_head
+                fin = {
+                    "hc_norm.weight": ar.f32([hc * H]),
+                    "input_mix_weight_down.weight": ar.f32([cfg.hc_lowrank, hc * H]),
+                    "input_mix_weight_up.weight": ar.f32([hc * H, cfg.hc_lowrank]),
+                }
+                if feed is not None:
+                    _fill_dense(fin, feed, "hyper_connection_mixer.", dense_census)
+                fin_h = qhc.emit_hc(hidden, cfg, fin, None)             # [1,T,H]
+                head_w = ar.f32([V, H])
+                if feed is not None:
+                    _fill_dense({"lm_head.weight": head_w}, feed, "", dense_census)
+                logits = op.matmul(fin_h, qgdn._c(head_w),
+                                   transpose_a=False, transpose_b=True)
+                res = op.result(logits)
+                res.set_friendly_name("logits")
+                res.output(0).set_names({"logits"})
+            else:
+                # the segment boundary: the hc*H-wide state, as is, for the
+                # next segment's `inputs_embeds`
+                res = op.result(hidden)
+                res.set_friendly_name("hidden_out")
+                res.output(0).set_names({"hidden_out"})
 
-            model = Model([res], sinks,
-                          [inputs_embeds, pid, chunk_ids, local_ids, conv_mask,
-                           attn_mask, beam] + table_ports,
-                          "qwen4_exp_serving_shape")
+            params = [inputs_embeds, pid]
+            if has_ple:
+                params += [chunk_ids, local_ids]
+            params += [conv_mask, attn_mask, beam] + table_ports
+            if expert_ports is not None:
+                params += expert_ports.params
+            model = Model([res], sinks, params,
+                          "qwen4_exp_serving_shape" if layer_range is None
+                          else f"qwen4_exp_serving_shape_L{lo}_{hi}")
 
         nodes, const_bytes, counts = pwe.graph_measures(model)
         report = {
             "n_layers": nl,
+            "layer_range": [lo, hi],
+            "segment_first": bool(first),
+            "segment_last": bool(last),
+            "inputs_embeds_width": int(in_width),
+            "has_ple": bool(has_ple),
+            "expert_ports": ([(n, list(s), (int(np.prod(s)) if b is None else int(b.size)))
+                              for n, s, b in expert_ports.bodies]
+                             if expert_ports is not None else []),
             "gdn_layers": kinds.count("gdn"),
             "attn_layers": kinds.count("attn"),
             "seq_len": None,                   # dynamic in T since feed-the-ports
