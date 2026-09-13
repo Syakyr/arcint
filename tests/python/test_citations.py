@@ -36,8 +36,9 @@ This leg is not automatic and cannot be: only a human knows which line a
 sentence meant. It covers the citations that carry contract weight -- the OTD
 handshake, the paged-port inventory, the slice-bytes constant, the slot
 ceiling. `tests/python/test_serving_shape.py` goes further for its own
-inventory and does not write the numbers down at all: `_PAGED_PORTS` derives
-every one of its thirteen citations from an anchor at import.
+inventory and does not write the numbers down at all: its ports table derives
+every one of its citations from an anchor at import, and the number of rows is
+never written either -- every count printed about it is a `len()` of the table.
 
 LEG 2, RESOLVABILITY. The weak, total one. Every `file:line` in tracked prose
 that resolves unambiguously to a file in this repository must point at a line
@@ -130,7 +131,7 @@ _ANCHORED = [
      "src/core/gguf_repack.cpp", "double repack_bound_steps(int32_t ggml_type)"),
     ("tests/python/test_repack_route.py", "design-gguf-native.md:52",
      "docs/design-gguf-native.md", "uses codebooks and sign tables"),
-    ("tests/python/test_repack_route.py", "serving_shape.py:138",
+    ("tests/python/test_repack_route.py", "serving_shape.py:146",
      "tools/q4e/serving_shape.py",
      "shipped tensor is IQ4_NL, which OpenVINO has no element type for"),
 ]

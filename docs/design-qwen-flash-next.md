@@ -1988,3 +1988,51 @@ So amortization stays **1× as a MEASURED input** until that window; the head is
 in hand and the acceptance path is located, the remaining work scoped above
 (gap 2 is convert + nextn-decode-graph engineering of unknown size — located,
 not yet de-risked).
+
+### The paged ports are the load path's own output, not the exporter's (measured 2026-09-13)
+
+A brief called the thirteen paged serving ports the export side's gap, to be
+closed by declaring and feeding them from the emitter. **That premise is void,
+and the correction is cheap rather than expensive.** `load_paged` reads the
+artifact and then runs `ov::pass::SDPAToPagedAttention` over it before it
+compiles (`src/exec/backend_ov.cpp:2574`). Every one of the ports is that
+pass's output. No exporter emits one, and the served artifacts on the fleet do
+not carry any.
+
+Measured both ways the same day, device-free — `read_model`, then the same
+transformation through its Python entry point, on the pinned OpenVINO
+2026.4.0-22849. No compile, no card.
+
+**On the real served hybrid artifact.** Before the pass: four parameters
+(`attention_mask`, `inputs_embeds`, `position_ids` at rank 3, `beam_idx`) and
+128 Variables — 48 of rank 3 `[?, 10240, 4]` (the GDN short conv), 48 of rank 4
+`[?, 48, 128, 128]` (the GDN recurrent state), 32 of rank 4 `[?, 4, ?, 256]`
+(attention K and V); ops include `ReadValue` 128, `Assign` 128,
+`ScaledDotProductAttention` 16. After the pass: 139 parameters — the full port
+contract, `conv_state_table.N` ×48, `gated_delta_state_table.N` ×48,
+`key_cache.N` ×16, `value_cache.N` ×16 and the nine index ports — carried by
+`PagedAttentionExtension` ×16, `PagedCausalConv1D` ×48, `PagedGatedDeltaNet`
+×48. The rank-3/rank-4 split is the one `load_paged` reads off the *stateful*
+graph at `:2557-2569`, before the pass runs, precisely because the transformed
+ports leave those dims dynamic.
+
+**On this repository's own serving-shape emitter.** Parameters `input_ids`,
+`position_ids`, `ngram_row_ids`, `conv_mask`; **zero Variables**; no op the
+pass converts. The pass refuses by name before it examines anything else:
+`Check '!model->get_variables().empty()' failed at
+src/core/src/pass/sdpa_to_paged_attention.cpp:75`.
+
+So the work the ports name is not thirteen parameter declarations. It is three
+constructs in the **stateful** graph — a rank-3 Variable per GDN short conv, a
+rank-4 Variable per GDN recurrent state, and a `ScaledDotProductAttention` over
+a rank-4 KV Variable — plus the parameter surface the served artifact carries
+(`inputs_embeds` rather than an inline embedding gather, `position_ids` at rank
+3, `attention_mask`, `beam_idx`). The ports follow from those by a pass arcint
+already runs; none of them is written by hand.
+
+Recorded in the suite as a table, not as prose: `_PAGED_PORT_TABLE` in
+`tests/python/test_serving_shape.py` carries one row per port with its status,
+its C++ citation resolved from an anchor, and the construct that produces it.
+Both the umbrella strict xfail and the inventory cell read that table and
+nothing else, so a port landing is one edit to its `status` column in the same
+commit as the port, and the row count is never written down anywhere.

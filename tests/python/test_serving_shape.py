@@ -49,6 +49,19 @@ first failure named exactly is worth more than a success.
 arcint actually exports -- pattern, not type name -- and its figures are
 cross-checked against `src/exec/flash_next_offload.h:45`
 (kFlashNextSliceBytes = 2,457,600 B per expert-layer for gate+up+down).
+
+WHAT THIS FILE FOUND SECOND (2026-09-13), and it is a correction TO THIS FILE:
+
+the paged serving ports are not something an exporter emits. `load_paged` runs
+`ov::pass::SDPAToPagedAttention` over the artifact it just read, before it
+compiles (backend_ov.cpp:2574), and every one of the ports in the table below
+is that pass's output -- measured both ways, on the real served artifact and on
+this emitter's own, in the block above `paged_census`. The cells here used to
+check the emitter's parameter list against the table and call the gap "NOT
+emitted"; they now run the pass and check what it produces. The gap is real and
+it is bigger than it read: this IR carries none of the three constructs the
+pass converts, and the pass refuses by name at
+`sdpa_to_paged_attention.cpp:75` before it looks at anything else.
 """
 import math
 import os
@@ -63,6 +76,11 @@ sys.path.insert(0, str(REPO_ROOT / "tools"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import openvino as ov  # noqa: E402
+# THE pass `load_paged` runs before it compiles (backend_ov.cpp:2574 registers
+# `ov::pass::SDPAToPagedAttention`); this is its Python entry point, and the
+# cells below run it rather than describing what it would do.
+from openvino._offline_transformations import (  # noqa: E402
+    paged_attention_transformation)
 
 from q4e import piecewise_export as pwe  # noqa: E402
 from q4e import serving_shape as ss  # noqa: E402
@@ -537,7 +555,7 @@ def cite(anchor, path=None):
     """`<file>:<line>` for the ONE line of `path` that contains `anchor`.
 
     CF-COUNTS (REVIEW 2a45349 F4). The table below used to write its line
-    numbers out by hand, and three of the thirteen had drifted by one line:
+    numbers out by hand, and three of its rows had drifted by one line:
     `gated_delta_state_table.` was written :3196 where the prefix test is at
     :3195, and `key_cache.` / `value_cache.` were both written :3200 where it
     is at :3199 (:3200 is the `is_value` line underneath). Nothing was wrong
@@ -563,78 +581,120 @@ def cite(anchor, path=None):
     return f"{p.name}:{hits[0]}"
 
 
-# (port prefix, the CODE that classifies or feeds it). The file:line in the
-# printed inventory is derived from the second column by `cite`, never typed.
-_PAGED_PORT_ANCHORS = (
+# THE PORTS TABLE -- ONE RECORDED TABLE, AND BOTH CELLS BELOW READ IT.
+#
+# Every fact about the paged gap lives here and nowhere else in this suite: the
+# port, whether the emitter produces it yet, which of the two C++ sites names
+# it, and WHICH CONSTRUCT of the stateful graph the transformation turns into
+# it. A port landing is ONE edit to the `status` column plus that port's live
+# cells; the inventory cell and the umbrella xfail follow by construction and
+# neither can rot against the other. The count of rows is never written down --
+# every count in this section is `len()` of some slice of this table -- so the
+# count-drift class that cost REVIEW 2a45349 F4 three wrong line numbers cannot
+# recur in the other direction either.
+ABSENT, PRESENT = "absent", "present"
+
+# The `produced by` column, named once each so the rows stay readable. These
+# are not descriptions: they are what the pass was MEASURED to do, below.
+_BY_SDPA = ("ScaledDotProductAttention over a rank-4 KV Variable"
+            " -> PagedAttentionExtension")
+_BY_CONV = "a rank-3 Variable (GDN short-conv state) -> PagedCausalConv1D"
+_BY_GDN = "a rank-4 Variable (GDN recurrent state) -> PagedGatedDeltaNet"
+_BY_PA_INDEX = "PagedAttentionExtension's own index ports"
+_BY_LA_INDEX = ("the linear-attention conversions' index ports"
+                " (PagedCausalConv1D / PagedGatedDeltaNet)")
+
+# port prefix | status | site | anchor: the CODE that classifies or feeds it |
+# produced by | how many of it the served IR carries (census below).
+# The file:line in every printed inventory is derived from the anchor by
+# `cite`, never typed.
+_PAGED_PORT_TABLE = (
     # classified by name prefix at load time
-    ("conv_state_table.", 'name.rfind("conv_state_table.", 0) == 0'),
-    ("gated_delta_state_table.", 'name.rfind("gated_delta_state_table.", 0) == 0'),
-    ("key_cache.",
-     'name.rfind("key_cache.", 0) == 0 || name.rfind("value_cache.", 0) == 0'),
-    ("value_cache.",
-     'name.rfind("key_cache.", 0) == 0 || name.rfind("value_cache.", 0) == 0'),
+    ("conv_state_table.", ABSENT, "classify",
+     'name.rfind("conv_state_table.", 0) == 0', _BY_CONV, 48),
+    ("gated_delta_state_table.", ABSENT, "classify",
+     'name.rfind("gated_delta_state_table.", 0) == 0', _BY_GDN, 48),
+    ("key_cache.", ABSENT, "classify",
+     'name.rfind("key_cache.", 0) == 0 || name.rfind("value_cache.", 0) == 0',
+     _BY_SDPA, 16),
+    ("value_cache.", ABSENT, "classify",
+     'name.rfind("key_cache.", 0) == 0 || name.rfind("value_cache.", 0) == 0',
+     _BY_SDPA, 16),
     # fed every forward
-    ("past_lens", 'set_i32("past_lens"'),
-    ("subsequence_begins", 'set_i32("subsequence_begins"'),
-    ("block_indices", 'set_i32("block_indices"'),
-    ("block_indices_begins", 'set_i32("block_indices_begins"'),
-    ("max_context_len", 'set_i32("max_context_len"'),
-    ("la.block_indices", 'set_i32("la.block_indices"'),
-    ("la.block_indices_begins", 'set_i32("la.block_indices_begins"'),
-    ("la.past_lens", 'set_i32("la.past_lens"'),
-    ("la.cache_interval", 'set_i32("la.cache_interval"'),
+    ("past_lens", ABSENT, "feed",
+     'set_i32("past_lens"', _BY_PA_INDEX, 1),
+    ("subsequence_begins", ABSENT, "feed",
+     'set_i32("subsequence_begins"', _BY_PA_INDEX, 1),
+    ("block_indices", ABSENT, "feed",
+     'set_i32("block_indices"', _BY_PA_INDEX, 1),
+    ("block_indices_begins", ABSENT, "feed",
+     'set_i32("block_indices_begins"', _BY_PA_INDEX, 1),
+    ("max_context_len", ABSENT, "feed",
+     'set_i32("max_context_len"', _BY_PA_INDEX, 1),
+    ("la.block_indices", ABSENT, "feed",
+     'set_i32("la.block_indices"', _BY_LA_INDEX, 1),
+    ("la.block_indices_begins", ABSENT, "feed",
+     'set_i32("la.block_indices_begins"', _BY_LA_INDEX, 1),
+    ("la.past_lens", ABSENT, "feed",
+     'set_i32("la.past_lens"', _BY_LA_INDEX, 1),
+    ("la.cache_interval", ABSENT, "feed",
+     'set_i32("la.cache_interval"', _BY_LA_INDEX, 1),
 )
 
-_PAGED_PORTS = [(port, cite(anchor)) for port, anchor in _PAGED_PORT_ANCHORS]
+# The same rows with the citation resolved. `cite` asserts at import that each
+# anchor still identifies exactly one line of the C++, so a table row that has
+# lost its code cannot survive collection.
+_PAGED_PORTS = [
+    {"port": port, "status": status, "site": site, "cite": cite(anchor),
+     "produced_by": by, "served_count": served}
+    for port, status, site, anchor, by, served in _PAGED_PORT_TABLE
+]
+_PAGED_ABSENT = [r for r in _PAGED_PORTS if r["status"] == ABSENT]
+_PAGED_PRESENT = [r for r in _PAGED_PORTS if r["status"] == PRESENT]
+
+
+def _declares(port, names):
+    """Does a port-name set satisfy a table row? A prefix row (`key_cache.`)
+    is satisfied by any name that starts with it; a whole-name row by equality.
+    This is the same predicate the C++ classifies with (`rfind(p, 0) == 0`)."""
+    return any(n == port or n.startswith(port) for n in names)
 
 
 def test_the_paged_port_citations_resolve_to_the_code_they_name():
-    """The anchors above must each still identify exactly one line -- `cite`
-    asserts that as it builds `_PAGED_PORTS`, so this cell mostly documents the
-    result and prints it. It also pins the two facts the inventory depends on:
-    thirteen ports, and the two classification sites they fall into."""
-    assert len(_PAGED_PORTS) == len(_PAGED_PORT_ANCHORS)
-    lines = sorted(int(c.split(":")[1]) for _, c in _PAGED_PORTS)
+    """The anchors in the table must each still identify exactly one line --
+    `cite` asserts that as it builds `_PAGED_PORTS`, so this cell documents the
+    result and prints it. It also pins the fact the inventory depends on: the
+    table's two sites are the C++'s two sites, and each row sits in the one it
+    claims."""
     print("\n[contract-cite] paged-port citations, resolved from anchors:")
-    for port, c in _PAGED_PORTS:
-        print(f"  {port:28s} {c}")
-    classify = [ln for ln in lines if ln < 5000]
-    feed = [ln for ln in lines if ln >= 5000]
-    print(f"[contract-cite] classified at {min(classify)}-{max(classify)}, "
-          f"fed at {min(feed)}-{max(feed)}")
-    assert len(classify) == 4 and len(feed) == 9, (
-        f"{len(classify)} classified / {len(feed)} fed; the inventory's two "
-        f"sites moved and the split above is no longer the document's")
+    for r in _PAGED_PORTS:
+        print(f"  {r['port']:28s} {r['cite']:22s} {r['status']:8s} {r['site']}")
+    # The split is checked by READING the C++ line each row resolved to rather
+    # than by counting the table's own `site` column against itself: the column
+    # is the claim, the line number is the evidence, and a row that drifts from
+    # one site to the other has to be noticed here.
+    by_site = {}
+    for r in _PAGED_PORTS:
+        by_site.setdefault(r["site"], []).append(int(r["cite"].split(":")[1]))
+    classify, feed = sorted(by_site["classify"]), sorted(by_site["feed"])
+    print(f"[contract-cite] {len(classify)} classified at "
+          f"{min(classify)}-{max(classify)}, {len(feed)} fed at "
+          f"{min(feed)}-{max(feed)}")
+    assert max(classify) < min(feed), (
+        f"a 'classify' row resolved below a 'feed' row (classify "
+        f"{classify}, feed {feed}); the inventory's two sites moved and the "
+        f"table's site column is no longer the document's")
 
 
-# WHAT THE PAGED GAP IS, COUNTED -- because a brief described it as "the 13
-# strict-xfails" and that is not the shape of it (measured 2026-09-13: the whole
-# suite carries TWO `xfail(strict=True)` decorators, one here and one in
-# test_moe_block.py, and every matrix row reads `2 xfailed`):
-#
-#   * THIRTEEN PORTS, in `_PAGED_PORTS`, each citation resolved from an anchor
-#     at import -- 4 classified at backend_ov.cpp:3191-3199, 9 fed at :6141-6151.
-#   * ONE strict xfail over all thirteen: `test_the_paged_port_contract_is_
-#     satisfied` is all-or-nothing, so it retires on the commit that lands the
-#     LAST port, not the first.
-#   * AND `test_the_paged_gap_is_inventoried_precisely` asserts every one of the
-#     thirteen is still absent. So THE FIRST PORT THAT LANDS REDS THAT CELL.
-#     That is deliberate -- it is the "promote instead of forget" rule -- but it
-#     means a per-port march updates the inventory cell in the same commit as
-#     each port, and a reader planning "kill one xfail per commit" should know
-#     there is one xfail here and thirteen ports.
-#
-# AND WHY THESE THIRTEEN ARE THE BOOT BLOCKER, read out of the C++ 2026-09-13,
-# because the question "can a shallow boot run before the ports exist" is worth
-# a definite answer: there is no non-paged forward to boot into.
+# WHY THESE PORTS ARE THE BOOT, read out of the C++ 2026-09-13, because the
+# question "can a shallow boot run before the ports exist" is worth a definite
+# answer: there is no non-paged forward to boot into.
 #
 #   * the backend compiles the served IR as `paged_model_`
 #     (backend_ov.cpp:2965) and every lane's request comes from it (:3019);
-#   * the forward at :6141-6151 sets `past_lens`, `subsequence_begins`,
-#     `block_indices`, `block_indices_begins`, `max_context_len`,
-#     `la.block_indices`, `la.block_indices_begins`, `la.past_lens` and
-#     `la.cache_interval` UNCONDITIONALLY -- nine `set_tensor` calls with no
-#     branch, which is the nine "fed" citations of this inventory;
+#   * the forward at :6141-6151 sets the table's nine "feed" rows
+#     UNCONDITIONALLY -- `set_tensor` calls with no branch, which is what those
+#     rows' citations resolve to;
 #   * `ov::InferRequest::set_tensor` on a name the compiled model does not
 #     declare throws. A static full-sequence IR therefore cannot be served by
 #     this path at any depth, shallow included.
@@ -644,36 +704,146 @@ def test_the_paged_port_citations_resolve_to_the_code_they_name():
 # (`test_the_cpp_type_name_matcher_finds_nothing_and_the_line_is_named`) was
 # withdrawn as a blocker: it changes a log line, these change whether a forward
 # can be issued at all.
+#
+# ---------------------------------------------------------------------------
+# HOW A PORT IS MADE -- measured 2026-09-13, and it corrects this file
+# ---------------------------------------------------------------------------
+#
+# This section used to test `report["inputs"]` -- the parameters of the model
+# the emitter returns -- against the table, and the xfail's own reason said the
+# ports are "NOT emitted", as if emitting them were the export side's job. THAT
+# WAS WRONG ABOUT WHO MAKES THEM, and the error was load-bearing: it pointed a
+# whole item's work at hand-declaring a list of parameters.
+#
+# `load_paged` reads the artifact and then runs a pass over it before compiling
+# (backend_ov.cpp:2574, `ov::pass::SDPAToPagedAttention`). EVERY PORT IN THE
+# TABLE IS THAT PASS'S OUTPUT. Measured on the real served artifact, dev host,
+# 2026-09-13, OV 2026.4.0-22849 -- `read_model`, then the same transformation,
+# device-free, no compile and no card:
+#
+#     openvino_language_model.xml of the served hybrid agent model
+#     BEFORE: 4 parameters -- attention_mask [?,?] i64, inputs_embeds
+#             [?,?,5120] f32, position_ids [4,?,?] i64, beam_idx [?] i32
+#             128 Variables: 48 rank-3 [?,10240,4]   (GDN short conv)
+#                            48 rank-4 [?,48,128,128] (GDN recurrent state)
+#                            32 rank-4 [?,4,?,256]    (attention K and V)
+#             ops: ReadValue 128, Assign 128, ScaledDotProductAttention 16
+#     AFTER : 139 parameters -- conv_state_table.N x48,
+#             gated_delta_state_table.N x48, key_cache.N x16, value_cache.N x16,
+#             and past_lens / subsequence_begins / block_indices /
+#             block_indices_begins / max_context_len / la.block_indices /
+#             la.block_indices_begins / la.past_lens / la.cache_interval
+#             ops: PagedAttentionExtension 16, PagedCausalConv1D 48,
+#                  PagedGatedDeltaNet 48
+#
+# That is the `produced by` column of the table above, and the `served_count`
+# column is the multiplicity in that same reading. The rank-3/rank-4 split is
+# the one `load_paged` itself reads off the STATEFUL graph at :2557-2569, which
+# is why it must be read before the pass runs -- the transformed ports leave
+# those dims dynamic.
+#
+# The converse, on this emitter's own output, same day and same method:
+#
+#     serving-shape IR, 8 layers, T=8
+#     parameters: input_ids, position_ids, ngram_row_ids, conv_mask
+#     Variables : 0        convertible ops: none
+#     the pass REFUSES, by name:
+#       RuntimeError: Check '!model->get_variables().empty()' failed at
+#       src/core/src/pass/sdpa_to_paged_attention.cpp:75
+#
+# So the gap is not a set of missing parameters. It is that this IR carries
+# NONE OF THE THREE CONSTRUCTS the pass converts, and the pass says so by name
+# before it looks at anything else. `test_the_paged_gap_is_inventoried_
+# precisely` below asserts THE TABLE against what the pass actually produces,
+# and prints that refusal verbatim while it stands.
+#
+# ONE xfail over all the rows: `test_the_paged_port_contract_is_satisfied` is
+# all-or-nothing, so it retires on the commit that lands the LAST port, not the
+# first -- and the inventory cell reds on any port whose real state stops
+# matching its `status` column, in either direction. A port landing is one edit
+# to that column in the same commit as the port.
+
+
+@pytest.fixture(scope="module")
+def paged_census():
+    """The ports that exist after THE PASS ARCINT ITSELF RUNS.
+
+    Its own build and its own arena: `paged_attention_transformation` mutates
+    the model in place, and the `built` fixture is module-scoped and shared, so
+    transforming that one would hand every later cell a different graph than it
+    asked for.
+    """
+    arena = ss.SparseArena()
+    try:
+        model, _ = ss.build_serving_shape_ir(
+            seq_len=_T, arena=arena, n_layers=_CONTRACT_LAYERS)
+        before = {p.get_node().get_friendly_name() for p in model.inputs}
+        variables = len(model.get_variables())
+        refusal, after = None, before
+        try:
+            paged_attention_transformation(model)
+        except Exception as exc:                                  # noqa: BLE001
+            refusal = f"{type(exc).__name__}: {str(exc).strip().splitlines()[0]}"
+        else:
+            after = {p.get_node().get_friendly_name() for p in model.inputs}
+        hist = {}
+        for node in model.get_ordered_ops():
+            hist[node.get_type_name()] = hist.get(node.get_type_name(), 0) + 1
+        paged_ops = {k: v for k, v in sorted(hist.items())
+                     if k.startswith("Paged")}
+        yield {"before": before, "after": after, "variables": variables,
+               "refusal": refusal, "paged_ops": paged_ops}
+    finally:
+        arena.close()
+
+
 @pytest.mark.xfail(strict=True, reason=(
-    "the serving-shape IR is the STATIC full-sequence shape, not the paged "
-    "one. The paged port contract (conv_state_table.N / "
-    "gated_delta_state_table.N / key_cache.N / value_cache.N / la.* -- "
-    "backend_ov.cpp:3191-3199 and :6141-6151) is NOT emitted. strict=True: "
-    "the day it is, this cell fails and gets promoted instead of forgotten."))
-def test_the_paged_port_contract_is_satisfied(built):
-    model, report, _ = built
-    names = {n for n, _, _ in report["inputs"]}
-    missing = [(p, cite) for p, cite in _PAGED_PORTS
-               if not any(n == p or n.startswith(p) for n in names)]
+    "the serving-shape IR is the STATIC full-sequence shape: no Variables, no "
+    "ScaledDotProductAttention, so ov::pass::SDPAToPagedAttention -- the pass "
+    "backend_ov.cpp:2574 runs before it compiles -- produces none of the {n} "
+    "paged ports the table records, and refuses by name before it tries. "
+    "strict=True: the day the table's last row reads 'present', this cell "
+    "fails and gets promoted instead of forgotten."
+).format(n=len(_PAGED_PORTS)))
+def test_the_paged_port_contract_is_satisfied(paged_census):
+    missing = [r for r in _PAGED_PORTS
+               if not _declares(r["port"], paged_census["after"])]
     assert not missing, (
-        "paged ports absent from the serving-shape IR:\n"
-        + "\n".join(f"  {p:28s} fed at {cite}" for p, cite in missing))
+        "paged ports the transformation does not produce from this IR:\n"
+        + "\n".join(f"  {r['port']:28s} fed at {r['cite']:22s} would come from "
+                    f"{r['produced_by']}" for r in missing)
+        + (f"\nthe pass refused: {paged_census['refusal']}"
+           if paged_census["refusal"] else ""))
 
 
-def test_the_paged_gap_is_inventoried_precisely(built):
-    """The xfail above proves the gap; this cell PRINTS it, so a reader of the
-    log knows exactly which thirteen ports stand between this IR and a paged
-    forward, and where each one is fed."""
-    _, report, _ = built
-    names = {n for n, _, _ in report["inputs"]}
-    missing = [(p, c) for p, c in _PAGED_PORTS if p not in names]
-    print("\n[contract-paged] ports the paged forward feeds that this IR "
-          "does not declare:")
-    for p, c in missing:
-        print(f"  {p:28s} {c}")
-    assert len(missing) == len(_PAGED_PORTS), (
-        "some paged ports appeared; update the xfail above rather than this "
-        "inventory")
+def test_the_paged_gap_is_inventoried_precisely(paged_census):
+    """THE TABLE IS THE ASSERTION. Every row marked `present` must really be
+    produced, every row marked `absent` must really be missing -- so the first
+    port that lands reds this cell until its row is flipped, and a row flipped
+    ahead of its port reds it too. The xfail above proves the whole gap; this
+    cell is what keeps the table honest one row at a time."""
+    produced = {r["port"]: _declares(r["port"], paged_census["after"])
+                for r in _PAGED_PORTS}
+    print(f"\n[contract-paged] the pass produced "
+          f"{len(paged_census['after'] - paged_census['before'])} new "
+          f"parameter(s) from {paged_census['variables']} Variable(s); "
+          f"paged ops: {paged_census['paged_ops'] or 'none'}")
+    if paged_census["refusal"]:
+        print(f"[contract-paged] the pass REFUSED: {paged_census['refusal']}")
+    for r in _PAGED_PORTS:
+        mark = "yes" if produced[r["port"]] else "no "
+        print(f"  {r['port']:28s} table={r['status']:8s} produced={mark} "
+              f"{r['cite']:22s} {r['produced_by']}")
+    wrong = [(r, produced[r["port"]]) for r in _PAGED_PORTS
+             if produced[r["port"]] != (r["status"] == PRESENT)]
+    assert not wrong, (
+        "the ports table disagrees with what the transformation produces:\n"
+        + "\n".join(
+            f"  {r['port']:28s} table says {r['status']}, pass "
+            f"{'produces' if got else 'does not produce'} it"
+            for r, got in wrong)
+        + "\nedit the `status` column of _PAGED_PORT_TABLE in the same commit "
+          "as the port, rather than either cell.")
 
 
 # ---------------------------------------------------------------------------

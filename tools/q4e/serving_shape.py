@@ -102,14 +102,22 @@ module emits byte-identical in STRUCTURE to the ones the parity suites gate.
   Nothing here may be used to make a parity claim, and the contract test
   asserts structure and shape only. The numeric gates live in the per-piece
   suites, on real fed tensors.
-* It is not the paged serving graph. The served forward's port contract
+* It is not the paged serving graph, and the reason is not that the paged
+  ports are unwritten. NOBODY WRITES THEM: `load_paged` runs
+  `ov::pass::SDPAToPagedAttention` over the artifact it has just read
+  (`backend_ov.cpp:2574`) and that pass produces the whole port contract
   (`conv_state_table.N`, `gated_delta_state_table.N`, `key_cache.N`,
-  `value_cache.N`, `position_ids`, `la.block_indices`,
-  `la.block_indices_begins`, `la.past_lens`, `la.cache_interval` --
-  `backend_ov.cpp:3191-3199` and `backend_ov.cpp:6141-6151`) is NOT emitted
-  here; this is the static full-sequence shape the piecewise work validates.
-  The contract test names that gap with a STRICT xfail so it fails loudly the
-  day it closes rather than passing silently while it is open.
+  `value_cache.N`, `la.*` and the index ports -- `backend_ov.cpp:3191-3199`
+  and `:6141-6151`) out of three constructs of the STATEFUL graph: a rank-3
+  Variable per GDN short conv, a rank-4 Variable per GDN recurrent state, and
+  a ScaledDotProductAttention over a rank-4 KV Variable. Measured both ways
+  2026-09-13; the reading is in `tests/python/test_serving_shape.py` beside
+  the ports table. What this module emits carries none of the three -- it is
+  the static full-sequence shape the piecewise work validates, with no
+  Variables at all, so the pass refuses it by name
+  (`sdpa_to_paged_attention.cpp:75`, "model->get_variables().empty()"). The
+  contract test names that gap with a STRICT xfail so it fails loudly the day
+  it closes rather than passing silently while it is open.
 * The PLE n-gram table is declared as a Constant here so that the gather has
   something to index. In SERVING it is the host-mmap tier, read through
   `src/exec/ngram_table.h` (Link 3) and `src/exec/ngram_gather.h`, never an
