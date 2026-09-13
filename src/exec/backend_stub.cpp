@@ -121,7 +121,7 @@ public:
         using clock = std::chrono::steady_clock;
 
         const auto prefill_start = clock::now();
-        const auto prompt_ids    = tokenizer_.encode(in.prompt);
+        const auto prompt_ids    = in.prompt_ids.empty() ? tokenizer_.encode(in.prompt) : in.prompt_ids;
         stats.prompt_tokens      = static_cast<int>(prompt_ids.size());
         stats.prefill_seconds =
             std::chrono::duration<double>(clock::now() - prefill_start).count();

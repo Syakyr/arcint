@@ -50,6 +50,13 @@ struct ChatRequest {
 struct CompletionRequest {
     std::string      model;
     std::string      prompt;
+    // A token-id prompt (`prompt: [760, 6511, ...]`, the OpenAI array form),
+    // fed to the model as given, never re-tokenised. FULL-DEPTH (2026-09-13):
+    // the KLD gate replays the reference capture's own token windows
+    // (tools/kld_served.py), and a text round-trip through the tokenizer
+    // cannot promise the same ids at a window boundary. One sequence, as
+    // before; batches stay refused.
+    std::vector<int> prompt_ids;
     bool             stream = false;
     bool             echo   = false;
     bool             stream_include_usage = true;

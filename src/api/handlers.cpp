@@ -514,13 +514,18 @@ namespace {
 
 std::optional<HttpResult> finish_prepare(const Context& ctx, const std::string& prompt,
                                          const SamplerOverrides& overrides,
-                                         GenerationInput& input, int& prompt_tokens) {
+                                         GenerationInput& input, int& prompt_tokens,
+                                         const std::vector<int>& prompt_ids = {}) {
     SamplerParams sampler = sampler_from_defaults(ctx.backend->status().sampler_defaults);
     if (auto err = sampler_apply(sampler, overrides)) {
         return HttpResult{400, invalid_request(*err)};
     }
 
-    prompt_tokens = static_cast<int>(ctx.backend->tokenizer().encode(prompt).size());
+    // A token-id prompt is counted as given; a text prompt is tokenised once
+    // here for the count (the backend tokenises it again for the forward).
+    prompt_tokens = prompt_ids.empty()
+                        ? static_cast<int>(ctx.backend->tokenizer().encode(prompt).size())
+                        : static_cast<int>(prompt_ids.size());
 
     // DESIGN.md §3.8 — reject, with the numbers. No truncation, no shift.
     const int n_ctx = effective_n_ctx(ctx);
@@ -528,8 +533,9 @@ std::optional<HttpResult> finish_prepare(const Context& ctx, const std::string& 
         return HttpResult{400, context_overflow(prompt_tokens, n_ctx)};
     }
 
-    input.prompt  = prompt;
-    input.sampler = std::move(sampler);
+    input.prompt     = prompt;
+    input.prompt_ids = prompt_ids;
+    input.sampler    = std::move(sampler);
     return std::nullopt;
 }
 
@@ -595,7 +601,8 @@ std::optional<HttpResult> prepare_completion(const Context& ctx, const json& bod
     PreparedCompletion prep;
     prep.req = std::move(req);
     if (auto err =
-            finish_prepare(ctx, prep.req.prompt, prep.req.sampler, prep.input, prep.prompt_tokens)) {
+            finish_prepare(ctx, prep.req.prompt, prep.req.sampler, prep.input, prep.prompt_tokens,
+                           prep.req.prompt_ids)) {
         return err;
     }
 

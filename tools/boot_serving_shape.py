@@ -117,6 +117,16 @@ def main(argv=None):
                     help="after the served forward's first refusal, continue "
                          "with input_ids in place of inputs_embeds (LABELLED)")
     ap.add_argument("--paged-kv", default=PAGED_KV_DEFAULT)
+    ap.add_argument("--artifact", default=None,
+                    help="FULL-DEPTH: instead of building, read the language "
+                         "model of this ARTIFACT DIRECTORY (tools/export_serving_"
+                         "artifact.py) -- the exact bytes the served binary "
+                         "loads -- and run the same stages over it. --shards "
+                         "still supplies the table and the embedding rows")
+    ap.add_argument("--zeros", type=int, default=0,
+                    help="prompt = this many tokens of id 0 (the served "
+                         "activation probe's own feed, backend_ov.cpp "
+                         "`embed_paged(lane, zeros)`); overrides --ids")
     ap.add_argument("--cut", default=None,
                     help="LOCALISER: after the pass, keep only the graph up to "
                          "the node with this friendly name (a Result is put on "
@@ -129,6 +139,8 @@ def main(argv=None):
     from q4e import serving_shape as ss
 
     ids = parse_ids(args.ids)
+    if args.zeros:
+        ids = [0] * int(args.zeros)
     if not ids:
         ids = list(range(1000, 1008))
     T = len(ids)                       # the FEED's length; the graph is dynamic
@@ -148,14 +160,52 @@ def main(argv=None):
         say("shards", f"feed over {args.shards} in {time.time() - t0:.1f}s; "
                       f"REAL WEIGHTS for every layer built")
     t0 = time.time()
-    try:
-        model, rep = ss.build_serving_shape_ir(arena=arena, n_layers=args.layers,
-                                               filler=filler, feed=feed_)
-    except Exception as exc:                                      # noqa: BLE001
-        say("build", "FAIL " + one_line(exc))
-        arena.close()
-        return 0
-    if feed_ is not None:
+    if args.artifact:
+        # the served binary's own bytes: read, not built. The report is
+        # composed from the model and the artifact's manifest so every later
+        # stage reads the same keys.
+        import json
+        core0 = ov.Core()
+        xml = str(Path(args.artifact) / "openvino_language_model.xml")
+        try:
+            model = core0.read_model(xml)
+        except Exception as exc:                                  # noqa: BLE001
+            say("build", "READ FAIL " + one_line(exc))
+            arena.close()
+            return 0
+        man = {}
+        try:
+            man = json.loads((Path(args.artifact) / "serving-shape.json").read_text())
+        except Exception:                                         # noqa: BLE001
+            pass
+        tports = [p for p in model.get_parameters()
+                  if p.get_friendly_name().startswith("ngram_table.")]
+        rep = {
+            "n_layers": man.get("layers", args.layers), "gdn_layers": man.get("gdn_layers", -1),
+            "attn_layers": man.get("attn_layers", -1), "nodes": len(model.get_ordered_ops()),
+            "graph_const_bytes": 0,
+            "ngram_table_rows": man.get("ngram_table_rows", sum(dims(p.output(0))[0] for p in tports)),
+            "ngram_row_bytes": man.get("ngram_row_bytes", dims(tports[0].output(0))[1] if tports else 0),
+            "ngram_chunk_cap_bytes": man.get("ngram_chunk_cap_bytes", 0),
+            "ngram_table_ports": [(p.get_friendly_name(), dims(p.output(0))[0],
+                                   dims(p.output(0))[0] * dims(p.output(0))[1]) for p in tports],
+            "inputs": [(p.get_node().get_friendly_name(), dims(p), str(p.get_element_type()))
+                       for p in model.inputs],
+            "outputs": [(r.get_node().get_friendly_name(), dims(r), str(r.get_element_type()))
+                        for r in model.outputs],
+        }
+        say("build", f"ARTIFACT {xml} read in {time.time() - t0:.2f}s (tree "
+                     f"{man.get('tree', '?')}, written {man.get('written_utc', '?')}); "
+                     f"the served binary's bytes, not a build")
+    else:
+        try:
+            model, rep = ss.build_serving_shape_ir(arena=arena, n_layers=args.layers,
+                                                   filler=filler, feed=feed_)
+        except Exception as exc:                                  # noqa: BLE001
+            say("build", "FAIL " + one_line(exc))
+            arena.close()
+            return 0
+    if feed_ is not None and not args.artifact:
         dense = rep["dense_fill_census"]
         say("shards", f"dense fill: {len(dense)} tensors, "
                       f"{sum(b for _, b in dense) / 2 ** 30:.2f} GiB written; "

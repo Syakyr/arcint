@@ -22,6 +22,40 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
 Requires `marfrit-openvino 2026.4.0~dev20260821+p15` (patches 0003–0033) —
 unchanged from 0.4.7. No plugin patch.
 
+### The serving-shape IR as an artifact directory, and the served path on it (2026-09-13)
+
+`tools/export_serving_artifact.py` writes what `load_artifact` requires from
+the serving-shape IR at a chosen depth with real weights: the language model
+(`compress_to_fp16=False`), a T-dynamic embedding model from `token_embd`, the
+tokenizer files passed through from the qwen3.8 artifact after an id-for-id
+comparison against the GGUF's own token list (0 of 248,077 disagree), the
+GGUF's chat template, a `config.json` at the real geometry with the n-gram
+keys and the hash-boundary eos the GGUF declares under
+`qwen4exp.ple.eos_token_id` (248044 — not `tokenizer.ggml.eos_token_id`,
+which is `<|im_end|>`), and a `serving-shape.json` manifest. The depth-4
+artifact is allowlisted as `qwen3.8-flash-next-d4` (`qwen38-flash-next-d4-ov`),
+hashes read off the dev-host directory; a measurement artifact, not the
+model's answers.
+
+Three things the served path needed that the probe had not: `--ngram-gguf FILE`
+opens one shard for `per_layer_token_embd.weight` alone (`gguf_geometry`
+refuses the `qwen4exp` architecture, so `--gguf` cannot), refused with
+`--gguf` and when the IR declares no `ngram_table.K` port; `position_ids` is
+fed at the port's own rank (the pass's flat `[-1]` on this IR, `[sections, n]`
+on the mrope exports); the loader counts `qwen_sparse_attention` as a
+full-attention layer type (red: `n_attn_layer 0` of 4).
+
+For the KLD gate's served half: `/v1/completions` accepts the OpenAI token-id
+prompt form (`prompt: [ids]`, one sequence, fed as given; batches stay
+refused; `echo` needs text), and `ARCINT_LOGITS_DUMP=<path>` appends every
+paged forward's logits (`"ARCLGT01"` + lane, past, n, rows, vocab + rows ×
+vocab f32) — a measurement switch that reads back every prefill chunk, so a
+rate under it is not the served rate. `tools/kld_served.py --replay` posts
+the pinned llama.cpp capture's own token windows; `--compare` reconstructs the
+capture's uint16 log-prob rows (transcribed from `perplexity.cpp`, pinned to
+the quantisation step by a cell) and reports mean per-token KL below and at
+or above row 2051. Report only.
+
 ### The serving-shape IR carries the paged port contract (2026-09-13)
 
 Nothing declares a paged serving port by hand: the load path runs

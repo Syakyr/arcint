@@ -8,14 +8,38 @@ TEST(registry_holds_exactly_the_target_models) {
     // 3.8 (its own entry with its own status, never an alias of our AWQ export),
     // and the dense qwen3.5-2b marker artifact (FIX 8.2, hashes pinned off the
     // dev-host IR 2026-09-10).
+    // Seven since 2026-09-13: the Flash-Next serving-shape IR at depth 4, the
+    // served path's first Flash-Next artifact (hashes pinned off the dev-host
+    // directory the same day).
     const auto ids = model_ids();
-    CHECK_EQ(ids.size(), 6u);
+    CHECK_EQ(ids.size(), 7u);
     CHECK(find_model("qwen3.6-27b-a3b-coder") != nullptr);
     CHECK(find_model("qwen3.6-35b-a3b") != nullptr);
     CHECK(find_model("qwen3.8-27b") != nullptr);
     CHECK(find_model("qwen3.8-27b-intel-int4") != nullptr);
     CHECK(find_model("qwen3.6-35b-a3b-mtp") != nullptr);
     CHECK(find_model("qwen3.5-2b") != nullptr);
+    CHECK(find_model("qwen3.8-flash-next-d4") != nullptr);
+}
+
+// FULL-DEPTH (2026-09-13): the depth-4 serving-shape artifact is a MoE
+// qwen4exp entry with one attention layer in four, the GGUF's own chat
+// template and the passthrough tokenizer every other entry shares.
+TEST(registry_flash_next_d4_is_the_serving_shape_at_depth_4) {
+    const ModelEntry* e = find_model("qwen3.8-flash-next-d4");
+    CHECK(e != nullptr);
+    if (e == nullptr) return;
+    CHECK(find_by_artifact("qwen38-flash-next-d4-ov") == e);
+    CHECK(e->moe);
+    CHECK_EQ(e->model_type, std::string("qwen4_exp"));
+    CHECK_EQ(e->n_expert, 512);
+    CHECK_EQ(e->n_embd, 2560);
+    CHECK_EQ(e->n_layer, 4);
+    CHECK_EQ(e->n_attn_layer, 1);
+    CHECK_EQ(e->n_gdn_layer, 3);
+    CHECK(!e->has_mtp_head);
+    CHECK_EQ(e->template_hash, std::string("12827f24b742ea4e"));
+    CHECK_EQ(e->arch_hash, std::string("2910a860bf9dc6bb"));
 }
 
 TEST(registry_rejects_everything_else) {

@@ -337,20 +337,34 @@ std::optional<std::string> parse_completion_request(const json& body, Completion
     const json& p = body["prompt"];
     if (p.is_string()) {
         req.prompt = p.get<std::string>();
+    } else if (p.is_array() && !p.empty() && p[0].is_number_integer()) {
+        // The OpenAI token-id form: one sequence of ids, fed as given. Added
+        // for the KLD gate's replay of the reference capture's token windows
+        // (CompletionRequest::prompt_ids); a batch of id arrays is still not
+        // v1.
+        for (const json& t : p) {
+            if (!t.is_number_integer() || t.get<int64_t>() < 0) {
+                return "a token-id prompt must be an array of non-negative integers";
+            }
+            req.prompt_ids.push_back(t.get<int>());
+        }
     } else if (p.is_array()) {
-        // A single-element array of strings is the common client shape. Token-id
-        // prompts and batches are not v1 (one slot, one sequence).
+        // A single-element array of strings is the common client shape.
+        // Batches are not v1 (one slot, one sequence).
         if (p.size() != 1 || !p[0].is_string()) {
-            return "prompt must be a string or a one-element array of strings";
+            return "prompt must be a string, a one-element array of strings, or an array of token ids";
         }
         req.prompt = p[0].get<std::string>();
     } else {
-        return "prompt must be a string or a one-element array of strings";
+        return "prompt must be a string, a one-element array of strings, or an array of token ids";
     }
 
     if (body.contains("echo") && !body["echo"].is_null()) {
         if (!body["echo"].is_boolean()) return "echo must be a boolean";
         req.echo = body["echo"].get<bool>();
+    }
+    if (req.echo && !req.prompt_ids.empty()) {
+        return "echo needs a text prompt (a token-id prompt has no text to echo)";
     }
 
     if (auto e = read_stream(body, req.stream, req.stream_include_usage)) return e;

@@ -53,6 +53,27 @@ TEST(config_stub_defaults) {
     CHECK_EQ(cfg.mtp, std::string("auto"));
 }
 
+// FULL-DEPTH (2026-09-13): --ngram-gguf opens one shard for the ngram_table.K
+// ports of a serving-shape IR. It needs the IR (--model), the paged path (the
+// ports are bound per lane request), and it is exclusive with --gguf, which
+// opens a file of its own for the same binding site.
+TEST(config_ngram_gguf_needs_model_paged_and_no_second_gguf) {
+    CHECK(rejected({"--ngram-gguf", "/shards/x.gguf"}));
+    CHECK(rejected({"--model", "/models/ov/x", "--model-id", "qwen3.8-27b", "--no-paged",
+                    "--ngram-gguf", "/shards/x.gguf"}));
+    CHECK(rejected({"--model", "/models/ov/x", "--model-id", "qwen3.8-27b", "--gguf", "/y.gguf",
+                    "--ngram-gguf", "/shards/x.gguf"}));
+#ifdef ARCINT_OPENVINO
+    Config cfg;
+    CHECK(run({"--model", "/models/ov/x", "--model-id", "qwen3.8-27b", "--ngram-gguf",
+               "/shards/x.gguf"},
+              cfg)
+              .ok);
+    CHECK_EQ(cfg.ngram_gguf_path, std::string("/shards/x.gguf"));
+    CHECK(cfg.gguf_path.empty());
+#endif
+}
+
 TEST(config_needs_something_to_serve) {
     CHECK(rejected({}));
 }

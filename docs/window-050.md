@@ -1411,6 +1411,164 @@ pinned USM host; the container's 48 GiB held with the shard pages evicting
 under it (run 1's B60 leg paid 15.2 s and 7.9 s for two chunk copies for
 exactly that reason).
 
+## 4.9 THE SERVED PATH — the binary on an artifact directory, depth 4 (2026-09-13)
+
+Until this section the serving-shape IR had been fed on a card by one thing:
+the labelled probe (`tools/boot_serving_shape.py`), which transcribes the
+served load sequence stage by stage. The runtime's own binding site
+(`bind_ngram_ports` / `feed_ngram_ports`, §4.8) compiled and passed its cells
+and had never run, because nothing `load_artifact` would admit existed. The
+France and KLD gates are served-path gates (§7, §8); this section makes them
+reachable.
+
+**The artifact directory** — `tools/export_serving_artifact.py --layers 4`,
+`RUN@wt+6743ffb` (this increment's working tree over 6743ffb; the commit that
+carries this section is the tree), written 2026-09-13 12:16–12:27Z on the dev
+host, `serving-shape.json` beside it:
+
+| file | what | size |
+|---|---|---|
+| `openvino_language_model.xml/.bin` | `build_serving_shape_ir(feed=GgufFeed, n_layers=4)`, real weights, `compress_to_fp16=False`; 1,723 nodes; dense fill 95 tensors 3,906,155,136 B, expert fill 12 bodies 5,387,059,200 B; build 556.8 s, save 82.1 s, peak host 21.60 GiB | 9,427,885,993 B (8.78 GiB); xml sha `2910a860bf9dc6bb` |
+| `openvino_text_embeddings_model.xml/.bin` | `token_embd.weight` dequantised f32 [248320, 2560], Gather by `input_ids` [1, T], T dynamic | 2.37 GiB |
+| `openvino_tokenizer.*`, `openvino_detokenizer.*`, `tokenizer.json`, `tokenizer_config.json` | passthrough from the qwen3.8 artifact, admitted after the tool compared all 248,077 ids tokenizer.json defines against the GGUF's `tokenizer.ggml.tokens`: 0 disagree (the 243 GGUF ids past the last defined one are the padded tail); the France prompt tokenises to `760,6511,314,9338,369` on both | sha `87a7830d63fcf43b` |
+| `chat_template.jinja` | the GGUF's own `tokenizer.chat_template` | 9,993 chars, sha `12827f24b742ea4e` |
+| `config.json` | the real geometry at `num_hidden_layers 4`, `layer_types` 3 × linear_attention + qwen_sparse_attention, the n-gram five, `ple_layer_ids [2]`, `eos_token_id 248044` = the GGUF's `qwen4exp.ple.eos_token_id` (llama.cpp hashes with that key; `tokenizer.ggml.eos_token_id` is 248046 = `<|im_end|>`, a different token) | |
+| `generation_config.json` | `eos_token_id [248044, 248046]` — the loader takes `eos_ids.front()` as the hash boundary, so the PLE eos is first; both stop generation | |
+
+**What the served path needed that the probe did not** (each a refusal or a
+throw the code would have produced, read off the code before the run; the
+first two were measured on the probe before the branch existed):
+
+1. `gguf_geometry` refuses every architecture but `qwen35` by name, so `--gguf`
+   cannot open the shard for the table. `--ngram-gguf FILE` opens the shard
+   for `per_layer_token_embd.weight` alone: no geometry check, no template
+   rewrite; refused with `--gguf`, on the stateful path, and when the IR
+   declares no `ngram_table.K` port (config cells, red-first on the
+   `--gguf` + `--ngram-gguf` pair).
+2. `position_ids` is fed as `[sections, n]` and `paged_sections_` is read off
+   `ps[0].get_length()`; this IR's post-pass port is the flat `[-1]`. Fed at
+   the port's rank now (`paged_pos_flat_`).
+3. The loader counted only the literal `full_attention`; the pin's
+   `qwen_sparse_attention` reported 0 attention layers of 4 and the registry
+   split could never sum. `artifact_counts_qwen_sparse_attention_as_full_attention`
+   read `n_gdn_layer 4` before the loader learnt the name (red), 3 after.
+4. The allowlist: `qwen3.8-flash-next-d4` / `qwen38-flash-next-d4-ov`, hashes
+   read off the directory above; the registry cells went from 6 to 7 entries.
+
+Ladder on the exact tree, dirac, `ARCINT_GGUF_REAL` = shard 2: **532 cases
+run, 0 failed, 0 skipped** (`RUN@wt+6743ffb`, ladder-1.log).
+
+### The command, one card per process
+
+```
+# RUN@wt+6743ffb  (~/inc7/served_d4.sh GPU.1 a770-d4, then GPU.0 b60-d4)
+arcint --model /models/ov/qwen38-flash-next-d4-ov --device GPU.1 \
+  --ngram-gguf <shard 2> --prefill-chunk 1536 --n-ctx 8192 --parallel 1 \
+  --no-logits-slice --port 8091 -v
+# /props until 200 (the only gate), then
+POST /v1/completions {"prompt":"The capital of France is","max_tokens":8,"temperature":0}
+POST /v1/chat/completions {"messages":[{"role":"user","content":"What is the capital of France? Answer in one word."}],"max_tokens":32,"temperature":0}
+```
+
+`--prefill-chunk 1536`: under the A770's 1,638-token block ceiling (§4.8
+R7) and a multiple of the 16-token KV page. `--no-logits-slice`: every
+prefill row comes back, which the KLD replay (§4.11) needs; the France
+question does not care.
+
+### Measured — the served-path signature, `RUN@wt+6743ffb`, 2026-09-13 12:29–12:48Z, A770
+
+The binary loaded the artifact, compiled, bound the table through its own
+site — and the first forward never returned. Three legs, in order:
+
+| leg | what | measured |
+|---|---|---|
+| A770, defaults (`served-a770-d4`) | embeddings graph compiled on GPU.1 beside the paged model | `load_artifact` admits; `--ngram-gguf` opens shard 2 (402 tensors); paged model compiled in **21.8 s, 6.79 GiB resident**; embeddings on GPU.1, drafters 1.18 GiB; KV ports i8 for u8; **table bound: 7 ports, 26.82 GiB USM host in 76.7 s, id ports declared, conv_mask declared, hash ordinal 0** (the runtime's binding site, on a card, first time). Then the activation probe's first forward (128 tokens of id 0, chunk floor): **no return in 9 min 20 s**. Main thread in `xe_wait_user_fence_ioctl → __flush_workqueue` (`/proc/<pid>/stack`), 28 threads in futex wait, both GPUs at `act_freq 0` and rising idle residency, no GT reset in dmesg, `fdinfo` not read on this leg. `SIGKILL` took it (12:40:33Z). **The served-path signature, as the device wrote it: a user-fence wait on an idle card.** |
+| A770, `--emb-device CPU` (`served-a770-d4-embcpu`) | the one change: the embeddings gather runs on the host | boots: table bound in 27.2 s (page cache warm); reservation `weights+graph 6.79 + activations 3.62 (chunk 512)` — the climb settled the served chunk at **512**, not the configured 1536; `/props → 200` at 12:43:29Z, 2 min 21 s after launch; `fdinfo`: `drm-resident-gtt 27.35 GiB` (the table, all of it resident), `drm-resident-vram0 10.49 GiB`. |
+| → France, raw completion, greedy, 8 tokens | `"The capital of France is"` (5 ids) | **`rameworkenessooter5ussionxigy引`** — first token `ramework` = id 5613, **the probe's token (§4.8 R5), reached through the served path**: the C++ hash (ordinal 0, eos 248044), the C++ split, the runtime-bound table, the artifact's embedding. Cold: prefill 5 tok 8.15 s (`restore 7.28 s` — the first request's kernel JIT lands in that column), decode 8 tok 0.63 s (12.7 t/s). Warm, same prompt: identical text, prefill 0.05 s, **decode 38.2 t/s**. |
+| → France, chat form, 32 tokens | the template renders 64 prompt tokens | `reasoning_content`: `像在\n inté rendschedulers 2ingham aalii/sogos …` — 32 tokens of the same nature; prefill 64 tok 0.48 s (134 t/s), decode 24.6 t/s. |
+| B60, defaults (`served-b60-d4`) | embeddings on GPU.0 beside the paged model — the A770's hanging configuration | **boots**: table bound in 44.1 s; activation fit `0.290 GiB fixed + 6849.3 KiB per chunk token`, served chunk **1024** measured 6.98 GiB; reservation 6.79 + 1.18 + 6.98 + 0.25 of 22.71 GiB; `/props → 200` at 12:50:35Z, 2 min 16 s after launch. France raw, greedy 8: **`rameworkenessooter5rawd.githubusercontent /riet`** — the first four tokens the A770's (`ramework`, `eness`, `ooter`, `5`), the fifth diverges (`rawd` against `ussion`; §4.8 saw the same class of near-tie under f16 at position 0). Cold prefill 5 tok 3.08 s, decode 17.2 t/s; warm: identical text, prefill 0.03 s, **decode 47.1 t/s**. Chat form: `reasoning_content` `像在\n mere (把头/head/head/head#__otto …`, 46.6 t/s. Teardown clean, leftover 0. |
+
+> **RETRACTED the same hour, and re-measured.** The operator's word at
+> 12:57Z: *the reviewer was working on the host in parallel during the
+> first leg.* The hang was therefore never attributable to the embeddings'
+> placement — one difference was named while a second, unnamed one was
+> live. Re-run, quiet host, `served-a770-d4-rerun`, identical command to the
+> first leg (embeddings on GPU.1), 12:57:49–12:59:57Z: **boots** in 1 min
+> 58 s (paged model 46.9 s, table 45.0 s); activation fit `−1.101 GiB fixed
+> + 10975.6 KiB per chunk token`, served chunk 512 measured 4.26 GiB; France
+> raw **`rameworkenessooter5ussionxigy引`**, byte for byte the emb-CPU
+> leg's; cold prefill 0.41 s, warm decode **37.9 t/s**; chat form 34.4 t/s;
+> teardown clean. So: the served path boots and answers on the A770 in the
+> default configuration; the first leg's fence wait on an idle card is
+> recorded as what it was — a run taken while another session held the
+> host — and the sentence "the hang is the A770's with this artifact" is
+> withdrawn. `--emb-device CPU` is not a required configuration; it remains
+> a measured, working one (the KLD leg of §4.11 ran under it).
+
+The driver script of the emb-CPU leg died between `/props` and its first
+POST (its `run.log` ends at the props line; no process, no trace); the
+France requests above were posted by hand against the still-running server
+and appended to the same log, marked as such. The script now traces itself
+(`set -x`) instead of aborting.
+
+**What this is.** The runtime's binding site ran on a card, every port fed
+by the runtime and not by a driver, and the served path produced the token
+the probe had produced. **Paris is NOT dated** — `ramework` is a
+four-of-forty-eight-layer prefix's argmax, as §4.8 said, now on the served
+path. **What it is not**: an explanation of the first leg's hang — see the
+retraction under the B60 row: that leg ran while another session held the
+host, and the identical command re-run quiet boots and answers.
+
+## 4.11 THE KLD GATE'S SERVED HALF — the instrument, red-probed at depth 4 (2026-09-13)
+
+`tools/kld_served.py` (device-free cells in `tests/python/test_kld_served.py`):
+`--replay` posts the pinned capture's own token windows to a running arcint as
+token-id prompts (`/v1/completions` `prompt: [ids]`, one greedy token — the
+form the API now accepts; batches stay refused), while the server appends
+every paged forward's logits to `ARCINT_LOGITS_DUMP` (`"ARCLGT01"` + lane,
+past, n, rows, vocab + rows × vocab f32; `--no-logits-slice` so rows == n);
+`--compare` reconstructs the reference log-probs row by row (llama.cpp's
+uint16 rows: f32 scale, f32 min log-prob, `q = round((logit − min) / scale)`,
+transcribed from `perplexity.cpp` and pinned to the quantisation step by a
+cell), log-softmaxes the served rows, and reports mean per-token
+KL(P_ref‖P_served) over the recorded rows `n_ctx/2 .. n_ctx−2`, split at row
+index 2051. REPORT ONLY; the 0.0599-nat bar is printed beside the means.
+
+Reference: `/flash-model/kld-ref/qwen4exp-c2735-chunks2.dat`, sha
+`af7993b7…`, llama.cpp master `56b9eb28`, n_ctx 2735, 2 windows, 1,367 rows a
+window (684 below the boundary, 683 at or above), 91,266-byte corpus.
+
+**Red probe, predicted**: through the depth-4 artifact the instrument must
+read a mean KL FAR above 0.0599 in both regimes (forty-four layers are
+missing; `ramework` is not a distribution over English) and an argmax
+agreement near zero. A reading near the bar at depth 4 would falsify the
+instrument, not pass the model. This prediction was written in the tree
+before the run and **not committed before it** — the discipline of §4.6–4.8
+was kept in letter for the card runs of §4.9/§4.10 and only in substance
+here; said rather than hidden.
+
+**Measured — `RUN@wt+6743ffb`, A770, `--emb-device CPU`, 2026-09-13
+12:51–12:57Z (`kld-a770-d4`).** Server up in 4 min 31 s (table bind 138.8 s
+this time — the shard pages had been evicted by the B60 leg's own bind);
+served chunk 512. Replay: window 0, 2,735 ids, HTTP OK in 27.4 s (prefill
+26.35 s = 103.8 t/s: graph 13.48 s, embed 12.87 s on the host), greedy
+token ` ev`; window 1 in 22.1 s (21.92 s, 124.8 t/s), `xyz`. Dump
+6,325,207,856 B, 17 records in 5 windows — the server's three load-time
+probe windows and the two replays, which the compare selects by their
+2,735-row length. Compare, 1,367 recorded rows a window (684 below the
+boundary, 683 at or above):
+
+| window | mean KL below 2051 | mean KL at/above 2051 | max | argmax agreement |
+|---|---|---|---|---|
+| 0 | 1.168541e+01 | 1.124390e+01 | 2.36e+01 | 0.0007 |
+| 1 | 1.161744e+01 | 1.171603e+01 | 1.93e+01 | 0.0000 |
+| **all** | **1.165143e+01** | **1.147997e+01** | | |
+
+**The instrument reads red at depth 4, as predicted**: 11.65 / 11.48 nats
+against the 0.0599 bar, two hundred times over; argmax agreement 1 row in
+1,367. Nothing here is a statement about the model. The same command against
+a full-depth artifact is the gate's measurement — REPORT ONLY.
+
 ## 5. Residency — the SIZE LEDGER, and the number that decides the window
 
 `RUN@wt+2e99661`, 2026-09-12, real checkpoint geometry, T=64, CPU, every row either built
@@ -1665,6 +1823,8 @@ baseline probe from a different model either.
 | "The capital of France is" (ids `760,6511,314,9338,369`) | serving-shape IR at depth 4, `RUN@806b76f`, 2026-09-13 09:38–09:46Z, A770 then B60 | **served path: refused at `set_tensor(inputs_embeds)` — `Port for tensor name inputs_embeds was not found`** (the IR declares `input_ids`). **Labelled probe** (input_ids fed in its place, nothing else): `INFER OK`, logits `(1, 5, 248320)`, finite, `absmax 0.0000e+00`, greedy token id **`0`** on both cards — zero weights, a structure witness and not an answer. §4.7 | 1 (probe) | — |
 
 | "The capital of France is" (ids `760,6511,314,9338,369`) | serving-shape IR at depth 4, **REAL weights** (Q3_K_XL shards; dense fill 95 tensors, 12 expert bodies, the IQ4_NL table bound as 7 ports), `RUN@2413cab`, 2026-09-13 11:24–11:42Z, A770 then B60 | served feed order accepted end to end; logits `(1, 5, 248320)`, finite, absmax 9.1495 (A770) / 9.1205 (B60); **greedy token id `5613` = `ramework`** on both cards (3.586 / 3.573) — the argmax of a four-of-forty-eight-layer prefix, not an answer. §4.8 | 1 | — |
+
+| "The capital of France is" (5 ids) | **THE SERVED PATH**: `arcint --model qwen38-flash-next-d4-ov --ngram-gguf <shard 2>`, A770, `RUN@wt+6743ffb`, 2026-09-13 12:47Z (`--emb-device CPU`) and 12:59Z (defaults, quiet host) | greedy, 8 tokens, both runs byte for byte: **`rameworkenessooter5ussionxigy引`** — first token `ramework` (5613), the probe's; warm decode 38.2 / 37.9 t/s. Chat form ("What is the capital of France? Answer in one word."): `reasoning_content` `像在\n inté rendschedulers 2ingham aalii/sogos …`. Not an answer: depth 4 of 48. **B60**, same binary, embeddings on the card, 12:50Z: `rameworkenessooter5rawd.githubusercontent /riet` — the first four tokens the A770's, warm decode 47.1 t/s. §4.9 | 8 / 32 | — |
 
 §4.6 predicted the first row before its window ran (P4) and the window wrote
 it as predicted. §4.7 predicted the second row's served-path signature (B4)

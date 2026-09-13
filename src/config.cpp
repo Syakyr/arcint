@@ -354,6 +354,11 @@ std::string usage_text() {
         "                            the host per token (default), or the template's\n"
         "  --gguf-check once|always  keep each repacked projection's deviation verdict\n"
         "                            between loads of the same file (default) or re-check\n"
+        "  --ngram-gguf FILE         the GGUF shard whose per_layer_token_embd.weight binds\n"
+        "                            the IR's ngram_table.K ports (a serving-shape IR that\n"
+        "                            carries the n-gram table as ports). Opened for that\n"
+        "                            tensor only: no template rewrite, no geometry check.\n"
+        "                            Refused with --gguf, and when the IR declares no ports\n"
         "  --flash-next-ngram PATH   Flash-Next per_layer_token_embd table (24-byte\n"
         "                            ARCINGRM header + block-quantised payload). The\n"
         "                            artifact's config.json must declare an n-gram table\n"
@@ -430,6 +435,9 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
         } else if (arg == "--gguf") {
             if (!value(v)) return fail("--gguf needs a path");
             cfg.gguf_path = std::string(v);
+        } else if (arg == "--ngram-gguf") {
+            if (!value(v)) return fail("--ngram-gguf needs the path of the GGUF shard holding per_layer_token_embd.weight");
+            cfg.ngram_gguf_path = std::string(v);
         } else if (arg == "--flash-next-ngram") {
             if (!value(v)) return fail("--flash-next-ngram needs a path to the per_layer_token_embd table");
             cfg.flash_next_ngram_path = std::string(v);
@@ -846,6 +854,9 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
     if (cfg.prefill_chunk < 0) return fail("--prefill-chunk must be >= 0");
     if (!cfg.gguf_path.empty() && cfg.model_path.empty()) return fail("--gguf needs --model (the template IR directory)");
     if (!cfg.gguf_path.empty() && !cfg.paged) return fail("--gguf serves on the paged path only");
+    if (!cfg.ngram_gguf_path.empty() && cfg.model_path.empty()) return fail("--ngram-gguf needs --model (the IR whose ngram_table.K ports it binds)");
+    if (!cfg.ngram_gguf_path.empty() && !cfg.paged) return fail("--ngram-gguf serves on the paged path only (the ports are bound per lane request)");
+    if (!cfg.ngram_gguf_path.empty() && !cfg.gguf_path.empty()) return fail("--ngram-gguf and --gguf both open a GGUF for the ngram_table ports; give one");
     if (cfg.gguf_native && cfg.gguf_path.empty()) return fail("--gguf-native needs --gguf");
     if (cfg.gguf_mode != 2 && cfg.gguf_path.empty()) return fail("--gguf-mode needs --gguf");
 

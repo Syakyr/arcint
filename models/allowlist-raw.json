@@ -108,5 +108,24 @@
     "status": "provisional; dense qwen35 marker export (FIX 8.2), served via GGUF on the 16 GiB card, not acceptance-scored",
     "mtp_num_hidden_layers": 1,
     "mtp_head_exported": false
+  },
+  "qwen38-flash-next-d4-ov": {
+    "_note": "2026-09-13: the serving-shape IR of Qwen3.8 Flash-Next (qwen4exp) at DEPTH 4 of 48, real weights from the UD-Q3_K_XL shards (tools/export_serving_artifact.py --layers 4, tree wt+6743ffb, serving-shape.json beside it). Hashes read off /models/ov/qwen38-flash-next-d4-ov on the dev host. The n-gram table is not in the .bin: it binds to the IR's ngram_table.K ports from the GGUF shard at load (--ngram-gguf). A measurement artifact for the served path -- 44 layers are missing, its answers are not the model's.",
+    "arch": [
+      "Qwen4ExpForConditionalGeneration"
+    ],
+    "model_type": "qwen4_exp",
+    "hidden": 2560,
+    "layers": 4,
+    "experts": 512,
+    "ctx": 262144,
+    "full_attention_interval": 4,
+    "template_sha": "12827f24b742ea4e",
+    "tokenizer_sha": "87a7830d63fcf43b",
+    "lm_xml_sha": "2910a860bf9dc6bb",
+    "lm_bin_bytes": 9427885993,
+    "status": "measurement artifact: depth 4 of 48, served-path boot; not the model's answers",
+    "mtp_num_hidden_layers": 1,
+    "mtp_head_exported": false
   }
 }

@@ -234,6 +234,45 @@ std::vector<ModelEntry> build_registry() {
         r.push_back(std::move(e));
     }
 
+    {
+        // FULL-DEPTH (2026-09-13): the Qwen3.8 Flash-Next (qwen4exp) serving-
+        // shape IR at DEPTH 4 of 48, real weights from the UD-Q3_K_XL shards
+        // (tools/export_serving_artifact.py; serving-shape.json beside the
+        // IR names the tree, the ports and the fill). It exists so the served
+        // path -- the binary, its loader, bind_ngram_ports -- runs on a card
+        // at all; until it, the only thing that had fed this IR on a card was
+        // the labelled probe. Hashes read off the dev-host directory. The
+        // n-gram table is NOT in the .bin: it binds to the IR's ngram_table.K
+        // ports from the GGUF shard at load (--ngram-gguf). A measurement
+        // artifact: 44 layers are missing and nothing it says is the model's
+        // answer; the full-depth artifact is its own entry when it exists.
+        ModelEntry e;
+        e.id                      = "qwen3.8-flash-next-d4";
+        e.family                  = "qwen3.8";
+        e.artifact_aliases        = {"qwen38-flash-next-d4-ov"};
+        e.ov_arch                 = "Qwen4ExpForConditionalGeneration";
+        e.model_type              = "qwen4_exp";
+        e.moe                     = true;
+        e.has_mtp_head            = false;  // no MTP graph beside this IR
+        e.mtp_head_pinned         = true;   // inspected 2026-09-13 (the export writes none)
+        e.mtp_in_checkpoint       = true;   // the checkpoint ships an MTP head (staged, not served)
+        e.n_embd                  = 2560;
+        e.n_expert                = 512;
+        e.full_attention_interval = 4;
+        e.n_layer                 = 4;      // of 48: layer 3 is the one attention layer
+        e.n_ctx_train             = 262144;
+        e.quants                  = {Quant::Q4};
+        e.arch_hash               = "2910a860bf9dc6bb";
+        e.template_hash           = "12827f24b742ea4e";  // the GGUF's own chat template
+        e.tokenizer_hash          = "87a7830d63fcf43b";  // passthrough; vocab == the GGUF's, id for id
+        e.weights_bytes           = 9427885993ull;
+        e.status                  = "measurement artifact: depth 4 of 48, served-path boot; "
+                                    "not the model's answers";
+        e.sampler = qwen_card_defaults();
+        split_layers(e);
+        r.push_back(std::move(e));
+    }
+
     return r;
 }
 

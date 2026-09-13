@@ -81,6 +81,26 @@ private:
 
 }  // namespace
 
+// FULL-DEPTH (2026-09-13): the Flash-Next config names its full-attention
+// layers "qwen_sparse_attention" (the pin's `layer_types`; the selection
+// branch is the indexer, ruled out, and the layer is served dense-causal --
+// window-050 §8, 0.0 price to T=2051). The loader counted only the literal
+// "full_attention", so a real serving-shape artifact reported 0 attention
+// layers and 4 GDN out of 4, and the registry's layer split could never sum.
+// Red first: this cell read n_attn_layer 0 before the loader learnt the name.
+TEST(artifact_counts_qwen_sparse_attention_as_full_attention) {
+    TempArtifactDir d;
+    d.write("config.json",
+            R"({"num_hidden_layers":4,"layer_types":["linear_attention","linear_attention",)"
+            R"("linear_attention","qwen_sparse_attention"]})");
+    Artifact   a;
+    const auto err = load_artifact(d.dir(), a);
+    CHECK(!err.has_value());
+    CHECK_EQ(a.n_layer, 4);
+    CHECK_EQ(a.n_attn_layer, 1);
+    CHECK_EQ(a.n_gdn_layer, 3);
+}
+
 // M13 (docs/milestone-0.3.0.md): a *ForConditionalGeneration export carries
 // vision-tower/projector IRs the loader never reads (src/core/artifact.cpp
 // resolves only the language model and text embeddings). A plain text-only

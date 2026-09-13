@@ -132,6 +132,10 @@ const char* finish_reason_name(FinishReason r);
 
 struct GenerationInput {
     std::string   prompt;
+    // When non-empty, THESE are the prompt and `prompt` is not tokenised
+    // (CompletionRequest::prompt_ids; the KLD gate's replay of the reference
+    // capture's token windows).
+    std::vector<int> prompt_ids;
     SamplerParams sampler;
 
     // Names of the tools this request declared. A real backend ignores this —

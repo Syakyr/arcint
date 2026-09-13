@@ -82,7 +82,20 @@ Q6_K down 4.40 -> 3.59 at 856 rows; served warm 1k prefill 940 -> 1,001 t/s, 71.
 measured dead; DESIGN 7.0.2bp); 0.4.4 = the Q5_K decode rate; 0.5.0 = Qwen Flash Next
 (docs/milestone-0.5.0.md; recon pins the checkpoint and its config deltas
 first; gate: loads on both cards, Prüfstand, depth ladder, drafters measured
-against plain).
+against plain). 0.5.0 state 2026-09-13 (docs/window-050.md §4.9-4.11): the
+serving-shape IR (tools/q4e/serving_shape.py, real weights from the GGUF
+shards, the n-gram table as ngram_table.K USM-host PORTS bound at load from
+the shard via --ngram-gguf) is an artifact directory at depth 4 of 48
+(tools/export_serving_artifact.py; allowlist qwen3.8-flash-next-d4) and the
+served binary answers on it on both cards: "The capital of France is" ->
+"ramework..." (the probe's token; 38-47 t/s warm decode) -- not the model's
+answer, 44 layers missing (one A770 leg hung its first forward in a fence
+wait while another session held the host; re-run quiet, it boots and
+answers identically). KLD gate served half: /v1/completions takes token-id prompts,
+ARCINT_LOGITS_DUMP records every paged forward, tools/kld_served.py replays
+the pinned llama.cpp capture and reports KL below/above row 2051. Full
+depth: 60.2 GiB of u4 expert bodies do not fit either card or, beside the
+26.8 GiB table, the 48 GiB host -- §4.10's prediction, before the fill.
 
 Two M2 walls came down. Slicing logits to the last token before the LM head
 removed an out-of-memory wall at ~8k tokens (the graph computed logits for

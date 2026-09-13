@@ -281,11 +281,27 @@ TEST(completion_parses_prompt_forms) {
     CHECK_EQ(arr.prompt, std::string("hello"));
 }
 
-TEST(completion_rejects_batches_and_token_prompts) {
+TEST(completion_rejects_batches) {
     CompletionRequest req;
     CHECK(parse_completion_request(json{{"prompt", json::array({"a", "b"})}}, req).has_value());
-    CHECK(parse_completion_request(json{{"prompt", json::array({1, 2, 3})}}, req).has_value());
     CHECK(parse_completion_request(json::object(), req).has_value());
+}
+
+// FULL-DEPTH (2026-09-13): the OpenAI token-id prompt form is accepted, one
+// sequence, fed as given -- the KLD gate replays the reference capture's own
+// token windows through it. This cell was `completion_rejects_batches_and_
+// token_prompts` and asserted the refusal; it went red when the form landed.
+TEST(completion_accepts_a_token_id_prompt_and_refuses_a_bad_one) {
+    CompletionRequest req;
+    CHECK(!parse_completion_request(json{{"prompt", json::array({760, 6511, 314})}}, req).has_value());
+    CHECK_EQ(req.prompt_ids.size(), static_cast<size_t>(3));
+    CHECK_EQ(req.prompt_ids[2], 314);
+    CHECK(req.prompt.empty());
+    CompletionRequest bad;
+    CHECK(parse_completion_request(json{{"prompt", json::array({1, -2})}}, bad).has_value());
+    CHECK(parse_completion_request(json{{"prompt", json::array({1, "x"})}}, bad).has_value());
+    CHECK(parse_completion_request(json{{"prompt", json::array({1, 2})}, {"echo", true}}, bad)
+              .has_value());
 }
 
 TEST(chat_tool_call_arguments_follow_the_template_contract) {

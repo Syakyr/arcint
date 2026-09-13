@@ -190,8 +190,14 @@ std::optional<std::string> load_artifact(const std::string& dir, Artifact& out) 
         for (const json& t : tc["layer_types"]) {
             if (t.is_string()) a.layer_types.push_back(t.get<std::string>());
         }
+        // "full_attention" is the qwen3.5/3.6 exports' name; "qwen_sparse_
+        // attention" is the Flash-Next pin's (layer_types at layer_idx % 4 ==
+        // 3), served dense-causal -- the selection branch is the indexer,
+        // which is not emitted (window-050 §8: price 0.0 to T=2051). Either
+        // way the layer carries a KV cache and one ScaledDotProductAttention,
+        // which is what n_attn_layer counts.
         for (const std::string& t : a.layer_types) {
-            if (t == "full_attention") ++a.n_attn_layer;
+            if (t == "full_attention" || t == "qwen_sparse_attention") ++a.n_attn_layer;
         }
         a.n_gdn_layer = static_cast<int>(a.layer_types.size()) - a.n_attn_layer;
         if (!a.layer_types.empty() && static_cast<int>(a.layer_types.size()) != a.n_layer) {

@@ -15,6 +15,15 @@ struct Config {
     std::string model_path;  // OpenVINO IR directory (M1+)
     std::string gguf_path;   // --gguf: weights from this GGUF, --model as the topology template (0.4.0)
     std::string flash_next_ngram_path;  // --flash-next-ngram: FIX D per_layer_token_embd table (24-byte ARCINGRM header + block-quantised payload); admitted only when the artifact's config.json declares an n-gram table (docs/design-qwen-flash-next.md FIX D Link 2)
+    // --ngram-gguf: the GGUF shard whose per_layer_token_embd.weight binds a
+    // serving-shape IR's `ngram_table.K` ports (backend_ov.cpp
+    // bind_ngram_ports; FULL-DEPTH increment, 2026-09-13). The shard is opened
+    // for that one tensor: its architecture (qwen4exp) is not one --gguf's
+    // template route serves (gguf_geometry refuses it by name), and the IR
+    // carries its weights in its own .bin, so neither the geometry check nor
+    // the template rewrite runs. Refused together with --gguf (which opens a
+    // file of its own for the same site) and when the IR declares no ports.
+    std::string ngram_gguf_path;
     // --flash-next-offload-plan HIT: WP7 dry-run. Given the measured per-layer
     // LRU hit-rate (0..1, from tools/expert_lru_replay.py) and the single-A770
     // target card budget, print the expert-offload serving plan (resident

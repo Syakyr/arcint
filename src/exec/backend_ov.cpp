@@ -952,6 +952,29 @@ public:
             }
         }
 
+        // FULL-DEPTH (2026-09-13): ARCINT_LOGITS_DUMP=<path>, the KLD gate's
+        // served half (tools/kld_served.py reads it). Presence-armed like the
+        // other ARCINT_* switches. Every PAGED forward appends one record --
+        // "ARCLGT01", then lane, past, n, rows, vocab as five uint64,
+        // then rows x vocab f32 -- holding whatever the logits port carries
+        // after infer: every row with --no-logits-slice, the kept rows
+        // otherwise. It reads the logits back for EVERY forward, prefill
+        // chunks the serving loop never samples from included, so a rate
+        // measured under the switch is not the served rate.
+        if (const char* env = std::getenv("ARCINT_LOGITS_DUMP")) {
+            logits_dump_path_ = env;
+            logits_dump_file_.open(logits_dump_path_, std::ios::binary | std::ios::app);
+            if (logits_dump_file_.good()) {
+                logits_dump_enabled_ = true;
+                log::info("load", "ARCINT_LOGITS_DUMP: every paged forward's logits append to %s "
+                                  "(measurement switch; not the served rate)",
+                          logits_dump_path_.c_str());
+            } else {
+                log::warn("load", "cannot open %s for ARCINT_LOGITS_DUMP; disabling it",
+                          logits_dump_path_.c_str());
+            }
+        }
+
         core_.add_extension(tokenizers_extension_path());
         if (!cache_dir.empty()) core_.set_property(ov::cache_dir(cache_dir));
 
@@ -1380,8 +1403,9 @@ public:
         Lane&       lane  = *lanes_[0];
         using clock = std::chrono::steady_clock;
 
-        const std::vector<int> prompt_ids = tokenizer_->encode(in.prompt);
-        stats.prompt_tokens               = static_cast<int>(prompt_ids.size());
+        const std::vector<int> prompt_ids =
+            in.prompt_ids.empty() ? tokenizer_->encode(in.prompt) : in.prompt_ids;
+        stats.prompt_tokens = static_cast<int>(prompt_ids.size());
         if (prompt_ids.empty()) return FinishReason::Stop;
 
         // An unseeded request still gets a seed, it just gets a fresh one — and
@@ -1901,8 +1925,9 @@ private:
         // across requests, so lane id alone is not enough to chain cycles).
         const uint64_t request_id = next_request_id_.fetch_add(1);
 
-        const std::vector<int> prompt_ids = tokenizer_->encode(in.prompt);
-        stats.prompt_tokens               = static_cast<int>(prompt_ids.size());
+        const std::vector<int> prompt_ids =
+            in.prompt_ids.empty() ? tokenizer_->encode(in.prompt) : in.prompt_ids;
+        stats.prompt_tokens = static_cast<int>(prompt_ids.size());
         if (prompt_ids.empty()) return FinishReason::Stop;
 
         uint64_t seed = in.sampler.seed;
@@ -2552,6 +2577,27 @@ private:
         if (!cfg.gguf_path.empty())
             apply_gguf_weights(model, cfg.gguf_path, cfg.gguf_mode,
                                cfg.gguf_check_once ? gguf_verdict_dir(cfg) : std::string(), cfg.gguf_embed_file, cfg.gguf_q6k_aligned, cfg.gguf_mins);
+        // FULL-DEPTH (2026-09-13): --ngram-gguf opens the shard that holds
+        // the n-gram table for bind_ngram_ports alone. A serving-shape IR
+        // carries its weights in its own .bin, and the shard's architecture
+        // (qwen4exp) is not one the --gguf template route serves --
+        // gguf_geometry refuses it by name -- so neither the geometry check
+        // nor the template rewrite runs here; the file is mapped and held for
+        // the compiled model's life like a --gguf file would be, because the
+        // USM-host chunks are copied out of it at bind time and the tensor
+        // check reads its header. Whether the IR actually declares the ports
+        // is bind_ngram_ports' question; a flag with nothing to bind refuses
+        // there, by name.
+        if (!cfg.ngram_gguf_path.empty()) {
+            gguf_file_       = std::make_shared<gguf::GgufFile>(gguf::GgufFile::open(cfg.ngram_gguf_path));
+            gguf_path_       = cfg.ngram_gguf_path;
+            ngram_gguf_only_ = true;
+            log::info("load", "ngram source: %s opened for %s only (--ngram-gguf; %s, %zu tensors; no "
+                              "template rewrite, no geometry check)",
+                      cfg.ngram_gguf_path.c_str(), ngram::kTableTensor,
+                      gguf_file_->get_string("general.architecture").value_or("?").c_str(),
+                      gguf_file_->tensors().size());
+        }
         // --gate-pad N: widen the shared-expert gate (see pad_gate_matmuls). A
         // deployment choice with a known price, like --paged-kv: DESIGN 7.0.2g
         // has the break-even. Off by default for this fleet's answer lengths.
@@ -3315,7 +3361,21 @@ private:
                 // never reach kv_port_bits at all.
                 kv_port_bits.emplace_back(actual.bitwidth(), block_elems);
             } else if (name == kPositionIds) {
-                paged_sections_ = static_cast<size_t>(ps[0].get_length());
+                // The mrope exports declare [sections, tokens]; the
+                // serving-shape IR's port is [1, T] and SDPAToPagedAttention
+                // rewrites it to the flat token vector [-1] (the pass's own
+                // `set_partial_shape({-1})`, window-050 §4.7). Fed at the
+                // port's rank: `ps[0].get_length()` on a rank-1 dynamic port
+                // throws at load, and a [sections, n] tensor against a [n]
+                // port refuses at the first forward -- both measured on the
+                // probe before this branch existed (boot_serving_shape.py
+                // `flat_or_2d`).
+                if (ps.rank().is_static() && ps.rank().get_length() == 1) {
+                    paged_pos_flat_ = true;
+                    paged_sections_ = 1;
+                } else {
+                    paged_sections_ = static_cast<size_t>(ps[0].get_length());
+                }
             }
         }
         // Tripwire for re-exports: the byte arithmetic below assumes the
@@ -6107,7 +6167,8 @@ private:
         };
         if (la_rows.size() == 1) la_rows.push_back(la_rows[0]);
 
-        ov::Tensor pos(ov::element::i64, ov::Shape{paged_sections_, n});
+        ov::Tensor pos(ov::element::i64,
+                       paged_pos_flat_ ? ov::Shape{n} : ov::Shape{paged_sections_, n});
         int64_t*   pp = pos.data<int64_t>();
         for (size_t sct = 0; sct < paged_sections_; ++sct) {
             for (size_t i = 0; i < n; ++i) pp[sct * n + i] = static_cast<int64_t>(past + i);
@@ -6195,6 +6256,7 @@ private:
             lane.req.infer();
             const auto t1 = std::chrono::steady_clock::now();
             if (want_logits) copy_out(lane.req.get_tensor("logits"), lane.logits);
+            if (logits_dump_enabled_) logits_dump_write(lane, past, n);
             const auto t2 = std::chrono::steady_clock::now();
             if (mtp_ready_) copy_out(lane.req.get_tensor("hidden_states"), lane.hidden);
             const auto t3 = std::chrono::steady_clock::now();
@@ -6260,6 +6322,26 @@ private:
 
     // Into a tensor the lane owns, reshaping only when the graph's dynamic
     // output changes shape (one row for a decode step, 1+k for a verify pass).
+    // One ARCINT_LOGITS_DUMP record for the forward just run (see the
+    // constructor). The logits port is read exactly as copy_out reads it.
+    void logits_dump_write(Lane& lane, size_t past, size_t n) {
+        const ov::Tensor lg = lane.req.get_tensor("logits");
+        if (lg.get_element_type() != ov::element::f32) {
+            throw std::runtime_error(log::format("ARCINT_LOGITS_DUMP: logits are %s, not f32",
+                                                 lg.get_element_type().get_type_name().c_str()));
+        }
+        const ov::Shape  sh    = lg.get_shape();
+        const uint64_t   vocab = sh.empty() ? 0 : sh.back();
+        const uint64_t   rows  = vocab ? lg.get_size() / vocab : 0;
+        const uint64_t   hdr[5] = {static_cast<uint64_t>(lane.index), past, n, rows, vocab};
+        std::lock_guard<std::mutex> lk(logits_dump_mutex_);
+        logits_dump_file_.write("ARCLGT01", 8);
+        logits_dump_file_.write(reinterpret_cast<const char*>(hdr), sizeof(hdr));
+        logits_dump_file_.write(static_cast<const char*>(lg.data()),
+                                static_cast<std::streamsize>(lg.get_byte_size()));
+        logits_dump_file_.flush();
+    }
+
     static void copy_out(const ov::Tensor& src, ov::Tensor& dst) {
         if (!dst || dst.get_shape() != src.get_shape() ||
             dst.get_element_type() != src.get_element_type()) {
@@ -7754,6 +7836,8 @@ private:
     ov::element::Type              mtp_pos_type_     = ov::element::f32;
     int                            paged_n_ctx_      = 0;
     size_t                         paged_sections_   = 4;    // position_ids dim 0
+    bool                           paged_pos_flat_   = false;  // position_ids is the pass's flat [-1]
+    bool                           ngram_gguf_only_  = false;  // gguf_file_ came from --ngram-gguf
     size_t                         drafts_max_       = 0;
     std::vector<ov::Tensor>        rollback_;   // reused speculation scratch
     bool                           logged_rollback_size_ = false;
@@ -7821,6 +7905,11 @@ private:
     std::string              dflash_dump_path_;
     std::ofstream            dflash_dump_file_;
     std::atomic<bool>        dflash_dump_enabled_{false};
+    // ARCINT_LOGITS_DUMP (constructor): the KLD gate's served-logits record.
+    std::string              logits_dump_path_;
+    std::ofstream            logits_dump_file_;
+    bool                     logits_dump_enabled_ = false;
+    std::mutex               logits_dump_mutex_;
     std::atomic<uint64_t>    dflash_dump_cycle_{0};
     std::mutex               dflash_dump_mutex_;
     // Review follow-up: a per-request id the dump chains cycles
@@ -7868,12 +7957,21 @@ private:
             inputs.emplace_back(in.get_any_name(), std::move(dims));
         }
         ngram_ports_ = ngram::plan_ngram_ports(inputs);
-        if (ngram_ports_.empty()) return;
+        if (ngram_ports_.empty()) {
+            if (ngram_gguf_only_) {
+                throw std::runtime_error(log::format(
+                    "--ngram-gguf %s: the IR declares no ngram_table.K port to bind the table to "
+                    "(a served hybrid carries no n-gram table; the flag is for the serving-shape IR)",
+                    gguf_path_.c_str()));
+            }
+            return;
+        }
 
         if (!gguf_file_) {
             throw std::runtime_error(log::format(
                 "the IR declares %zu ngram_table.K port(s) but no GGUF is open to bind them from "
-                "(--gguf); the table is the file's own %s",
+                "(--ngram-gguf, or --gguf on a served-architecture file); the table is the file's "
+                "own %s",
                 ngram_ports_.chunks.size(), ngram::kTableTensor));
         }
         const gguf::TensorInfo* t = gguf_file_->tensor(ngram::kTableTensor);
