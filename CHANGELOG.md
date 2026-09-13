@@ -17,10 +17,41 @@ nightly is a different ABI, and since 0.3.0 floors the patch level within
 it (`>= +pN`, `<<` the next nightly) instead of pinning it exactly: an exact
 pin made apt remove arcint when the runtime was upgraded to +p3.
 
-## 0.5.0 — 2026-09-10
+## 0.5.0 — 2026-09-13
 
 Requires `marfrit-openvino 2026.4.0~dev20260821+p15` (patches 0003–0033) —
 unchanged from 0.4.7. No plugin patch.
+
+### Scope: the mechanism release (operator CR #2, 2026-09-13)
+
+0.5.0 is the **mechanism release**. Paris — the served model's own token for
+the capital of France at full depth — moved to 0.5.1 by operator change
+request #2 of 2026-09-13; the acceptance commit `8a84598`'s Paris line carries
+a dated amendment in `docs/window-050.md` (§4.6 and §8), nothing erased, and
+its falsifiable clause travels to `docs/window-051.md`. What ships:
+
+- the served path live on both cards through the runtime's own binding site
+  (`--ngram-gguf`, `bind_ngram_ports`; the serving-shape IR as an artifact
+  directory, depth 4 allowlisted);
+- the thirteen paged ports fed (`SDPAToPagedAttention` over the emitted
+  constructs; nothing declared by hand), `position_ids` at the port's rank,
+  `qwen_sparse_attention` counted as attention;
+- the dynamic-T serving class (the query block, the rope span, the state
+  constructs);
+- the IQ4_NL n-gram table as seven USM-host ports (26.8 GiB, ~1.9 s bind),
+  decoded in-graph bit for bit from the GGUF's own bytes;
+- the reviewers' riders and the PLE-ordinal oracle cell (the index rule gated
+  by the GGUF's own stored constants);
+- the KLD instrument for the served half, with its own run-to-run floor
+  reported beside every mean and the bar tagged PROVISIONAL with its
+  provenance — red at depth 4 as predicted (11.65 / 11.48 nats);
+- the full-depth artifact built (76.3 GiB, 82 min) and its compile refused by
+  the HOST, measured; the France line at full depth EMPTY by honest refusal;
+- the C++ ladder at `--max-skips 0` with the shard, green — the count is
+  generated on the tag tree and recorded in the tag-day checklist, never
+  typed here.
+
+Depth-4 output is mechanism, never an answer. The Paris line is 0.5.1's.
 
 ### The serving-shape IR as an artifact directory, and the served path on it (2026-09-13)
 

@@ -40,11 +40,12 @@ instruction, which is the one thing this directory exists to prevent.
 the README and FURTHER-READING.md was taken on that code. A patch that does not apply
 cleanly to that commit is a bug in `patches/`, not a reason to move the pin.
 
-The patched build reports itself as `…-71640275d29-marfrit-pN` (`+p6` is the
-deployed level, `+p7` the recipe carrying patch 0021 for the GGUF path — not
-built yet), so a version string in a log says whether it is the patched
-runtime and at which level. arcint reads the level off the plugin's version
-string at load and sizes its scratch terms by it; `--gguf` needs `+p7`.
+The patched build reports itself as `…-71640275d29-marfrit-pN` (`+p15`,
+patches 0003–0033, is the deployed level and the floor arcint 0.4.4 through
+0.5.0 depend on; `+p7` was the first level carrying patch 0021 for the GGUF
+path), so a version string in a log says whether it is the patched runtime
+and at which level. arcint reads the level off the plugin's version string
+at load and sizes its scratch terms by it; `--gguf` needs `+p7` or later.
 The build-number field stays numeric because `ov_parse_ci_build_number` rejects
 anything else; the patch level rides in the free-form tail.
 

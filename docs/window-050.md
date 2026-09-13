@@ -846,6 +846,21 @@ it, `RUN@8a84598`, pasted verbatim next to what was predicted. Every term is a
 B60 / A770 measurement this repository already holds, or a device-free reading
 of the pinned OpenVINO source; no external number appears.
 
+> **AMENDMENT (2026-09-13, operator CR #2 — a mark, never an erasure).** The
+> Paris line that this section's acceptance commit (`8a84598`) defined for
+> 0.5.0 — the served model's own token for the capital of France — **moved to
+> 0.5.1 by operator CR #2 (2026-09-13)**. 0.5.0 ships as the **mechanism
+> release**: the served path live on both cards through the runtime's own
+> binding site, the thirteen paged ports fed, the dynamic-T serving class,
+> the n-gram table as USM-host ports, the reviewers' riders and the PLE
+> oracle cell, the KLD instrument with its own floor (red at depth 4, as
+> predicted), the ladder green. The France row in §8 carries the dated probe
+> token (`ramework`, id 5613) **as mechanism evidence, not as an answer**. The
+> clause text of this section stays legible as written at `8a84598`; its
+> falsifiable Paris clause travels unchanged to the 0.5.1 acceptance
+> (`docs/window-051.md`), where the row that fills it is the model's own token
+> at depth 48 or a named refusal.
+
 **The reproducer is `tools/boot_serving_shape.py`**, committed with this
 section so the experiment is defined before it is run. It transcribes
 `load_paged`'s own sequence stage by stage (build → state prototypes → the
@@ -1946,6 +1961,16 @@ and its token `Ġ` is not this line's). **Paris is not dated.** The row
 stays the coherence line for the first window that runs the FULL model;
 that window replaces `ramework` with the model's own token, dated, in the
 same commit as its measurement.
+
+> **AMENDMENT (2026-09-13, operator CR #2 — a mark, never an erasure).** The
+> Paris line moved to 0.5.1 by operator CR #2 (2026-09-13); 0.5.0 ships as the
+> mechanism release. The France rows above are the served path's dated probe
+> token as **mechanism evidence, not an answer**, and they stay exactly as
+> measured. The full-model window this paragraph reserves the row for is
+> 0.5.1's (`docs/window-051.md`, row (e)); the falsifiable clause carries
+> over: the 48-layer served answer to "The capital of France is" is the
+> token whose surface form is `Paris` (its id recorded when it is measured),
+> or a named refusal that says which layer / which knowledge refuses.
 
 (For contrast and NOT as a substitute: the pre-window baseline of the *resident
 agent* — a different model, `qwen3.8-agent` on :8087 — answered `Paris` in 27
