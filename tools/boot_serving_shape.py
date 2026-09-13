@@ -598,7 +598,11 @@ def main(argv=None):
         n_z = 0
         for nm in state_names:
             t = rq.get_tensor(nm)
-            host = ov.Tensor(np.zeros(list(t.get_shape()), dtype=np.float16))
+            # the request's own element type: f16 by default, f32 under an
+            # f32 INFERENCE_PRECISION_HINT (the first f32 leg died here on a
+            # hard-coded f16 zero row: "src: f16 != dst: f32")
+            host = ov.Tensor(t.get_element_type(), t.get_shape())
+            host.data[...] = 0
             try:
                 t.copy_from(host)                       # RemoteTensor: the plugin's copy
             except AttributeError:
