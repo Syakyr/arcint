@@ -1157,7 +1157,134 @@ B5 holds, which is what the order asked for.
 <venv>/bin/python tools/boot_serving_shape.py --layers 4 --device GPU.0 --ids 760,6511,314,9338,369 --probe
 ```
 
-### Measured — `UNTESTED`, filled by the measurement commit
+### Measured — `RUN@6e3004e`, 2026-09-13 09:09:50Z–09:11:50Z, then the localisations
+
+The ladder above, run verbatim on a `git archive` extract of `6e3004e` (tree
+`d0b30232…`, hashed on both hosts), one process per leg, `timeout -s KILL
+1200`, both serving units inactive throughout, plugin the venv's stock
+`2026.4.0-22849`. Raw logs: `boot-6e3004e/` beside the extract, then
+`localise/` for what followed. **Two predictions died, and both deaths were
+localised the same morning to a mechanism each, with the mechanism measured
+rather than narrated.**
+
+| # | card | measured | matches? |
+|---|---|---|---|
+| Q1 | A770 | 3 chunks × 4096 rows: compile 0.3 s, `usm_host` +0.001 GiB, verdict **EXACT**, 0 rows wrong of 80 | **yes** |
+| Q2 | A770 | 1 chunk × 53,686,272 rows = 4,294,901,760 B: allocation accepted in 0.26 s; `usm_host` 4.000 GiB, `usm_device` **0.000** after set_tensor AND after infer (no device copy — the shared path was taken); infer 0.002 s; verdict **MISMATCH, 32 rows wrong of 80** | **NO — falsified**, on the rows, not on the transport |
+| Q3 | A770 | `create_host_tensor(u8, [320001536, 80])`: **REFUSED** in 0.05 s, `engine.cpp:319 … requested 25600122880 bytes, but max alloc size supported by device is 4294959104 bytes` | **yes** |
+| B1 | — | pass OK at depth 4, `PagedCausalConv1D 3, PagedGatedDeltaNet 3, PagedAttentionExtension 1`, the six `ngram_table.K` ports present and untouched after the pass | **yes** |
+| B2 | A770 | depth 4, served props: **`COMPILE FAIL after 18.23s peak_host_GiB=13.56 … plugin.cpp:54: \| map::at`** | **NO — falsified** |
+| B2 | B60 | the same, `13.61s peak_host_GiB=10.87 … map::at` | **NO — falsified** |
+| B3–B7 | both | not reached | — |
+
+**Q2, the rows.** Deterministic: seed 11 gives the same 32 rows wrong whether
+the sentinels are written before the bind or after one infer
+(`--order bind-then-write`), and whether every byte of the chunk was touched
+first (`--touch-all`: the wrong rows then read `0xEE` — the NEIGHBOUR row's
+fill — instead of zeros, so the kernel reads a wrong row, not an unmapped
+page). Seed 12: 35 of 80. Four 1 GiB chunks instead of one 4 GiB: 31 of 80.
+The wrong set is not a threshold: row 26,804,367 is wrong and the edge row
+26,843,136 just above it is right. The predicate that fits is **"the row id
+is not exactly representable in f32"** — 240 of 240 probed rows across three
+runs agree with it, none disagrees. The graph's in-graph decomposition
+(`Convert i64→i32 → Divide → Multiply → Subtract`) is executed by the GPU
+plugin in f32, which is exact only below 2²⁴ = 16,777,216, and the table has
+320,001,536 rows. Measured the other way the same hour: with the chunk id and
+the local id FED by the host and the graph doing only Equal / Select / Gather
+(`--index select`), **0 rows wrong of 80** at one 4 GiB chunk and at four; the
+per-chunk-tensor form (`--index direct`, Gather only) likewise 0 of 80. So the
+index path carries no arithmetic any more: `ngram_row_ids` became
+`ngram_chunk_ids` (i32) + `ngram_local_ids` (i64), split on the host where
+the hash already lives. This is the CPU's i64 finding of q4e.ple's header,
+met again on the card at a lower threshold.
+
+**B2, the node.** Plugin verbose output is not compiled into this build, so
+the graph was cut after named nodes (`--cut`) and each prefix compiled on the
+B60: `ple/gathered` OK 0.8 s; `layer0/mixer_out` (paged conv + GDN) OK 4.1 s;
+`layer0/out` (+ MoE) OK 6.7 s; `ple/out` OK; `layer1/out` OK 12.4 s;
+`layer2/out` OK 6.6 s; `attn3/q_rope` OK; `attn3/k_rope` OK;
+**`attn3/att_out` FAIL `map::at`** (u8 KV and f16 KV alike);
+`layer3/mixer_out` FAIL. The PagedAttentionExtension node itself. Its inputs,
+dumped beside the served artifact's after the same pass: 28 inputs on both,
+same Parameters, same Constants, same rt_info — and **q/k/v `[1, 30720]`,
+`[1, 2560]`, `[1, 2560]` on ours against `[?, ?]` on the served graph.** The
+pass flattens the SDPA's operands with `Reshape [0, -1]`
+(`state_management_pattern.cpp`, `q_reshape`): dimension 0 is kept as the
+token axis, the rest folded. On the served graph that yields
+`[tokens, heads·d]` because the pass also forces `input_ids` to `[-1]` +
+`Unsqueeze(1)` and the graph is dynamic in both batch and sequence, so at
+runtime the batch axis IS the token axis. On this emitter's static
+`[1, heads, T, d]` it yields one token of 30,720 features. The two
+linear-attention fusions have no such asymmetry — `PagedGatedDeltaNetFusion`
+(`flatten_batch_length`) and `PagedCausalConv1DFusion` (`Reshape [-1,
+hidden]`) flatten B·L into tokens themselves, which is why every prefix
+through `layer2/out` compiled. **This is the "query block static in T"
+suspect of the frontier order, in its true form: the SDPA's operands must be
+token-major, and nothing else in the graph has to change for the pass.**
+Fixed in the emitter at the one construct: q, k, v presented to the SDPA as
+`[T, heads, 1, d]` (a transpose; the same bytes), the mask `[T, 1, 1, total]`,
+the kv broadcast reading its batch off the input, the PA output transposed
+back. After the fix the node's operands read `[5, 6144]`, `[5, 512]`,
+`[5, 512]` — the served layout with T written in. The contract suite is
+green on that tree (28 passed 1 skipped) and it goes back to the cards
+below.
+
+### The third death, and the layout rule it wrote
+
+Token-major but STATIC operands (`[5, 6144]`) still drew `map::at` at the
+same cut; token-major AND DYNAMIC (`[?, 6144]`, the token count read off
+`position_ids`, which the pass rewrites to `[-1]`, and the operands gathered
+along it — an identity permutation) compiled: cut `attn3/att_out` OK on the
+A770 in 11.6 s and on the B60 in 8.9 s, then the whole depth-4 graph. Every
+served PagedAttentionExtension runs with a dynamic token axis; this plugin
+has no static path for it, and says so with `map::at` (the throw site sits
+in a stripped `.so`; gdb caught 770 `out_of_range` throws in the process, the
+last two inside the plugin under `compile_model`, and could name none).
+
+Then the first forward died at the PLE's additive join: hidden `[5, 5,
+10240]`. After the pass the embedding comes out `[tokens, 1, hidden]` and
+every static tensor of this graph is `[1, T, hidden]` — the same bytes — and
+a binary op between the two BROADCASTS rather than refuses. Pinned with one
+reshape where the token axis enters the static block. That is the whole
+layout rule for a static-T graph under this pass: token-major and dynamic at
+the SDPA operands, `[1, T, …]` everywhere else, one reshape at the seam.
+
+### Measured after the fixes — `RUN@806b76f`, 2026-09-13 09:38–09:46Z, both cards
+
+Tree `6c0106b6…` (`git write-tree` on both hosts), the tree the cards ran and
+the tree commit `806b76f` carries. One process per leg, both serving units
+inactive throughout. Logs: `boot-wt-final2/` beside the extract.
+
+| # | card | measured | matches the prediction? |
+|---|---|---|---|
+| Q1/Q2 | A770 | emitter's own gather (`--index select`): **EXACT**, 0 rows wrong of 80 at 1 × 4 GiB and at 4 × 1 GiB | **yes**, after the index fix |
+| B1 | — | pass OK; the ports after: `input_ids[-1]`, `position_ids[-1]`, `ngram_chunk_ids[1,5,16]`, `ngram_local_ids[1,5,16]`, `conv_mask[1,5]`, six `ngram_table.K`, the nine index ports, `key_cache.0`/`value_cache.0`, three `conv_state_table.N`, three `gated_delta_state_table.N` | **yes** |
+| **B2** | **A770** | **`COMPILE OK 19.30s` (15.3 s / 16.7 s on two earlier runs of the same code), `prec=float16`, `peak_host_GiB=10.82`, `device_resident_GiB=7.86`** | **yes — the acceptance** |
+| B3 | A770 | six USM-host tensors, 25,600,122,880 B, bound in 1.91 s; `usm_device` 7.86 → **7.86** GiB (no device copy), `usm_host` 0 → 23.85 GiB; peak host RSS unchanged by the binding (the driver does not commit the pages on allocation) | **yes** |
+| B4 | A770 | `SERVED PATH VERDICT: first refusal at set_tensor(inputs_embeds): … Port for tensor name inputs_embeds was not found.` | **yes** |
+| B5 | A770 | `--probe` (input_ids for inputs_embeds, labelled): **`INFER OK 3.161s out(1, 5, 248320) finite=True absmax=0.0000e+00`**, argmax `[0, 0, 0, 0, 0]`, RAW greedy token **0**; second infer **0.031 s**; `usm_device` still 7.86 GiB after infer | **yes** |
+| B6 | A770 | a 1-token block is **ACCEPTED at `set_tensor`** (the port is `[?]` after the pass) and refused at **`infer`** by the first baked reshape: `Reshape_18 … input {[1,1,10240]} … Requested output shape [1,5,10240] is incompatible` | **no — the refusal moved one stage later**; the query block is static in the GRAPH, not at the port |
+| B7 | B60 | compile 11.82 s, resident 7.87 GiB; table bound 1.94 s; the same served refusal; probe `INFER OK 0.044s`, absmax 0, token 0; second infer 0.017 s; the same decode refusal | **yes** |
+| — | both | no leftover process after any leg (the `ZOMBIE` lines in two ladder logs are the launcher shell matching its own command line, the self-match class already on record; a `pgrep -a python` count after the last leg reads 0) | — |
+
+First readings, not predictions: build 3.1–31.8 s at depth 4 (the 24.8 s and
+31.8 s readings came while the CPU suite ran beside them); the A770's first
+forward pays 3.16 s of kernel jit against the B60's 0.044 s, and the second
+forward is 0.031 s / 0.017 s; `declared_GiB` at depth 4 is 15.75 without the
+table (the u4-ceiled figure) against 63.43 with it.
+
+**What the forward is and is not.** Every weight is an unwritten page, so
+`absmax = 0` and token `0` are the structure lighting up on the served path's
+own compiled graph — the first time that has happened for this IR — and not
+an answer. The gathered table rows are whatever the USM-host allocation held
+and are multiplied into zero projections. Paris is not dated by this window.
+
+**The never-fed set after this window** (the contract cell asserts it):
+`input_ids` (the forward feeds `inputs_embeds`), `conv_mask`,
+`ngram_chunk_ids`, `ngram_local_ids`, and the `ngram_table.` family (the
+runtime has no site that binds the mapping to a compiled model's ports).
+Feeding them is the next increment, and every one of them is now reachable
+by a forward on a card.
 
 ## 5. Residency — the SIZE LEDGER, and the number that decides the window
 
@@ -1410,11 +1537,14 @@ baseline probe from a different model either.
 | probe | served model | answer | tokens | MTP acc/rej |
 |---|---|---|---|---|
 | "What is the capital of France? Answer in one word." | serving-shape IR, `RUN@8a84598`, 2026-09-13 | **no forward reached on either card** — depths 1–3: the pass refuses (`No ScaledDotProductAttention operation observed in the graph`); depth 4 (and 2): `engine.cpp:319`, `requested 25600122880 bytes` against `4294959104` (A770) / `24385683456` (B60). §4.6 | 0 | — |
+| "The capital of France is" (ids `760,6511,314,9338,369`) | serving-shape IR at depth 4, `RUN@806b76f`, 2026-09-13 09:38–09:46Z, A770 then B60 | **served path: refused at `set_tensor(inputs_embeds)` — `Port for tensor name inputs_embeds was not found`** (the IR declares `input_ids`). **Labelled probe** (input_ids fed in its place, nothing else): `INFER OK`, logits `(1, 5, 248320)`, finite, `absmax 0.0000e+00`, greedy token id **`0`** on both cards — zero weights, a structure witness and not an answer. §4.7 | 1 (probe) | — |
 
-§4.6 predicted this row before the window ran (P4) and the window wrote it as
-predicted. The row stays the coherence line for the first window that reaches
-a forward; that window replaces the refusal with the token, dated, in the same
-commit as its measurement.
+§4.6 predicted the first row before its window ran (P4) and the window wrote
+it as predicted. §4.7 predicted the second row's served-path signature (B4)
+and its probe token (B5) before its window ran, and the window wrote both.
+The row stays the coherence line for the first window that reaches a forward
+on REAL weights; that window replaces the token `0` with the model's, dated,
+in the same commit as its measurement.
 
 (For contrast and NOT as a substitute: the pre-window baseline of the *resident
 agent* — a different model, `qwen3.8-agent` on :8087 — answered `Paris` in 27
