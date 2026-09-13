@@ -508,18 +508,27 @@ def emit_gdn(hidden, amask, config, state, seq_len, ut_mode=None,
                          conv_emitter, core_emitter)
 
 
-def build_gdn_model(config, state, seq_len, ut_mode=None):
+def build_gdn_model(config, state, seq_len, ut_mode=None, core_emitter=None,
+                    sinks=None):
+    """The standalone GDN block.
+
+    `sinks` is required when `core_emitter` carries state: an emitter that
+    appends an Assign has to get it onto the Model, and a Model built without
+    it reads a state nothing ever writes. Pass the same list the emitter was
+    built with.
+    """
     H = config.hidden_size
     T = int(seq_len)
     hidden = op.parameter([1, T, H], Type.f32)
     hidden.set_friendly_name("hidden_states")
     amask = op.parameter([1, T], Type.f32)
     amask.set_friendly_name("attention_mask")
-    out = _gdn_subgraph(hidden, amask, config, state, T, ut_mode)
+    out = _gdn_subgraph(hidden, amask, config, state, T, ut_mode, None,
+                        core_emitter)
     result = op.result(out)
     result.set_friendly_name("output")
-    model = Model([result], [hidden, amask], "qwen4_exp_gdn_block")
-    return model
+    return Model([result], list(sinks or []), [hidden, amask],
+                 "qwen4_exp_gdn_block")
 
 
 __all__ = ["build_gdn_model", "emit_gdn", "UT_EMIT_MODE", "CHUNK"]

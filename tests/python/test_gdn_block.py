@@ -545,3 +545,94 @@ def test_no_emitted_op_sees_a_live_chunk_axis_under_perchunk():
         f"C={c2}. One unroll is emitted regardless of C, so this count is "
         f"structural; if it moved, the batched emission changed shape and the "
         f"comparison this cell draws is no longer between the same two things.")
+
+
+# ---------------------------------------------------------------------------
+# THE SERVING CORE, against the same truth the chunked one answers to
+# ---------------------------------------------------------------------------
+
+def test_the_sequential_serving_core_is_the_same_gdn_as_the_chunked_one():
+    """CF-GDNSEQ. The serving-shape emitter does NOT run this module's chunked
+    delta rule: it runs a token-sequential `v5::Loop`, because that is the only
+    form the serving path's fusion chain turns into
+    `gated_delta_state_table.N`. Two forms of one recurrence, and the commit
+    that introduced the second one wrote that the divergence "needs a gate of
+    its own". This is that gate.
+
+    It is NOT a comparison of the two emitters against each other. Judging the
+    new core by the old one would make the pair self-consistent and say nothing
+    about either: the sequential core is measured against the SAME f64 TRUTH,
+    at the SAME 20x-the-f32-floor doctrine, that `test_gdn_ov_parity` holds the
+    chunked core to. The chunked output is computed in the same run and printed
+    beside it, as context rather than as the yardstick.
+
+    Bitwise equality is NOT expected and is not asserted. DESIGN 3.2 already
+    records that a k-token pass computes bitwise-different state from k
+    one-token passes; the two differ in float association order and agree in
+    arithmetic, which is exactly what "distance to truth" measures and what a
+    comparison between them could not distinguish from both being wrong.
+    """
+    import openvino as ov
+
+    from q4e import serving_shape as ss
+
+    config = _make_config()
+    ref, _ = _ref_and_pin(config)
+    state = _state_np(ref)
+    T = 64
+    x = torch.randn(1, T, config.hidden_size)
+    mask = torch.ones(1, T, dtype=torch.long)
+    with torch.no_grad():
+        y_ref = ref(x, mask).float().numpy()
+        ref64 = ref_gdn.Qwen4ExpTextGatedDeltaNet(config, layer_idx=0).eval().double()
+        ref64.load_state_dict({k: v.double() for k, v in ref.state_dict().items()})
+        y_64 = ref64(x.double(), mask).numpy()
+    floor = float(np.max(np.abs(y_ref.astype(np.float64) - y_64)))
+
+    core = ov.Core()
+    feed = {"hidden_states": x.float().numpy(),
+            "attention_mask": mask.float().numpy()}
+
+    chunked = compile_for(core, gdn.build_gdn_model(config, state, seq_len=T),
+                          "CPU")
+    y_chunked = np.asarray(chunked(feed)[chunked.output(0)], np.float64)
+
+    # The serving core wants a beam index and somewhere to put its Assign. A
+    # constant beam is the single-lane case the serving path runs anyway, and
+    # the fusion's own pattern has the Gather as optional.
+    from openvino import opset13 as ovop
+    sinks = []
+    seq_model = gdn.build_gdn_model(
+        config, state, seq_len=T, sinks=sinks,
+        core_emitter=ss.stateful_gdn_core(
+            0, ovop.constant(np.array([0], np.int64)), sinks))
+    assert len(sinks) == 1, f"{len(sinks)} Assign(s); the core carries one state"
+    assert len(seq_model.get_variables()) == 1, seq_model.get_variables()
+    sequential = compile_for(core, seq_model, "CPU")
+    y_seq = np.asarray(sequential(feed)[sequential.output(0)], np.float64)
+
+    d_seq = float(np.max(np.abs(y_seq - y_64)))
+    d_chunked = float(np.max(np.abs(y_chunked - y_64)))
+    spread = float(np.max(np.abs(y_seq - y_chunked)))
+    print(f"\n[gdn-seq] T={T}  |sequential-r64|={d_seq:.4e}  "
+          f"|chunked-r64|={d_chunked:.4e}  |r32-r64|={floor:.4e}  "
+          f"ratio={d_seq / floor if floor else float('inf'):.2f}x  "
+          f"|sequential-chunked|={spread:.4e}")
+    print(f"[gdn-seq] nodes: chunked "
+          f"{len(gdn.build_gdn_model(config, state, seq_len=T).get_ordered_ops())}"
+          f", sequential {len(seq_model.get_ordered_ops())} "
+          f"(+ a Loop body of "
+          f"{len([n for n in seq_model.get_ordered_ops() if n.get_type_name() == 'Loop'][0].get_function().get_ordered_ops())})")
+
+    assert floor < 1e-5, (
+        f"the f32 REFERENCE itself left the float floor ({floor:.3e}) -- the "
+        f"denominator of this gate is broken, stop before reading either core")
+    assert d_seq <= 20.0 * floor, (
+        f"the SEQUENTIAL serving core is {d_seq / floor:.0f}x the reference's "
+        f"own f32 rounding ({d_seq:.4e} vs {floor:.4e}). It is the recurrence "
+        f"the serving graph actually runs, so this is not a lesser gate than "
+        f"the chunked core's -- same doctrine, same denominator.")
+    assert spread > 0.0, (
+        "the two cores are bitwise identical, which they cannot be: one sums "
+        "the recurrence per chunk and the other per token. A zero here means "
+        "this cell built the same graph twice and is measuring nothing.")

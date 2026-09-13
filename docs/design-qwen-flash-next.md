@@ -2202,6 +2202,13 @@ query scaled as `query / head_size^0.5` with `head_size` taken from a `ShapeOf`
 chain; whether it is required or opportunistic is not yet established and must
 be read before it is relied on.
 
+**RESOLVED 2026-09-13 by taking option 1 and gating the divergence it names**
+— see "The third construct" below, and `CF-GDNSEQ`
+(`test_the_sequential_serving_core_is_the_same_gdn_as_the_chunked_one`): the
+sequential core is measured against the same f64 truth, at the same
+20×-the-f32-floor doctrine, that the chunked core answers to. The fork as it
+stood when it was written:
+
 **This is the fork, and it is the operator's, not the emitter's.**
 `q4e.gdn` writes the *chunked* gated delta rule — CHUNK-sized blocks and the
 forward-substitution inverse — which is a different computation from the
@@ -2302,3 +2309,33 @@ with `os.wait4` and reads `ru_maxrss` for that child; both numbers are kept and
 the child's is asserted not to exceed the parent's. **The hole was demonstrated,
 not argued:** a child that allocates 2 GiB after its self-read reports 0.52 GiB
 where the kernel accounts 2.52 — 2.00 GiB invisible to the old method.
+
+#### CF-GDNSEQ — the divergence the fork named, gated (2026-09-13)
+
+Taking option 1 left one thing owed: the serving graph does not run the chunked
+delta rule the piecewise suites gate, so "that divergence needs its own gate".
+It has one, and it is **not** a comparison of the two emitters against each
+other — judging the new core by the old one would make the pair self-consistent
+and say nothing about either.
+
+The sequential core is measured against the **same f64 truth**, at the **same
+20× the f32 reference's own rounding** doctrine, that `test_gdn_ov_parity`
+holds the chunked core to. Measured, CPU, T=64, real reference weights:
+
+| | distance to f64 truth | vs the f32 floor |
+|---|---|---|
+| sequential (serving) | 1.0245e-06 | **0.92×** |
+| chunked (parity-gated) | 1.0394e-06 | 0.94× |
+| f32 reference's own floor | 1.1102e-06 | 1.00× |
+
+The serving core sits *closer* to truth than the chunked one, and both sit
+below the reference's own f32 rounding. They differ by 2.7195e-07 — **not**
+bitwise equal, which is asserted as a non-zero: DESIGN §3.2 already records
+that a k-token pass computes bitwise-different state from k one-token passes,
+and a zero there would mean the cell had built the same graph twice.
+
+Graph sizes, generated: chunked 2,037 nodes; sequential 166 plus a 42-op Loop
+body.
+
+Red cases run, not asserted: dropping the `Exp` from the gate decay → `nan`,
+red; dropping `beta` from the delta → 205,316× the floor, red.
