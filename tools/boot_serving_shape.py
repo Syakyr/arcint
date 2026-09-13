@@ -157,6 +157,12 @@ def main(argv=None):
                     help="INFERENCE_PRECISION_HINT for the post-pass compile "
                          "(f32 / f16); absent = the plugin's default, which is "
                          "what the served binary gets")
+    ap.add_argument("--plugin-prop", action="append", default=[],
+                    help="KEY=VALUE added to the post-pass compile properties, "
+                         "repeatable (e.g. GPU_DISABLE_ASYNC_COMPILATION=YES, "
+                         "the pinned plugin's own switch for the asynchronous "
+                         "static-shape kernel swap); a key the plugin refuses "
+                         "fails the compile by name")
     args = ap.parse_args(argv)
 
     import openvino as ov
@@ -309,6 +315,10 @@ def main(argv=None):
         props = {"KV_CACHE_PRECISION": getattr(ov.Type, args.paged_kv)}
         if args.precision:
             props["INFERENCE_PRECISION_HINT"] = args.precision
+        for kv in args.plugin_prop:
+            k, _, v = kv.partition("=")
+            props[k] = v
+    say("compile", f"props {props}")
     t0 = time.time()
     try:
         compiled = core.compile_model(model, dev, props)
