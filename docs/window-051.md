@@ -101,8 +101,79 @@ number.
 | depth | fill (predicted → measured) | compile, served binary (predicted → measured) | device-resident after compile | warm decode t/s | per-forward NVMe reads (predicted → measured) | card |
 |---|---|---|---|---|---|---|
 | 4 | measured 556.8 s (window-050 §4.9) | measured: server up in 1 min 58 s on a quiet host | 6.79 GiB | 38.2 / 47.1 | 0 (all resident) | A770 / B60 |
-| 12 | **~25 min predicted** (¼ of 82 min, the per-layer share of the 48-layer fill) → EMPTY | predicted: minutes; staging ≈ 3.7 GiB dense + 16.2 GB expert bodies **as constants** at this rung (the single-model rung, not yet segmented) = ~19 GB staged in host next to the 26.8 GiB table → **predicted to compile on the B60** with ~2 GiB of host to spare, or to name the new edge → EMPTY | predicted ≈ 6.79 + 8 × 1.27 ≈ 17 GiB + activations at chunk 512 (against 22.71 GiB on the B60) → EMPTY | EMPTY | 0 (resident) | B60 |
+| 12 | **~25 min predicted** → **measured 1,450.9 s (24.2 min)** build + 197.9 s save + 97.8 s hash, `RUN@d93508c` 2026-09-13 17:36–18:06Z; 265 dense tensors 5.88 GiB f32, 36 bodies 16,161,177,600 B, `.bin` 22,613,492,905 B (21.06 GiB), peak host 30.39 GiB; xml sha `7738fa87cddca8e2`, allowlisted `qwen3.8-flash-next-d12` — **C1 holds** | predicted minutes, ~19 GB staged in host → **measured: compiled on the B60 in 89.7 s** (`RUN@b4f593e`, served binary, 18:08Z; 128.0 s on the second process; 131.8 s through the python driver) — **C2 holds**. The host-side staging did NOT reach the arithmetic's 19 GB: `fdinfo` `drm-resident-gtt` peaked at **4.22 GB** in 15-s samples during the compile while `drm-resident-vram0` went 2 MB → 19.9 GB → 21.8 GB within two minutes; the 48-layer compile (§4.10) had shown gtt to 11.8 GiB and vram0 flat at 7.6 MiB for six minutes. The two compiles behave differently, not just by size; row (a)'s "every constant staged in host at once" is therefore NOT what this rung measured, and the 48-layer refusal's mechanism is re-opened by this number (a 24-layer rung would say whether it is a per-graph reservation the plugin makes when the total exceeds the card) | **17.73 GiB** (plugin, both processes; predicted ≈ 17) + table 26.82 GiB USM host (bind 37.5 s) | **18.3–18.5 t/s** greedy decode (B60, chat 32 tokens 18.5, raw 64 tokens 18.3; first request 13.8 with the jit) against 47.1 at depth 4; prefill 2,735 tokens at chunk 512 **84.4 s (32.4 t/s)**, later windows 97–109 s under the 2.7 GB/window logits dump | 0 (resident) | B60 |
 | 48, segmented (4 × 12 or the cut (a) decides) | measured 82 min (the artifact exists) | per segment: EMPTY | per segment: dense f16 ≈ 1.8 GiB + one segment's expert ports (host) + KV + state | EMPTY | route (a) estimate **60 GB / forward at 1.8 GB/s ≈ 35 s** (cold page cache) → EMPTY; warm-cache case: EMPTY | A770 or B60 |
+
+**The 12-layer rung's France line — mechanism, never an answer (row (f)):**
+`"The capital of France is"` → **` impkatanRGRIESIRES fiNDamespace`** (8
+greedy tokens, byte-identical on the warm repeat; 64 tokens continue
+`…lerotimo渐进triceELAClassLoaderHit…复制复制复制…`); chat form
+`reasoning_content` likewise. `RUN@b4f593e`, B60, 18:10Z. 36 layers are
+missing.
+
+**The 12-layer rung's KLD (REPORT ONLY, red as at depth 4):** mean KL
+below / at-or-above 2051: window 0 **11.93 / 11.63**, window 1 **11.89 /
+11.83** (leg 1); 12.01 / 11.60 and 11.99 / 11.89 (leg 2); argmax agreement
+0.0007 / 0.0000. **The floor at this rung is NOT the depth-4 floor**: leg 1's
+two replays differed by KL(A‖B) **0.743 / 0.822** mean, argmax agreement
+**0.118 / 0.111**, max |logit diff| 18.0; leg 2 (`--warmup 2 --repeat 2`,
+four passes per window) every one of 6 window pairs moved, the counted
+pair by 0.687 / 0.787, agreement 0.123 / 0.103, and the greedy tokens
+walked (window 0: `int`, `页`, ` inde`, `atom`; window 1: `loat`, `loat`,
+`arul`, `cito`). The prediction written before leg 2 (the counted pair
+bit-identical after two warm-ups, window-050 §4.11.1's rule at depth 12)
+**died**. The python driver on the same artifact, single 1,024-token
+forwards on the same request, state zeroed (`RUN@b4f593e`, B60, 18:37Z):
+forward #2 differs from #1 from row 32 (750 of 1,024 argmaxes moved, max
+|diff| 13.9), #3 from #2 (569 moved), #4..#8 each from its predecessor
+(673–804 moved; first differing row 14, 25 or 32 every time) — **per-forward,
+not a one-time step**, rows 0–13 identical every time. On the A770 the same
+driver at depth 4 was bit-identical over 12 forwards (window-050 §4.11.1).
+
+**Localised, then attributed to the CARD (the cut bisect, `RUN@b4f593e`,
+B60, 18:48–19:12Z, 3–4 forwards per cut):**
+
+| cut (artifact, card) | forward-to-forward | first differing row | max \|diff\| (max \|#1\|) | argmaxes moved / 1,024 |
+|---|---|---|---|---|
+| `layer0/out` (d12, B60) | every forward differs | 32 | 2.44e-4 (2.54) | 0 — 1–3 rows touched |
+| `ple/out` (d12, B60) | #2 = #3 ≠ #1 (one step) | 777 | 5.86e-3 (2.54) | 1 |
+| `layer1/out` (d12, B60) | every forward differs | 14 / 264 | 8.1e-3 (3.16) | 0 |
+| `layer2/out` (d12, B60) | every forward differs | 14 / 137 | 0.26–0.44 (32.6) | 3–11 |
+| `layer3/out` (d12, B60) | every forward differs | 14 | 0.25–0.30 (32.2) | 6–15 |
+| `layer7/out` (d12, B60) | every forward differs | 32 | 15.6–26.1 (85.1) | 85–136 |
+| logits (d12, B60) | every forward differs | 14 / 25 / 32 | 12.7–16.9 (21.1) | 569–804 |
+| **`layer2/out` (d4, B60)** | **every forward differs** | 14 | 0.11–0.36 (32.4) | 3–12 |
+| **logits (d4, B60)** | **every forward differs** | 14 / 51 / 148 | 1.60–1.69 (17.1) | 33–54 |
+| `layer2/out` (d4, **A770**, window-050 §4.11.1) | **bit-identical ×8** | — | 0 | 0 |
+| logits (d4, **A770**, warm) | **bit-identical ×12** | — | 0 | 0 |
+
+The expert bodies, zero-points, scales and rope tables of layers 0–2 are
+byte-identical between the two artifacts (29 named constants, same
+digests, checked device-free the same hour). The variable that separates
+"bit-identical" from "every forward differs" is the card: **the B60 (GPU.0,
+Xe2) runs this graph's first layer with a per-forward nondeterminism of one
+f16 ulp in a few rows at or after row 32** (`layer0/out`: 1–3 of 1,024 rows,
+2.44e-4 against 2.54), which twelve layers amplify to an 11 % argmax
+agreement at the logits and four layers to 33–54 moved argmaxes; the A770
+(GPU.1, Alchemist) runs the same bytes bit-identically. Which kernel inside
+layer 0's block (short-conv, GDN core, hyper-connection, MoE) is not
+localised — the cut names the block, and the kernel-level cut needs names
+the emitter does not set yet. The reviewer's B60 leg of the ba2d5de review
+(two identical replays differing from row 14 / 261) was this, not the A770's
+one-time kernel step.
+
+**Consequences.** (1) A KL floor is per card: on the A770 it is the settled
+kernel set's zero with the one-time step named; on the B60 it is a
+per-forward floor whose size grows with depth (0.74 nats mean at 12 layers)
+and against which no bar is readable at 48 layers without either the
+kernel named and fixed or the A770 as the measurement card. (2) The
+12-layer rung's France token above is ONE draw of that floor on the B60,
+byte-identical only within its own process's warm repeat. (3) Row (c)'s
+cold-boot determinism is predicted to FAIL on the B60 as measured and to
+hold on the A770; the row stays EMPTY until the segmented service exists,
+and it names the card when it is filled. (4) The kernel-level localisation
+is an open row: `--cut` at the emitter's next finer names inside layer 0,
+B60, cold and warm.
 
 ### (c) Cold-boot determinism
 
