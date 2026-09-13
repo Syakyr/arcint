@@ -631,6 +631,10 @@ def main(argv=None):
     # appears only in one of the two modes names the request's own state.
     base = np.array(rows, dtype=np.float32, copy=True)
     served_feeds = {name: req.get_tensor(name) for name in fed}
+    import hashlib
+    digest = lambda a: hashlib.sha256(np.ascontiguousarray(a).tobytes()).hexdigest()[:12]  # noqa: E731
+    say("repeat", f"#1 digest {digest(base)} (sha256 of the f32 bytes, first 12 hex)")
+    prev = base
 
     def fresh_request():
         r2 = compiled.create_infer_request()
@@ -669,10 +673,14 @@ def main(argv=None):
             say("repeat", f"#{k} shape {cur.shape} != #1 {base.shape}")
             break
         diff_rows = np.flatnonzero((cur != base).any(axis=1))
+        vs_prev = ("identical to the previous" if np.array_equal(cur, prev) else
+                   f"vs previous: max |diff| {float(np.abs(cur - prev).max()):.4e}, argmax moved in "
+                   f"{int((cur.argmax(axis=1) != prev.argmax(axis=1)).sum())} rows")
+        prev = cur
         if diff_rows.size == 0:
             say("repeat", f"#{k} ({'fresh' if args.fresh else 'same'} request) "
                           f"INFER OK {dt:.3f}s: BIT-IDENTICAL to #1 over "
-                          f"{base.shape[0]} rows x {base.shape[1]}")
+                          f"{base.shape[0]} rows x {base.shape[1]}; digest {digest(cur)}; {vs_prev}")
             continue
         moved = int((cur.argmax(axis=1) != base.argmax(axis=1)).sum())
         say("repeat", f"#{k} ({'fresh' if args.fresh else 'same'} request) "
@@ -680,7 +688,7 @@ def main(argv=None):
                       f"{int(diff_rows[0])}, {diff_rows.size} of {base.shape[0]} "
                       f"rows differ, max |diff| {float(np.abs(cur - base).max()):.4e}, "
                       f"max |#1| {float(np.abs(base).max()):.4e}, argmax moved "
-                      f"in {moved} rows")
+                      f"in {moved} rows; digest {digest(cur)}; {vs_prev}")
 
     # ---- the static-T probe: what a DECODE step would meet -----------------------
     # A decode step feeds one token. The query block is static in T inside the
