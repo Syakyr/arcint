@@ -336,7 +336,7 @@ def emit_shared_expert(hidden_bth, config, state, seq_len):
     expert gate) -- pin 986-996."""
     H = config.hidden_size
     I = config.shared_expert_intermediate_size
-    T = int(seq_len)
+    T = -1 if seq_len is None else int(seq_len)   # -1: dynamic in T
     h2d = _reshape(hidden_bth, [T, H])
     sg = _mm(h2d, _c(state["shared_expert.gate_proj.weight"]), tb=True)
     su = _mm(h2d, _c(state["shared_expert.up_proj.weight"]), tb=True)

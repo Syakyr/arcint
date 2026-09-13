@@ -168,14 +168,28 @@ from . import hc as qhc
 from . import ple as qple
 from . import piecewise_export as pwe
 
-# The n-gram table's element type as DECLARED in the serving-shape IR. The
-# shipped tensor is IQ4_NL, which OpenVINO has no element type for; u4 carries
-# the same nibble width, which is what the residency arithmetic depends on.
-# Since increment 5 the table is not a constant of the graph: its rows travel
-# as u8 BYTES over the `ngram_table.K` ports (NGRAM_PORT_TYPE) and the nibble
-# width lives in `row_bytes = head_dim * u4.bitwidth / 8`.
-NGRAM_DECLARED_TYPE = Type.u4
+# The n-gram table's row format. It used to be DECLARED u4 (the same nibble
+# width as the shipped tensor, for the residency arithmetic). The
+# shipped tensor is IQ4_NL, which OpenVINO has no element type for; since
+# feed-the-ports the rows travel over the `ngram_table.K` ports as their OWN
+# bytes -- ggml's block_iq4_nl: a little-endian f16 scale `d` followed by 16
+# bytes of nibbles per 32 elements (element j is the low nibble of byte j,
+# element 16+j the high one), so a 160-wide row is 5 x 18 = 90 bytes -- and
+# are dequantised AFTER the gather (`ngram_dequant_iq4nl`: d x kvalues[q]).
+# That is what lets the real table (28.8 GB) bind to the ports unchanged
+# from the GGUF, with no host-side conversion and no second copy.
 NGRAM_PORT_TYPE = Type.u8
+NGRAM_BLOCK_ELEMS = 32
+NGRAM_BLOCK_BYTES = 18
+# ggml's kvalues_iq4nl, the 16-entry codebook every IQ4_NL nibble indexes
+NGRAM_IQ4NL_KVALUES = (-127, -104, -83, -65, -49, -35, -22, -10,
+                       1, 13, 25, 38, 53, 69, 89, 113)
+
+
+def ngram_row_bytes(head_dim):
+    """Bytes of one table row of `head_dim` elements in IQ4_NL."""
+    assert head_dim % NGRAM_BLOCK_ELEMS == 0, head_dim
+    return head_dim // NGRAM_BLOCK_ELEMS * NGRAM_BLOCK_BYTES
 # The per-object allocation cap the table is chunked under: the A770's, as the
 # GPU plugin reported it at engine.cpp:319 (`RUN@be57428`, window-050 §4.4,
 # re-read verbatim by `RUN@8a84598` §4.6). The tighter of the two cards, and
@@ -509,11 +523,14 @@ def ngram_table_ports(n_rows, row_bytes, cap_bytes=NGRAM_CHUNK_CAP_BYTES):
     return ports
 
 
-def ngram_chunked_gather(chunk_ids, local_ids, ports, head_dim):
+def ngram_chunked_gather(chunk_ids, local_ids, ports):
     """`[1, T, Hn]` i32 chunk ids + `[1, T, Hn]` i64 local row ids over the
-    chunked table -> `[1, T, Hn, head_dim]` f32, the same tensor a Gather over
-    the whole `[n_rows, head_dim]` u4 table would produce, nibbles unpacked
-    LOW FIRST (element 2j is the low nibble of byte j, 2j+1 the high one).
+    chunked table -> `[1, T, Hn, row_bytes]` f32: the gathered rows' BYTES
+    (0..255, exact in f32), the same rows a Gather over the whole
+    `[n_rows, row_bytes]` table would produce. The format is decoded by
+    `ngram_dequant_iq4nl`, kept separate so the gather can be probed on a
+    card with arbitrary sentinel bytes and the decode gated on CPU against
+    the gguf package's own dequantiser.
 
     NO ARITHMETIC ON THE INDEX PATH. The first form of this function took the
     GLOBAL row id and decomposed it in the graph with i32 Divide / Multiply /
@@ -527,8 +544,9 @@ def ngram_chunked_gather(chunk_ids, local_ids, ports, head_dim):
     at one and at four chunks). So the decomposition moved to the host, where
     the hash already lives (src/exec/ngram_row_ids.h; the same boundary
     q4e.ple's header drew for the hash after the CPU's i64 arithmetic was
-    measured broken), and the graph's index path is Equal, Select and Gather
-    only -- the ops measured exact.
+    measured broken), and the ids pass through Equal, Select and Gather only
+    -- the ops measured exact. (The fallback zero is a Broadcast over
+    ShapeOf(local_ids): it reads the port's shape, not one id.)
 
     Every chunk is gathered, at its own local row where the id lands in it and
     at row 0 otherwise, so no Gather ever sees an out-of-range index
@@ -537,15 +555,15 @@ def ngram_chunked_gather(chunk_ids, local_ids, ports, head_dim):
     `len(ports)` gathers of T x Hn rows each -- bytes, not the table.
     """
     i32 = lambda v: op.constant(np.array(v, np.int32))
-    row_bytes = int(ports[0].get_output_partial_shape(0)[1].get_length())
-    assert head_dim == 2 * row_bytes, (head_dim, row_bytes)
 
-    # the fallback index for the chunks the id does not name: a CONSTANT
-    # zero of the id port's own (static) shape. The first form multiplied
-    # the id tensor by zero -- inert, but an eltwise op on the index path
-    # that the record said carried none (review of d30db36, F1 rider).
-    zero = op.constant(np.zeros(
-        [d.get_length() for d in local_ids.get_output_partial_shape(0)], np.int64))
+    # the fallback index for the chunks the id does not name: a zero
+    # BROADCAST to the id port's shape -- ShapeOf reads the shape, never the
+    # ids. The first form multiplied the id tensor by zero: inert, but an
+    # eltwise op on the index path that the record said carried none (review
+    # of d30db36, F1 rider); the second was a static constant, which a graph
+    # dynamic in T cannot have.
+    zero = op.broadcast(op.constant(np.array(0, np.int64)),
+                        op.shape_of(local_ids, output_type="i64"))
     picked = None
     for k, port in enumerate(ports):
         here = op.equal(chunk_ids, i32(k))                     # [1,T,Hn] bool
@@ -557,18 +575,59 @@ def ngram_chunked_gather(chunk_ids, local_ids, ports, head_dim):
         else:
             picked = op.select(op.unsqueeze(here, i32(-1)), rows, picked)
 
-    x = op.convert(picked, Type.f32)                           # bytes as f32
-    hi = op.floor(op.divide(x, op.constant(np.array(16.0, np.float32))))
-    lo = op.subtract(x, op.multiply(hi, op.constant(np.array(16.0, np.float32))))
-    pair = op.concat([op.unsqueeze(lo, i32(-1)), op.unsqueeze(hi, i32(-1))],
-                     axis=-1)                                  # [1,T,Hn,rb,2]
-    shape = op.concat([
-        op.slice(op.shape_of(x, output_type="i64"),
-                 op.constant(np.array([0], np.int64)),
-                 op.constant(np.array([3], np.int64)),
-                 op.constant(np.array([1], np.int64))),
-        op.constant(np.array([head_dim], np.int64))], axis=0)
-    return op.reshape(pair, shape, special_zero=False)         # [1,T,Hn,head_dim]
+    return op.convert(picked, Type.f32)                        # bytes as f32
+
+
+def ngram_dequant_iq4nl(row_bytes_f32, head_dim):
+    """`[1, T, Hn, row_bytes]` f32 (bytes 0..255) -> `[1, T, Hn, head_dim]`
+    f32: ggml's IQ4_NL dequantisation, `d * kvalues[q]` per element, done
+    with ops that are EXACT on this card class (window-050 §4.7: integer
+    eltwise runs in f32, so every intermediate here is an integer below 2**24
+    or a power of two, and the codebook and the exponent are Gathers on
+    constants rather than arithmetic):
+
+      * the block splits into d_lo, d_hi (the f16 scale's two bytes) and 16
+        nibble bytes; nibbles come out as floor(b/16) and b - 16*floor(b/16);
+      * the f16 is rebuilt from its bit fields -- sign, 5-bit exponent, 10-bit
+        mantissa, subnormals included -- as sign * 2**(e-15) * (1 + m/1024),
+        the power of two gathered from a 32-entry table, so `d` is bit-exact;
+      * kvalues[q] is a Gather on the 16-entry codebook with the nibble
+        converted to i32 (Convert is exact for 0..15).
+
+    The product of an f16-exact scale and a codebook integer is exact in
+    f32, so the result equals gguf-py's `dequantize(raw, IQ4_NL)` bit for
+    bit; the contract cell asserts equality, not tolerance.
+    """
+    f32 = lambda v: op.constant(np.array(v, np.float32))
+    i64 = lambda v: op.constant(np.array(v, np.int64))
+    nb = head_dim // NGRAM_BLOCK_ELEMS
+    # [..., nb, 18]: 18 = 2 scale bytes + 16 nibble bytes
+    blocks = op.reshape(row_bytes_f32, i64([0, 0, 0, nb, NGRAM_BLOCK_BYTES]),
+                        special_zero=True)
+    d_lo = op.gather(blocks, i64(0), i64(-1))                  # [..., nb]
+    d_hi = op.gather(blocks, i64(1), i64(-1))
+    qs = op.slice(blocks, i64([2]), i64([NGRAM_BLOCK_BYTES]), i64([1]), i64([-1]))
+    hi = op.floor(op.divide(qs, f32(16.0)))
+    lo = op.subtract(qs, op.multiply(hi, f32(16.0)))
+    nibbles = op.concat([lo, hi], axis=-1)                     # [..., nb, 32]
+    kv = op.gather(f32(NGRAM_IQ4NL_KVALUES), op.convert(nibbles, Type.i32),
+                   i64(0))                                     # codebook
+    # the f16 scale from its bits: bits = lo + 256*hi (< 65536, exact)
+    bits = op.add(d_lo, op.multiply(d_hi, f32(256.0)))
+    sign_bit = op.floor(op.divide(bits, f32(32768.0)))         # 0 or 1
+    rest = op.subtract(bits, op.multiply(sign_bit, f32(32768.0)))
+    exp = op.floor(op.divide(rest, f32(1024.0)))               # 0..31
+    mant = op.subtract(rest, op.multiply(exp, f32(1024.0)))    # 0..1023
+    # 2**(e-15) for e = 0..31, with e = 0 (subnormal) mapped to 2**-14 and
+    # the mantissa then taken WITHOUT the implicit one
+    pow_table = [2.0 ** (e - 15) if e > 0 else 2.0 ** -14 for e in range(32)]
+    scale = op.gather(f32(pow_table), op.convert(exp, Type.i32), i64(0))
+    normal = op.convert(op.greater(exp, f32(0.0)), Type.f32)   # 1 if e > 0
+    frac = op.add(normal, op.divide(mant, f32(1024.0)))        # 1.m or 0.m
+    sign = op.subtract(f32(1.0), op.multiply(sign_bit, f32(2.0)))
+    d = op.multiply(op.multiply(sign, scale), frac)            # [..., nb]
+    vals = op.multiply(kv, op.unsqueeze(d, i64(-1)))           # [..., nb, 32]
+    return op.reshape(vals, i64([0, 0, 0, head_dim]), special_zero=True)
 
 
 # --------------------------------------------------------------------------
@@ -688,12 +747,12 @@ def emit_moe_tiled(hidden_bth, config, state, arena, T, tag, filler=None,
                     if kk.startswith("mlp.shared_expert")}
     from . import moe as _moe
     sh = _moe.emit_shared_expert(
-        op.reshape(y_flat, op.constant(np.array([1, T, H], np.int64)),
+        op.reshape(y_flat, op.constant(np.array([1, -1, H], np.int64)),
                    special_zero=False),
-        config, shared_state, T)                                       # [T,H]
+        config, shared_state, None)                                    # [T,H]
 
     out2d = op.add(mixed, sh)
-    return op.reshape(out2d, op.constant(np.array([1, T, H], np.int64)),
+    return op.reshape(out2d, op.constant(np.array([1, -1, H], np.int64)),
                       special_zero=False)
 
 
@@ -701,9 +760,28 @@ def emit_moe_tiled(hidden_bth, config, state, arena, T, tag, filler=None,
 # The full-geometry serving-shape backbone
 # --------------------------------------------------------------------------
 
-def _layer_state(arena, config, kind):
+def _fill_dense(st, feed, prefix, census):
+    """Write REAL weights into the arena buffers `st` holds (feed-the-ports):
+    each key becomes the pin key `prefix + key` and `feed.fitted` returns the
+    dequantised GGUF tensor cut to the buffer's shape (or raises by name).
+    The buffers are the arena's memmaps, so writing them is what turns an
+    unwritten page into a real one -- the same mechanism as the expert fill.
+    `census` collects (pin_key, bytes) for the report."""
+    if feed is None:
+        return
+    layer = None
+    if prefix.startswith("layers."):
+        layer = int(prefix.split(".")[1])
+    for key, buf in st.items():
+        arr = feed.fitted(prefix + key, tuple(buf.shape), gguf_layer=layer)
+        buf[...] = arr
+        census.append((prefix + key, int(buf.nbytes)))
+
+
+def _layer_state(arena, config, kind, layer=None, feed=None, census=None):
     """Sparse-declared state for one decoder layer, at the pin's own
-    module-relative keys, real shapes from `config`."""
+    module-relative keys, real shapes from `config`. With `feed` the buffers
+    are written from the real shards (`_fill_dense`)."""
     H = config.hidden_size
     hc = config.hc_count
     lr = config.hc_lowrank
@@ -753,15 +831,17 @@ def _layer_state(arena, config, kind):
     st["mlp.shared_expert.up_proj.weight"] = arena.f32([Is, H])
     st["mlp.shared_expert.down_proj.weight"] = arena.f32([H, Is])
     st["mlp.shared_expert_gate.weight"] = arena.f32([1, H])
+    if feed is not None:
+        _fill_dense(st, feed, f"layers.{layer}.", census)
     return st
 
 
-def _ple_state(arena, config):
+def _ple_state(arena, config, layer=None, feed=None, census=None):
     H = config.hidden_size
     hc = config.hc_count
     Hn = (config.ngram_size - 1) * config.heads_per_ngram
     head_dim = config.ple_embed_dim // Hn
-    return {
+    st = {
         "key_proj.weight": arena.f32([hc * H, config.ple_embed_dim]),
         "value_proj.weight": arena.f32([H, config.ple_embed_dim]),
         # [hc*H] = 10240, measured; the group RMS norms span the whole
@@ -770,22 +850,40 @@ def _ple_state(arena, config):
         "norm_query.weight": arena.f32([hc * H]),
         "norm_conv.weight": arena.f32([hc * H]),
         "conv1d.weight": arena.f32([hc * H, 1, config.ple_conv_kernel_size]),
-    }, head_dim, Hn
+    }
+    if feed is not None:
+        _fill_dense(st, feed, f"layers.{layer}.ple.", census)
+    return st, head_dim, Hn
 
 
-def build_serving_shape_ir(config=None, seq_len=64, arena=None, n_layers=None,
-                           filler=None,
-                           ngram_chunk_cap_bytes=NGRAM_CHUNK_CAP_BYTES):
-    """The full-geometry serving-shape backbone as an ov::Model.
+def build_serving_shape_ir(config=None, arena=None, n_layers=None,
+                           filler=None, feed=None,
+                           ngram_chunk_cap_bytes=NGRAM_CHUNK_CAP_BYTES,
+                           rope_span=None):
+    """The full-geometry serving-shape backbone as an ov::Model, DYNAMIC IN T
+    (feed-the-ports increment): no port, reshape or slice carries the block
+    length. `T` below is the runtime token count of a forward.
 
     Inputs
-        input_ids        [1, T]      i64
+        inputs_embeds    [1, T, H]   f32   -- the embedded tokens. The served
+                                             runtime embeds on the host
+                                             (`embed_paged`) and feeds this
+                                             name (backend_ov.cpp:6141); the
+                                             pass rewrites the port to [-1, -1]
+                                             + Unsqueeze(1), so it is fed as
+                                             [T, H]. The embedding weight is
+                                             NOT in this graph any more --
+                                             `pwe.build_embed_piece` is the
+                                             separate model, as for the served
+                                             artifact.
         position_ids     [1, T]      i64
-        ngram_table.K    [rows_K, 80] u8   -- the n-gram table, one port per
+        ngram_table.K    [rows_K, 90] u8   -- the n-gram table, one port per
                                              chunk under `ngram_chunk_cap_bytes`
                                              (ngram_table_ports), bound once
                                              per request from host memory;
-                                             80 = 160 nibbles of one row
+                                             90 = one 160-wide IQ4_NL row as
+                                             the GGUF stores it (5 blocks of
+                                             18 bytes), decoded in-graph
         ngram_chunk_ids  [1, T, 16]  i32   -- which `ngram_table.K` holds the
         ngram_local_ids  [1, T, 16]  i64      hashed row, and the row inside
                                              it: the global row id split by
@@ -806,10 +904,21 @@ def build_serving_shape_ir(config=None, seq_len=64, arena=None, n_layers=None,
     Output
         logits           [1, T, vocab] f32
 
+    `rope_span` sizes the ONE cos/sin table pair every full-attention layer
+    gathers from (default `max_position_embeddings`, 262,144 at real
+    geometry: ~67 MB a side, once, shared -- not per layer).
+
+    `feed` (a `q4e.gguf_feed.GgufFeed`) writes the REAL dense weights of the
+    built layers, the PLE, the final mixer and the head into the arena
+    (`_fill_dense`); with `filler` for the expert bodies that is the whole
+    depth-`n_layers` model at real weights. The embedding is not in this
+    graph (it is fed) and the n-gram table is bound to the ports at request
+    time; both come from the same shards on the driver's side.
+
     Returns (model, report) where `report` carries the measured structure.
     """
     cfg = config if config is not None else pwe.real_config()
-    T = int(seq_len)
+    T = -1                                 # dynamic: every reshape uses -1
     own_arena = arena is None
     ar = arena if arena is not None else SparseArena()
     nl = int(n_layers if n_layers is not None else cfg.num_hidden_layers)
@@ -822,14 +931,18 @@ def build_serving_shape_ir(config=None, seq_len=64, arena=None, n_layers=None,
     # layer's: `ov::Model` takes them as its own argument and a graph whose
     # state is read and never written is not stateful, it is wrong.
     sinks = []
+    dense_census = []
 
     try:
         with shared_constants():
-            input_ids = op.parameter([1, T], Type.i64)
-            input_ids.set_friendly_name("input_ids")
+            inputs_embeds = op.parameter([1, T, H], Type.f32)
+            inputs_embeds.set_friendly_name("inputs_embeds")
+            inputs_embeds.output(0).set_names({"inputs_embeds"})
             pid = op.parameter([1, T], Type.i64)
             pid.set_friendly_name("position_ids")
-            ple_state, head_dim, Hn = _ple_state(ar, cfg)
+            pid.output(0).set_names({"position_ids"})
+            ple_state, head_dim, Hn = _ple_state(ar, cfg, ple_layer_idx, feed,
+                                                 dense_census)
             chunk_ids = op.parameter([1, T, Hn], Type.i32)
             chunk_ids.set_friendly_name("ngram_chunk_ids")
             local_ids = op.parameter([1, T, Hn], Type.i64)
@@ -851,21 +964,19 @@ def build_serving_shape_ir(config=None, seq_len=64, arena=None, n_layers=None,
             beam.set_friendly_name("beam_idx")
             beam.output(0).set_names({"beam_idx"})
 
-            # embed -> repeat to the hyper-connection width (backbone.py)
-            embed_w = ar.f32([V, H])
-            emb = op.gather(qgdn._c(embed_w), input_ids, qgdn._i(0))    # [1,T,H]
+            # the fed embedding -> repeat to the hyper-connection width
+            # (backbone.py). PIN THE LAYOUT where the pass's token axis enters:
+            # after `SDPAToPagedAttention` `inputs_embeds` is [-1, -1] +
+            # Unsqueeze(1), i.e. [tokens, 1, H], while this graph is
+            # [1, T, ...]. Same bytes; a binary op between the two BROADCASTS
+            # rather than refuses (the first forward on a card died at the
+            # PLE's additive join with a [5, 5, 10240] hidden, window-050
+            # §4.7). The reshape folds it to [1, T, H] -- the identity
+            # pre-pass, the seam post-pass.
+            emb = op.reshape(inputs_embeds,
+                             op.constant(np.array([1, -1, H], np.int64)),
+                             special_zero=False)
             hidden = op.tile(emb, op.constant(np.array([1, 1, hc], np.int64)))
-            # PIN THE LAYOUT where the pass's token axis enters. After
-            # `SDPAToPagedAttention` `input_ids` is [-1] + Unsqueeze(1), so the
-            # embedding comes out [tokens, 1, hc*H] while every static tensor
-            # of this graph is [1, T, hc*H]. The two are the same bytes, but a
-            # binary op between them does not refuse -- it BROADCASTS, and the
-            # first forward on a card died at the PLE's additive join with a
-            # [5, 5, 10240] hidden (window-050 §4.7). Pre-pass this reshape is
-            # the identity; post-pass it is the one place the dynamic axis is
-            # folded back into the static block.
-            hidden = op.reshape(hidden, op.constant(np.array([1, T, hc * H], np.int64)),
-                                special_zero=False)
 
             # the n-gram table: PORTS, one per sub-cap chunk, never a constant
             # (module docstring §4). The host-mmap tier serving reads through
@@ -873,24 +984,38 @@ def build_serving_shape_ir(config=None, seq_len=64, arena=None, n_layers=None,
             ngram_rows = (cfg.ngram_total_vocab
                           if hasattr(cfg, "ngram_total_vocab")
                           else pwe.REAL_GEOMETRY["ngram_total_vocab"])
-            ngram_row_bytes = (head_dim * NGRAM_DECLARED_TYPE.bitwidth + 7) // 8
-            table_ports = ngram_table_ports(ngram_rows, ngram_row_bytes,
+            row_bytes = ngram_row_bytes(head_dim)
+            table_ports = ngram_table_ports(ngram_rows, row_bytes,
                                             ngram_chunk_cap_bytes)
+
+            # ONE rope table pair for every full-attention layer, spanning
+            # the whole context. It used to be baked per layer for positions
+            # 0..T-1 -- right at position 0, silently wrong after, and pinned
+            # as such by the suite until this increment. Shared, it costs the
+            # table once (~67 MB a side at real geometry), not once per layer.
+            span = int(rope_span if rope_span is not None
+                       else cfg.max_position_embeddings)
+            cos_np, sin_np = qattn._freqs_tables(cfg, span)
+            rope_cos = op.constant(cos_np)
+            rope_cos.set_friendly_name("rope/cos")
+            rope_sin = op.constant(sin_np)
+            rope_sin.set_friendly_name("rope/sin")
 
             kinds = []
             for i in range(nl):
                 kind = "attn" if (i % 4) == 3 else "gdn"
                 kinds.append(kind)
-                st = _layer_state(ar, cfg, kind)
+                st = _layer_state(ar, cfg, kind, i, feed, dense_census)
 
                 if i == ple_layer_idx:
                     # pin 1283: hidden = hidden + ple(...), ADDITIVE
-                    gathered = ngram_chunked_gather(
-                        chunk_ids, local_ids, table_ports, head_dim)  # [1,T,Hn,hd]
+                    gathered = ngram_dequant_iq4nl(
+                        ngram_chunked_gather(chunk_ids, local_ids, table_ports),
+                        head_dim)                            # [1,T,Hn,hd] real values
                     gathered.set_friendly_name("ple/gathered")
                     emb_ple = op.reshape(
                         gathered,
-                        op.constant(np.array([1, T, Hn * head_dim], np.int64)),
+                        op.constant(np.array([1, -1, Hn * head_dim], np.int64)),
                         special_zero=False)
                     hidden = op.add(hidden, _ple_tail(
                         hidden, emb_ple, cfg, ple_state, T, conv_mask))
@@ -901,13 +1026,13 @@ def build_serving_shape_ir(config=None, seq_len=64, arena=None, n_layers=None,
                                                "attn_hyper_connection.", T)
                 if kind == "gdn":
                     g = qgdn.emit_gdn(
-                        h, conv_mask, cfg, _strip(st, "linear_attn."), T,
+                        h, conv_mask, cfg, _strip(st, "linear_attn."), None,
                         conv_emitter=stateful_short_conv(i, beam, sinks),
                         core_emitter=stateful_gdn_core(i, beam, sinks))
                 else:
                     g = emit_stateful_attention(
-                        h, pid, cfg, _strip(st, "self_attn."), T, i, beam,
-                        attn_mask, sinks)
+                        h, pid, cfg, _strip(st, "self_attn."), i, beam,
+                        attn_mask, sinks, rope_cos, rope_sin)
                 hidden = _recombine(hyper, inj, g, cfg, T)
                 # named so a card-side localiser can cut the graph here
                 # (tools/boot_serving_shape.py --cut); names only, no op
@@ -926,15 +1051,19 @@ def build_serving_shape_ir(config=None, seq_len=64, arena=None, n_layers=None,
                 "input_mix_weight_down.weight": ar.f32([cfg.hc_lowrank, hc * H]),
                 "input_mix_weight_up.weight": ar.f32([hc * H, cfg.hc_lowrank]),
             }
-            last = qhc.emit_hc(hidden, cfg, fin, T)                     # [1,T,H]
+            if feed is not None:
+                _fill_dense(fin, feed, "hyper_connection_mixer.", dense_census)
+            last = qhc.emit_hc(hidden, cfg, fin, None)                  # [1,T,H]
             head_w = ar.f32([V, H])
+            if feed is not None:
+                _fill_dense({"lm_head.weight": head_w}, feed, "", dense_census)
             logits = op.matmul(last, qgdn._c(head_w),
                                transpose_a=False, transpose_b=True)
             res = op.result(logits)
             res.set_friendly_name("logits")
 
             model = Model([res], sinks,
-                          [input_ids, pid, chunk_ids, local_ids, conv_mask,
+                          [inputs_embeds, pid, chunk_ids, local_ids, conv_mask,
                            attn_mask, beam] + table_ports,
                           "qwen4_exp_serving_shape")
 
@@ -943,7 +1072,8 @@ def build_serving_shape_ir(config=None, seq_len=64, arena=None, n_layers=None,
             "n_layers": nl,
             "gdn_layers": kinds.count("gdn"),
             "attn_layers": kinds.count("attn"),
-            "seq_len": T,
+            "seq_len": None,                   # dynamic in T since feed-the-ports
+            "rope_span": span,
             "nodes": nodes,
             "graph_const_bytes": const_bytes,
             "op_histogram": counts,
@@ -951,12 +1081,13 @@ def build_serving_shape_ir(config=None, seq_len=64, arena=None, n_layers=None,
             # the cap they were cut under. Not counted in graph_const_bytes --
             # it is not a constant any more, which is the point.
             "ngram_table_rows": int(ngram_rows),
-            "ngram_row_bytes": int(ngram_row_bytes),
+            "ngram_row_bytes": int(row_bytes),
             "ngram_chunk_cap_bytes": int(ngram_chunk_cap_bytes),
             "ngram_table_ports": [
                 (p.get_friendly_name(), int(_dims(p.output(0))[0]),
-                 int(_dims(p.output(0))[0]) * int(ngram_row_bytes))
+                 int(_dims(p.output(0))[0]) * int(row_bytes))
                 for p in table_ports],
+            "dense_fill_census": dense_census,
             "arena_declared_bytes": ar.declared_bytes,
             "arena_written_bytes": ar.written_bytes,
             "arena_disk_kib": ar.disk_kib(),
@@ -1044,9 +1175,10 @@ def _repeat_kv_broadcast(x, kv_heads, heads, head_dim):
                       special_zero=True)
 
 
-def _additive_causal_mask(T, total, past):
-    """The [1, 1, T, TOTAL] additive mask for a query block that starts at
-    `past` inside a sequence of `total` keys: 0 where the key is visible,
+def _additive_causal_mask(n_tok, total, past):
+    """The [1, 1, T, TOTAL] additive mask for a query block of `n_tok` tokens
+    (a scalar i64 node) that starts at `past` inside a sequence of `total`
+    keys: 0 where the key is visible,
     finfo(f32).min above the diagonal -- the value `q4e.attention` bakes for
     the same purpose (pin 809, which converts torch's bool mask with
     `torch.finfo(dtype).min`).
@@ -1060,7 +1192,7 @@ def _additive_causal_mask(T, total, past):
     can check.
     """
     i64 = lambda v: op.constant(np.array(v, np.int64))
-    rows = op.add(op.range(i64(0), i64(T), i64(1), Type.i64), past)  # [T]
+    rows = op.add(op.range(i64(0), n_tok, i64(1), Type.i64), past)   # [T]
     cols = op.range(i64(0), op.squeeze(total, i64(0)), i64(1), Type.i64)
     visible = op.less_equal(op.unsqueeze(cols, i64(0)),
                             op.unsqueeze(rows, i64(1)))             # [T, TOT]
@@ -1121,25 +1253,29 @@ def stateful_short_conv(layer, beam, sinks):
         past = op.gather(op.read_value(init, var), beam, i64(0))
         joined = op.concat([past, x], axis=-1)          # [1, conv_dim, K+T]
 
-        total = op.gather(op.shape_of(joined, output_type="i64"), i64([2]),
-                          i64(0))
+        # NO ShapeOf on this construct (feed-the-ports). The new state is the
+        # last K columns and the conv output is everything past its first
+        # column: both are negative-index / to-the-end Slices. The first form
+        # read the joined length off ShapeOf -> Gather, and once T went
+        # dynamic the pass's `TotalSequenceLengthPattern` matched that chain
+        # as if it were an attention's KV length and threw
+        # ("failed to determine the dimension value after the Gather").
+        INT_MAX = 9223372036854775807
         sinks.append(op.assign(
-            op.slice(joined, op.subtract(total, i64([K])), total, i64([1]),
-                     i64([2])), var))
+            op.slice(joined, i64([-K]), i64([INT_MAX]), i64([1]), i64([2])),
+            var))
 
         weights = qgdn._c(np.ascontiguousarray(conv_w, np.float32)
                           .reshape(conv_dim, 1, 1, K))
         conv = op.group_convolution(joined, weights, strides=[1],
                                     pads_begin=[0], pads_end=[0], dilations=[1])
-        out_len = op.gather(op.shape_of(conv, output_type="i64"), i64([2]),
-                            i64(0))
-        body = op.slice(conv, i64([1]), out_len, i64([1]), i64([2]))
+        body = op.slice(conv, i64([1]), i64([INT_MAX]), i64([1]), i64([2]))
         return qgdn._silu(body)
 
     return emit
 
 
-def _gdn_loop_body(HV, Dk, Dv, T):
+def _gdn_loop_body(HV, Dk, Dv):
     """One timestep of the delta rule, as the Loop body `FuseGDNLoop` requires.
 
     Transcribed op for op from `matches_linear_attention_loop`
@@ -1162,7 +1298,7 @@ def _gdn_loop_body(HV, Dk, Dv, T):
     i64 = lambda v: op.constant(np.array(v, np.int64))
     step = op.parameter([], Type.i64)                    # current iteration
     state = op.parameter([1, HV, Dk, Dv], Type.f32)      # recurrent state
-    buf = op.parameter([1, HV, T, Dv], Type.f32)         # output buffer
+    buf = op.parameter([1, HV, -1, Dv], Type.f32)        # output buffer, T dynamic
     q = op.parameter([1, HV, 1, Dk], Type.f32)
     k = op.parameter([1, HV, 1, Dk], Type.f32)
     v = op.parameter([1, HV, 1, Dv], Type.f32)
@@ -1245,8 +1381,13 @@ def stateful_gdn_core(layer, beam, sinks):
         past = op.gather(op.read_value(init, var), beam, i64(0))
 
         body, (p_step, p_state, p_buf, p_q, p_k, p_v, p_g,
-               p_beta) = _gdn_loop_body(HV, Dk, Dv, T)
-        loop = op.loop(i64(T), op.constant(np.array(True)))
+               p_beta) = _gdn_loop_body(HV, Dk, Dv)
+        # trip count and output buffer from the SHAPE, as the served
+        # artifact's Loop has them (in[0] a Convert off ShapeOf, in[8] a
+        # Broadcast [?, HV, ?, Dv]): dynamic in T
+        n_tok = op.squeeze(op.gather(op.shape_of(q, output_type="i64"),
+                                     i64([2]), i64(0)), i64([0]))
+        loop = op.loop(n_tok, op.constant(np.array(True)))
         loop.set_function(body)
         # body parameter 0 is the iteration counter, body result 0 the condition
         loop.set_special_body_ports([0, 0])
@@ -1261,7 +1402,10 @@ def stateful_gdn_core(layer, beam, sinks):
         loop.set_merged_input(
             p_buf,
             op.broadcast(op.constant(np.array(0.0, np.float32)),
-                         i64([1, HV, T, Dv])).output(0),
+                         op.concat([i64([1, HV]),
+                                    op.gather(op.shape_of(q, output_type="i64"),
+                                              i64([2]), i64(0)),
+                                    i64([Dv])], axis=0)).output(0),
             body.get_results()[2].output(0))
         attn_out = loop.get_iter_value(body.get_results()[2].output(0), -1)
         state_out = loop.get_iter_value(body.get_results()[1].output(0), -1)
@@ -1280,8 +1424,8 @@ def stateful_gdn_core(layer, beam, sinks):
     return emit
 
 
-def emit_stateful_attention(hidden, pid, config, state, T, layer, beam,
-                            attn_mask, sinks):
+def emit_stateful_attention(hidden, pid, config, state, layer, beam,
+                            attn_mask, sinks, rope_cos, rope_sin):
     """The full-attention layer in the STATEFUL shape the serving path's own
     transformation converts, at real geometry.
 
@@ -1307,32 +1451,24 @@ def emit_stateful_attention(hidden, pid, config, state, T, layer, beam,
     argument and a layer that dropped one would emit a graph whose state is
     read and never written.
 
-    KNOWN LIMITATION, NAMED BECAUSE NOTHING ELSE NAMES IT: THE ROPE TABLE ONLY
-    SPANS THIS QUERY BLOCK. `qattn._freqs_tables(config, T)` bakes cos/sin for
-    positions 0..T-1 and `_apply_rope` GATHERS them by `position_ids`. Every
-    other part of this layer was built for `past > 0` on purpose -- the causal
-    mask derives `past` from the KV Variable's dynamic length rather than
-    baking it -- but a position at or past T indexes off the end of that
-    table, and OpenVINO's Gather does not throw for an out-of-range index. So
-    the graph is correct for a forward that starts at position 0 and silently
-    wrong for any forward after it.
+    THE ROPE TABLE SPANS THE FULL CONTEXT AND IS SHARED (feed-the-ports
+    increment; until then it was baked per layer for positions 0..T-1 and a
+    position past T gathered off its end without a throw). `rope_cos` /
+    `rope_sin` are the ONE constant pair `build_serving_shape_ir` makes from
+    `_freqs_tables(config, rope_span)`, gathered here by `position_ids`; one
+    table for the twelve layers is what keeps it out of the residency
+    keystone (~67 MB a side once, not 1.6 GiB).
 
-    It is not fixed here, and the reason is a number: `max_position_embeddings`
-    is 262,144 at real geometry, so a full table is ~67 MB per side per layer
-    and about 1.6 GiB over the 12 full-attention layers -- which walks straight
-    through the residency keystone's 5.12 GiB ceiling. Sizing it (once, shared
-    across layers, from `max_position_embeddings` or an explicit bound) belongs
-    with the increment that makes the query block dynamic, because it is the
-    same static-T root cause. `test_the_rope_table_only_spans_the_query_block`
-    pins it so the day it is fixed the cell reds and this paragraph gets read.
+    DYNAMIC IN T: every reshape here uses -1, the mask and the loop bounds
+    come from ShapeOf. The block length is nowhere in this layer.
     """
     H = config.hidden_size
     heads = config.num_attention_heads
     kv = config.num_key_value_heads
     d = getattr(config, "head_dim", None) or H // heads
     eps = config.rms_norm_eps
-    cosT, sinT = qattn._freqs_tables(config, T)
-    rotary = cosT.shape[-1]
+    rotary = int(rope_cos.get_output_shape(0)[-1])
+    T = -1
     i64 = lambda v: op.constant(np.array(v, np.int64))
 
     # pin 867-870, unchanged from q4e.attention: the split is PER HEAD on the
@@ -1352,8 +1488,7 @@ def emit_stateful_attention(hidden, pid, config, state, T, layer, beam,
     v = qgdn._transpose(
         qgdn._reshape(qgdn._mm(hidden, qattn._c(state["v_proj.weight"]), tb=True),
                       [1, T, kv, d]), [0, 2, 1, 3])
-    q, k = qattn._apply_rope(q, k, qattn._c(cosT), qattn._c(sinT), pid,
-                                  rotary, T)
+    q, k = qattn._apply_rope(q, k, rope_cos, rope_sin, pid, rotary, T)
     q.set_friendly_name(f"attn{layer}/q_rope")            # localiser cut points
     k.set_friendly_name(f"attn{layer}/k_rope")
 
@@ -1412,9 +1547,10 @@ def emit_stateful_attention(hidden, pid, config, state, T, layer, beam,
     # TOTAL is the key length after the join; PAST is what was there before.
     # The mask is [T, 1, 1, TOTAL] in this layout: one row per token-batch.
     total = op.gather(op.shape_of(full[0], output_type="i64"), i64([2]), i64(0))
-    past_len = op.subtract(total, i64([T]))
-    mask = op.reshape(_additive_causal_mask(T, total, past_len),
-                      op.concat([i64([T, 1, 1]), total], axis=0),
+    n_vec = op.unsqueeze(n_tok, i64(0))                      # [1]: the token count
+    past_len = op.subtract(total, n_vec)
+    mask = op.reshape(_additive_causal_mask(n_tok, total, past_len),
+                      op.concat([n_vec, i64([1, 1]), total], axis=0),
                       special_zero=False)
     att = op.scaled_dot_product_attention(
         q,
@@ -1437,7 +1573,7 @@ def _strip(state, prefix):
 def _split_combine(hidden, config, state, prefix, T):
     """backbone.py's use_combine=True mixer: returns (h, hyper, inject)."""
     sub = _strip(state, prefix)
-    return qhc.emit_combine(hidden, config, sub, T)
+    return qhc.emit_combine(hidden, config, sub, None if T is None or T < 0 else T)
 
 
 def _recombine(hyper, inj, block_out, config, T):
@@ -1445,12 +1581,13 @@ def _recombine(hyper, inj, block_out, config, T):
     inj.unsqueeze(-1)).flatten(-2)."""
     H = config.hidden_size
     hc = config.hc_count
-    o4 = op.reshape(block_out, op.constant(np.array([1, T, 1, H], np.int64)),
+    Td = -1 if T is None or T < 0 else int(T)
+    o4 = op.reshape(block_out, op.constant(np.array([1, Td, 1, H], np.int64)),
                     special_zero=False)
-    i4 = op.reshape(inj, op.constant(np.array([1, T, hc, 1], np.int64)),
+    i4 = op.reshape(inj, op.constant(np.array([1, Td, hc, 1], np.int64)),
                     special_zero=False)
     prod = op.reshape(op.multiply(o4, i4),
-                      op.constant(np.array([1, T, hc * H], np.int64)),
+                      op.constant(np.array([1, Td, hc * H], np.int64)),
                       special_zero=False)
     return op.add(hyper, prod)
 
@@ -1467,26 +1604,27 @@ def _ple_tail(hidden, emb, config, state, T, conv_mask=None):
     K = config.ple_conv_kernel_size
     dilation = config.ngram_size
 
+    Td = -1 if T is None or T < 0 else int(T)
     key = qgdn._mm(emb, qgdn._c(state["key_proj.weight"]), tb=True)
-    key_n = qple._group_rms(key, T, hc, H, state["norm_key.weight"], eps)
-    key_n4 = qgdn._reshape(key_n, [1, T, hc, H])
+    key_n = qple._group_rms(key, Td, hc, H, state["norm_key.weight"], eps)
+    key_n4 = qgdn._reshape(key_n, [1, Td, hc, H])
     value = qgdn._mm(emb, qgdn._c(state["value_proj.weight"]), tb=True)
-    q_n = qple._group_rms(hidden, T, hc, H, state["norm_query.weight"], eps)
-    q_n4 = qgdn._reshape(q_n, [1, T, hc, H])
+    q_n = qple._group_rms(hidden, Td, hc, H, state["norm_query.weight"], eps)
+    q_n4 = qgdn._reshape(q_n, [1, Td, hc, H])
     gate = qgdn._rsum(qgdn._mul(key_n4, q_n4), 3)
     gate = qgdn._mul(gate, qgdn._c(np.float32(1.0 / math.sqrt(H))))
     ag = op.maximum(op.abs(gate), qgdn._c(np.float32(1e-6)))
     gate = qgdn._mul(op.sqrt(ag), op.sign(gate))
     sg = op.sigmoid(gate)
-    value4 = qgdn._reshape(value, [1, T, 1, H])
+    value4 = qgdn._reshape(value, [1, Td, 1, H])
     gv = qgdn._mul(sg, value4)
-    gv_flat = qgdn._reshape(gv, [1, T, hc * H])
-    gv_normed = qple._group_rms(gv_flat, T, hc, H, state["norm_conv.weight"], eps)
+    gv_flat = qgdn._reshape(gv, [1, Td, hc * H])
+    gv_normed = qple._group_rms(gv_flat, Td, hc, H, state["norm_conv.weight"], eps)
     if conv_mask is not None:                    # pin 1251-1253
-        m = qgdn._reshape(conv_mask, [1, T, 1])
+        m = qgdn._reshape(conv_mask, [1, Td, 1])
         gv_flat = qgdn._mul(gv_flat, m)
         gv_normed = qgdn._mul(gv_normed, m)
-    conv_out = qple._short_conv(gv_normed, state["conv1d.weight"], T,
+    conv_out = qple._short_conv(gv_normed, state["conv1d.weight"], Td,
                                 hc * H, K, dilation)
     return qgdn._add(gv_flat, conv_out)
 
@@ -1551,6 +1689,8 @@ __all__ = [
     "emit_moe_tiled", "emit_stateful_attention", "stateful_short_conv",
     "stateful_gdn_core", "slot_pool_from_ir",
     "ngram_table_chunks", "ngram_table_ports", "ngram_chunked_gather",
-    "EXPERT_DECLARED_TYPE", "NGRAM_DECLARED_TYPE", "NGRAM_PORT_TYPE",
+    "ngram_dequant_iq4nl", "ngram_row_bytes",
+    "EXPERT_DECLARED_TYPE", "NGRAM_PORT_TYPE", "NGRAM_BLOCK_ELEMS",
+    "NGRAM_BLOCK_BYTES", "NGRAM_IQ4NL_KVALUES",
     "NGRAM_CHUNK_CAP_BYTES", "NGRAM_CHUNK_ROW_ALIGN", "EXPERT_GROUP_SIZE",
 ]

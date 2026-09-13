@@ -256,8 +256,9 @@ def build_combine_model(config, state, seq_len):
 
 def emit_hc(hyper_input, config, state, seq_len):
     """use_combine=False mixer NODE for the assembled backbone (E2 inc5b):
-    hyper_input [1,T,hc*H] -> mixed [1,T,H]. Same body as build_hc_model."""
-    T = int(seq_len)
+    hyper_input [1,T,hc*H] -> mixed [1,T,H]. Same body as build_hc_model.
+    `seq_len=None` builds the reshapes with -1: dynamic in T."""
+    T = -1 if seq_len is None else int(seq_len)
     mixed, _ = _gated_residual(
         hyper_input, T, config.hidden_size, config.hc_count, config.hc_lowrank,
         state["hc_norm.weight"], config.rms_norm_eps, state,
@@ -268,8 +269,9 @@ def emit_hc(hyper_input, config, state, seq_len):
 def emit_combine(hyper_input, config, state, seq_len):
     """use_combine=True mixer NODES for the assembled backbone: hyper_input
     [1,T,hc*H] -> (mixed [1,T,H], hyper_input passthrough, injection
-    [1,T,hc_count]). Same body as build_combine_model (pin 1030-1031)."""
-    T = int(seq_len)
+    [1,T,hc_count]). Same body as build_combine_model (pin 1030-1031).
+    `seq_len=None` builds the reshapes with -1: dynamic in T."""
+    T = -1 if seq_len is None else int(seq_len)
     H, hc, lowrank, eps = config.hidden_size, config.hc_count, config.hc_lowrank, config.rms_norm_eps
     mixed, xg = _gated_residual(
         hyper_input, T, H, hc, lowrank, state["hc_norm.weight"], eps, state

@@ -287,7 +287,7 @@ def filled(feed):
     arena = ss.SparseArena()
     try:
         model, report = ss.build_serving_shape_ir(
-            config=small, seq_len=8, arena=arena,
+            config=small, arena=arena,
             n_layers=len(_FILL_LAYERS), filler=filler)
         yield model, report, arena, filler, small
     finally:

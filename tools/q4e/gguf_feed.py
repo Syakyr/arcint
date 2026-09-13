@@ -216,6 +216,23 @@ class GgufFeed:
     def gguf_type(self, gguf_name):
         return self._index[gguf_name].tensor_type.name
 
+    def raw_table(self):
+        """The n-gram table's BYTES as the shard holds them: the reader's
+        memmap over `per_layer_token_embd.weight`, (rows, 90) u8 for IQ4_NL.
+        Nothing is dequantised -- the serving-shape graph decodes the rows it
+        gathers (q4e.serving_shape.ngram_dequant_iq4nl)."""
+        t = self._index[_PLE_TABLE]
+        return t.data
+
+    def token_strings(self):
+        """The GGUF's own vocabulary, `tokenizer.ggml.tokens`, as a list of
+        str -- for putting a face on a token id in a driver's output."""
+        for r in self._readers:
+            f = r.fields.get("tokenizer.ggml.tokens")
+            if f is not None:
+                return [bytes(f.parts[i]).decode("utf-8", "replace") for i in f.data]
+        raise KeyError("tokenizer.ggml.tokens in no shard")
+
     def has_lm_head(self):
         """Does this source ship a SEPARATE lm_head (GGUF `output.weight`)?
 

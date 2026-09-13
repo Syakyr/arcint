@@ -21,6 +21,11 @@ stage so that the first stage to refuse names itself.
     forward inputs_embeds, position_ids, then the nine   :6141-6151
             index ports, in that order, then infer()
 
+Since feed-the-ports the graph is dynamic in T and takes `inputs_embeds`,
+so the served feed order is accepted end to end; the driver adds the two id
+ports (q4e.ngram_ids) and conv_mask itself and says so. `--long N` runs one
+more forward of N tokens on a fresh request (rope span, blocks past 2051).
+
 `--no-pass` is the CONTROL: the stateful graph compiled and run directly, the
 `RUN@be57428` form (INFERENCE_PRECISION_HINT f32, every declared port fed),
 which proves the structure still lights up on the card before the served
@@ -91,7 +96,20 @@ def main(argv=None):
     ap.add_argument("--ids", default="",
                     help="prompt token ids, comma-separated; seq_len = their "
                          "count unless --seq-len is given")
-    ap.add_argument("--seq-len", type=int, default=None)
+    ap.add_argument("--shards", default=None,
+                    help="REAL WEIGHTS: a directory of the model's GGUF shards. "
+                         "The built layers, the PLE, the final mixer and the "
+                         "head are filled from them (q4e.gguf_feed), the expert "
+                         "bodies through q4e.expert_fill, the n-gram table is "
+                         "bound from the GGUF's own IQ4_NL bytes, and the prompt "
+                         "is embedded on the host from token_embd. Without it "
+                         "every weight is an unwritten page (zeros).")
+    ap.add_argument("--long", type=int, default=0,
+                    help="after the prompt forward: ONE forward of this many "
+                         "tokens (ids 1000, 1001, ...) on the same request -- "
+                         "the graph is dynamic in T, so this measures a block "
+                         "past the query block's length and, past 2051, the "
+                         "rope span (feed-the-ports)")
     ap.add_argument("--no-pass", action="store_true",
                     help="CONTROL: skip the transformation, compile the "
                          "stateful graph directly, feed every declared port")
@@ -111,26 +129,38 @@ def main(argv=None):
     from q4e import serving_shape as ss
 
     ids = parse_ids(args.ids)
-    T = args.seq_len if args.seq_len is not None else (len(ids) or 8)
-    if ids and len(ids) != T:
-        raise SystemExit(f"--ids has {len(ids)} tokens, --seq-len is {T}: the "
-                         f"query block is static, they must agree")
     if not ids:
-        ids = list(range(1000, 1000 + T))
+        ids = list(range(1000, 1008))
+    T = len(ids)                       # the FEED's length; the graph is dynamic
 
     say("env", f"openvino {ov.get_version()} layers={args.layers} T={T} "
                f"device={args.device} pass={not args.no_pass} probe={args.probe}")
 
     # ---- build ----------------------------------------------------------------
     arena = ss.SparseArena()
+    feed_ = filler = None
+    if args.shards:
+        from q4e import gguf_feed as gf
+        from q4e import expert_fill as ef
+        t0 = time.time()
+        feed_ = gf.GgufFeed(args.shards)
+        filler = ef.ExpertFiller(ef.gguf_expert_source(feed_), ss.EXPERT_GROUP_SIZE)
+        say("shards", f"feed over {args.shards} in {time.time() - t0:.1f}s; "
+                      f"REAL WEIGHTS for every layer built")
     t0 = time.time()
     try:
-        model, rep = ss.build_serving_shape_ir(seq_len=T, arena=arena,
-                                               n_layers=args.layers)
+        model, rep = ss.build_serving_shape_ir(arena=arena, n_layers=args.layers,
+                                               filler=filler, feed=feed_)
     except Exception as exc:                                      # noqa: BLE001
         say("build", "FAIL " + one_line(exc))
         arena.close()
         return 0
+    if feed_ is not None:
+        dense = rep["dense_fill_census"]
+        say("shards", f"dense fill: {len(dense)} tensors, "
+                      f"{sum(b for _, b in dense) / 2 ** 30:.2f} GiB written; "
+                      f"expert fill: {rep['fill_census']}; arena written "
+                      f"{rep['arena_written_bytes'] / 2 ** 30:.2f} GiB")
     say("build", f"OK {time.time() - t0:.2f}s nodes={rep['nodes']} "
                  f"declared_GiB={rep['graph_const_bytes'] / 2 ** 30:.2f} "
                  f"layers={rep['n_layers']} ({rep['gdn_layers']} GDN + "
@@ -271,6 +301,13 @@ def main(argv=None):
         tctx = core.get_default_context(dev) if dev.startswith("GPU") else None
         t0 = time.time()
         total = 0
+        raw = None
+        if feed_ is not None:
+            # the GGUF's own bytes: (rows, 90) u8, mmapped, copied chunk by
+            # chunk into the USM-host tensors -- no conversion, one copy
+            raw = np.asarray(feed_.raw_table())
+            say("table", f"binding the REAL table: {raw.shape} {raw.dtype} from the shards")
+        off = 0
         for name in table_ports:
             sh = dims(declared[name])
             et = declared[name].get_element_type()
@@ -281,6 +318,12 @@ def main(argv=None):
                 say("table", f"{name}{sh}: ALLOC FAIL " + one_line(exc))
                 arena.close()
                 return 0
+            if raw is not None:
+                t1 = time.time()
+                np.copyto(t.data, raw[off:off + sh[0]])
+                say("table", f"{name}: rows {off:,}..{off + sh[0]:,} copied in "
+                             f"{time.time() - t1:.1f}s")
+                off += sh[0]
             total += int(np.prod(sh))
             if feed(name, t) is not None:
                 arena.close()
@@ -323,6 +366,7 @@ def main(argv=None):
 
     # ---- forward ----------------------------------------------------------------
     H = 2560
+    rep_vocab = lambda: rep["outputs"][0][1][-1]                            # noqa: E731
     i64 = lambda a, sh: ov.Tensor(np.array(a, dtype=np.int64).reshape(sh))   # noqa: E731
     i32 = lambda a: ov.Tensor(np.array(a, dtype=np.int32).reshape(-1))       # noqa: E731
 
@@ -333,19 +377,45 @@ def main(argv=None):
         vector; pre-pass (the control) they are the emitter's [1, T]. Follow
         the declared rank rather than assume either."""
         d = dims(declared[name]) if name in declared else None
-        return i64(values, (n,) if d is not None and len(d) == 1 else (1, n))
+        m = len(values)
+        return i64(values, (m,) if d is not None and len(d) == 1 else (1, m))
+
+    # the prompt's embedding, on the host as the served path does it
+    embed_w = None
+    if feed_ is not None:
+        t0 = time.time()
+        embed_w = feed_.fitted("embed_tokens.weight", (rep_vocab(), H))
+        say("shards", f"embed_tokens {embed_w.shape} dequantised in {time.time() - t0:.1f}s")
+
+    def embeds_for(tokens):
+        if embed_w is None:
+            return np.zeros((len(tokens), H), np.float32)
+        return np.ascontiguousarray(embed_w[np.asarray(tokens, np.int64)], np.float32)
+
+    # THE DRIVER'S OWN FEEDS (feed-the-ports): the hashed row ids, split at
+    # the port partition by the host, and the padding mask. Computed once for
+    # the prompt; the runtime has no site for either yet (that is the C++
+    # half of the increment), so these are labelled as the driver's.
+    from q4e import ngram_ids as nid
+    from q4e import piecewise_export as pwe
+    cfg = pwe.real_config()
+    table_rows0 = (dims(declared[table_ports[0]])[0] if table_ports else 1)
+
+    def id_feeds(tokens):
+        g = nid.gen_row_ids(cfg, 1, tokens)                    # [1,T,Hn] i64
+        c, l = nid.split_by_partition(g, table_rows0)
+        return {"ngram_chunk_ids": ov.Tensor(c), "ngram_local_ids": ov.Tensor(l),
+                "conv_mask": ov.Tensor(np.ones((1, len(tokens)), np.float32))}, g
 
     if args.no_pass:
         # CONTROL: every port the stateful graph declares, fed by name.
-        Hn = 16
+        extras, _ = id_feeds(ids)
         candidates = {
-            "input_ids": flat_or_2d("input_ids", ids),
+            "inputs_embeds": ov.Tensor(embeds_for(ids).reshape(1, n, H)),
             "position_ids": flat_or_2d("position_ids", list(range(n))),
-            "ngram_chunk_ids": ov.Tensor(np.zeros((1, n, Hn), np.int32)),
-            "ngram_local_ids": i64([0] * (n * Hn), (1, n, Hn)),
-            "conv_mask": ov.Tensor(np.ones((1, n), np.float32)),
             "attention_mask": i64([1] * n, (1, n)),
             "beam_idx": i32([0]),
+            **extras,
         }
         for name, t in candidates.items():
             if name in declared:
@@ -365,7 +435,7 @@ def main(argv=None):
             pos = i64([p for _ in range(sections) for p in range(past, tot)],
                       (sections, n))
         served = [
-            ("inputs_embeds", ov.Tensor(np.zeros((n, H), np.float32))),
+            ("inputs_embeds", ov.Tensor(embeds_for(ids))),
             ("position_ids", pos),
             ("past_lens", i32([past])),
             ("subsequence_begins", i32([0, n])),
@@ -388,10 +458,16 @@ def main(argv=None):
             if not args.probe:
                 arena.close()
                 return 0
-            say("probe", "LABELLED DEVIATION: input_ids fed in place of "
-                         "inputs_embeds; nothing else substituted")
-            if "input_ids" in declared:
-                feed("input_ids", flat_or_2d("input_ids", ids))
+            say("probe", "LABELLED DEVIATION: continuing past the refusal")
+        else:
+            say("forward", "SERVED PATH: every name the C++ feeds was accepted")
+        extras, g = id_feeds(ids)
+        say("driver-feed", f"row ids for the prompt (q4e.ngram_ids, PLE layer 1): "
+                           f"min {int(g.min()):,} max {int(g.max()):,}; split at "
+                           f"{table_rows0:,} rows/chunk; plus conv_mask=ones. "
+                           f"THE DRIVER'S FEEDS, not the runtime's")
+        for name, t in extras.items():
+            feed(name, t)
 
     unfed = sorted(set(declared) - set(fed))
     say("forward", f"fed {len(fed)}: {fed}")
@@ -412,6 +488,13 @@ def main(argv=None):
                    f"absmax={float(np.abs(lg).max()):.4e}")
     say("forward", f"argmax per position: {[int(r.argmax()) for r in rows]}")
     say("forward", f"RAW OUTPUT (greedy, last position): {int(rows[-1].argmax())}")
+    if feed_ is not None:
+        # the token strings, from the GGUF's own vocabulary, so the id has a face
+        toks = feed_.token_strings()
+        top = np.argsort(-rows[-1])[:5]
+        say("forward", "REAL-WEIGHT LOGITS, last position, top 5: " + ", ".join(
+            f"{int(i)}={toks[int(i)]!r}:{float(rows[-1][int(i)]):.3f}" for i in top))
+        say("forward", f"prompt tokens: {[toks[int(i)] for i in ids]}")
     gpu_mem("after infer")
     # a second forward on the same request: the first one pays the kernel
     # jit (feedback-first-request-compiles-kernels); the second is the rate
@@ -428,12 +511,25 @@ def main(argv=None):
     # what the runtime says to a one-token block, verbatim -- a set_tensor
     # refusal if the port is static, or an infer refusal at the first baked
     # reshape if it is not -- instead of predicting the text.
-    port = "input_ids" if "input_ids" in declared else (
-        "inputs_embeds" if "inputs_embeds" in declared else None)
+    port = "inputs_embeds" if "inputs_embeds" in declared else None
     if port is not None and n != 1:
-        pd = dims(declared[port])
-        one = (i64([int(rows[-1].argmax())], (1,) if pd is not None and len(pd) == 1 else (1, 1))
-               if port == "input_ids" else ov.Tensor(np.zeros((1, H), np.float32)))
+        one = ov.Tensor(embeds_for([int(rows[-1].argmax())]))
+        # the one token's companions: position, ids, mask, index ports
+        nxt = [int(rows[-1].argmax())]
+        feed("position_ids", flat_or_2d("position_ids", [n]))
+        for name, t in id_feeds(nxt)[0].items():
+            if name in declared:
+                feed(name, t)
+        if not args.no_pass:
+            past1, tot1 = n, n + 1
+            nb1 = (tot1 + KV_BLOCK_TOKENS - 1) // KV_BLOCK_TOKENS
+            for name, t in [("past_lens", i32([past1])),
+                            ("subsequence_begins", i32([0, 1])),
+                            ("block_indices", i32(list(range(nb1)))),
+                            ("block_indices_begins", i32([0, nb1])),
+                            ("max_context_len", ov.Tensor(np.array(tot1, dtype=np.int32))),
+                            ("la.past_lens", i32([past1]))]:
+                feed(name, t)
         exc = feed(port, one)
         if exc is None:
             say("decode-probe", f"set_tensor({port}) with a 1-token block was "
@@ -442,15 +538,67 @@ def main(argv=None):
             t0 = time.time()
             try:
                 req.infer()
-                say("decode-probe", f"  INFER OK {time.time() - t0:.3f}s -- a "
-                                    f"1-token block ran through a graph built "
-                                    f"for {n}")
+                lg1 = req.get_output_tensor(0).data if args.cut else req.get_tensor("logits").data
+                say("decode-probe", f"  INFER OK {time.time() - t0:.3f}s out{tuple(lg1.shape)} "
+                                    f"finite={bool(np.isfinite(lg1).all())} -- a "
+                                    f"1-token block after a {n}-token one: the "
+                                    f"graph is dynamic in T")
             except Exception as exc2:                             # noqa: BLE001
                 say("decode-probe", f"  INFER FAIL after {time.time() - t0:.3f}s "
                                     + one_line(exc2))
         else:
-            say("decode-probe", f"a 1-token block against the [1, {n}] query "
+            say("decode-probe", f"a 1-token block against the {n}-token query "
                                 f"block: refused (text above)")
+
+    # ---- the LONG block: one forward of --long tokens from position 0 ------------
+    if args.long and port is not None and not args.no_pass:
+        L = int(args.long)
+        toks = list(range(1000, 1000 + L))
+        nbl = (L + KV_BLOCK_TOKENS - 1) // KV_BLOCK_TOKENS
+        # a fresh request so the KV pools are sized for L blocks
+        req2 = compiled.create_infer_request()
+        for name in table_ports:
+            req2.set_tensor(name, req.get_tensor(name))
+        la_i = 0
+        for name, portp in declared.items():
+            if name.startswith("conv_state_table."):
+                sh = list(conv_proto[0]); sh[0] = ROWS_PER_LANE
+            elif name.startswith("gated_delta_state_table."):
+                sh = list(gdn_proto[0]); sh[0] = ROWS_PER_LANE
+            elif name.startswith(("key_cache.", "value_cache.")):
+                d = dims(portp); sh = [nbl + 1] + d[1:]
+                req2.set_tensor(name, ctx.create_tensor(portp.get_element_type(), ov.Shape(sh), {})
+                                if ctx else ov.Tensor(portp.get_element_type(), ov.Shape(sh)))
+                continue
+            else:
+                continue
+            req2.set_tensor(name, ctx.create_tensor(ov.Type.f16, ov.Shape(sh), {})
+                            if ctx else ov.Tensor(ov.Type.f16, ov.Shape(sh)))
+        req2.set_tensor("inputs_embeds", ov.Tensor(embeds_for(toks)))
+        req2.set_tensor("position_ids", i64(list(range(L)), (L,)))
+        for name, t in [("past_lens", i32([0])), ("subsequence_begins", i32([0, L])),
+                        ("block_indices", i32(list(range(nbl)))),
+                        ("block_indices_begins", i32([0, nbl])),
+                        ("max_context_len", ov.Tensor(np.array(L, dtype=np.int32))),
+                        ("la.block_indices", i32([0, 0])), ("la.block_indices_begins", i32([0, 2])),
+                        ("la.past_lens", i32([0])), ("la.cache_interval", i32([0]))]:
+            req2.set_tensor(name, t)
+        for name, t in id_feeds(toks)[0].items():
+            if name in declared:
+                req2.set_tensor(name, t)
+        t0 = time.time()
+        try:
+            req2.infer()
+            lgL = req2.get_tensor("logits").data
+            say("long-block", f"INFER OK {time.time() - t0:.3f}s for {L} tokens "
+                              f"out{tuple(lgL.shape)} finite={bool(np.isfinite(lgL).all())} "
+                              f"absmax={float(np.abs(lgL).max()):.4e} "
+                              f"({'past' if L > 2051 else 'under'} the 2051 QSA boundary; "
+                              f"rope positions up to {L - 1})")
+        except Exception as exc:                                  # noqa: BLE001
+            say("long-block", f"INFER FAIL after {time.time() - t0:.3f}s for {L} tokens "
+                              + one_line(exc))
+        gpu_mem("after long block")
     arena.close()
     return 0
 

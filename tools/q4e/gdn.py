@@ -512,7 +512,17 @@ def _gdn_subgraph(hidden, amask, config, state, T, ut_mode=None,
 
 def emit_gdn(hidden, amask, config, state, seq_len, ut_mode=None,
              conv_emitter=None, core_emitter=None):
-    """The GDN subgraph for the assembled backbone (E2 inc5b)."""
+    """The GDN subgraph for the assembled backbone (E2 inc5b).
+
+    `seq_len=None` builds the block dynamic in T (reshapes with -1). Only
+    legal with BOTH hooks given: the default conv and the chunked core unroll
+    over T and need it as a number."""
+    if seq_len is None:
+        assert conv_emitter is not None and core_emitter is not None, (
+            "dynamic T needs the stateful conv and core hooks; the unrolled "
+            "defaults bake the block length")
+        return _gdn_subgraph(hidden, amask, config, state, -1, ut_mode,
+                             conv_emitter, core_emitter)
     return _gdn_subgraph(hidden, amask, config, state, int(seq_len), ut_mode,
                          conv_emitter, core_emitter)
 

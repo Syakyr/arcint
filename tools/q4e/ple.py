@@ -70,19 +70,25 @@ from openvino import opset13 as op
 from .gdn import _c, _i, _mm, _mul, _add, _slice, _transpose, _reshape, _rmean, _rsum, _rsqrt_eps, _silu  # noqa: F401
 
 
+def _T(T):
+    """The reshape extent for the sequence axis: the block's length, or -1
+    when the caller builds a graph dynamic in T (serving shape)."""
+    return -1 if T is None or T < 0 else int(T)
+
+
 def _group_rms(x, T, hc, H, weight_vec, eps):
     """Qwen4ExpTextRMSNorm with group_size = H (pin 152-172): reshape the last
     dim into the hc groups, normalize within each, apply (1+w) as hc.py's
     f64-roundtrip lowering (bit-identical to the pin's fp32 add), flatten. x:
     [1,T,hc*H] -> [1,T,hc*H]."""
-    xg = _reshape(x, [1, T, hc, H])
+    xg = _reshape(x, [1, _T(T), hc, H])
     var = _rmean(_mul(xg, xg), 3)            # pin 164: mean(x^2) over the group
     xn = _mul(xg, _rsqrt_eps(var, eps))      # pin 164: x * rsqrt(var + eps)
     w64 = op.convert(_c(np.ascontiguousarray(weight_vec, np.float32).reshape(1, 1, hc, H)), Type.f64)
     ones64 = op.constant(np.ones((1, 1, hc, H), np.float64))
     wn = op.convert(op.add(ones64, w64), Type.f32)  # pin 171: (1 + w)
     xn = _mul(wn, xn)
-    return _reshape(xn, [1, T, hc * H])      # pin 165: flatten(-2)
+    return _reshape(xn, [1, _T(T), hc * H])  # pin 165: flatten(-2)
 
 
 def _short_conv(x, conv_w, T, C, K, dilation):
@@ -94,7 +100,15 @@ def _short_conv(x, conv_w, T, C, K, dilation):
     xpad = op.concat([_c(np.zeros((1, C, state_len), np.float32)), xt], axis=2)  # [1,C,state_len+T]
     acc = None
     for j in range(K):                       # depthwise dilated taps (pin 1230 conv1d)
-        xs = _slice(xpad, j * dilation, j * dilation + T, 1, 2)  # [1, C, T]
+        if T is not None and T > 0:
+            stop = j * dilation + T
+        else:
+            # DYNAMIC T (serving shape): tap j covers [j*dil, j*dil + T) of a
+            # state_len + T long pad, i.e. it ends (state_len - j*dil) before
+            # the end -- a negative stop, or "to the end" for the last tap.
+            # Same window, no length written in.
+            stop = j * dilation - state_len if j < K - 1 else 9223372036854775807
+        xs = _slice(xpad, j * dilation, stop, 1, 2)  # [1, C, T]
         wj = _c(conv_w[:, 0, j].reshape(1, C, 1))
         term = _mul(xs, wj)
         acc = term if acc is None else _add(acc, term)

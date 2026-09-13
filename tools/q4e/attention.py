@@ -200,7 +200,9 @@ def _rmsnorm_hd(x, weight, eps, d):
 def _rotate_half(x):
     """pin 628-632: rotate_half -- x1 = x[..., :d/2], x2 = x[..., d/2:],
     cat((-x2, x1), dim=-1)."""
-    half = x.shape[-1] // 2
+    # the last dim off the PARTIAL shape: static either way, and `.shape`
+    # throws on a node with a dynamic sequence axis (the serving shape)
+    half = x.get_output_partial_shape(0)[-1].get_length() // 2
     x1 = _slice(x, 0, half, 1, -1)                 # pin 630
     x2 = _slice(x, half, half * 2, 1, -1)          # pin 631
     return op.concat([op.negative(x2), x1], axis=-1)   # pin 632
@@ -212,11 +214,17 @@ def _apply_rope(q, k, cosT, sinT, pid_node, rotary, T):
     gather-and-apply. q/k: [1, heads, T, d]; returns rotated q, k."""
     cos = op.gather(cosT, pid_node, op.constant(np.int64(0)))   # [1,T,rotary]
     sin = op.gather(sinT, pid_node, op.constant(np.int64(0)))
-    cos = _reshape(cos, [1, 1, T, rotary])         # pin 653: unsqueeze(1)
-    sin = _reshape(sin, [1, 1, T, rotary])         # pin 654
+    Td = -1 if T is None or T < 0 else int(T)      # -1: dynamic in T
+    cos = _reshape(cos, [1, 1, Td, rotary])        # pin 653: unsqueeze(1)
+    sin = _reshape(sin, [1, 1, Td, rotary])        # pin 654
     # pin 658 / 665: keep the non-rotary tail, rotate the leading rotary band.
-    qr, qn = _slice(q, 0, rotary, 1, -1), _slice(q, rotary, q.shape[-1], 1, -1)
-    kr, kn = _slice(k, 0, rotary, 1, -1), _slice(k, rotary, k.shape[-1], 1, -1)
+    # the head dim is read off the PARTIAL shape: `.shape` throws on a node
+    # with a dynamic sequence axis (the serving shape), and the last dim is
+    # static either way
+    dq = q.get_output_partial_shape(0)[-1].get_length()
+    dk = k.get_output_partial_shape(0)[-1].get_length()
+    qr, qn = _slice(q, 0, rotary, 1, -1), _slice(q, rotary, dq, 1, -1)
+    kr, kn = _slice(k, 0, rotary, 1, -1), _slice(k, rotary, dk, 1, -1)
     qr = _add(_mul(qr, cos), _mul(_rotate_half(qr), sin))       # pin 660
     kr = _add(_mul(kr, cos), _mul(_rotate_half(kr), sin))       # pin 666
     return (op.concat([qr, qn], axis=-1),                       # pin 662

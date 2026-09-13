@@ -132,69 +132,15 @@ def _kld(p_logits, q_logits):
     return float(np.mean(np.sum(p * (np.log(p + 1e-12) - np.log(q + 1e-12)), axis=-1)))
 
 
-# --- the index derivation, transcribed (matches src/exec/ngram_row_ids.h) ----
-_MASK64 = (1 << 64) - 1
+# --- the index derivation lives in q4e.ngram_ids (feed-the-ports); the cells
+# below keep their names and call it through these aliases ---------------------
+from q4e import ngram_ids as _ngram_ids  # noqa: E402
 
-
-def _s64(x):
-    x &= _MASK64
-    return x - (1 << 64) if x >= (1 << 63) else x
-
-
-def _derive(vocab_size, ngram_size, heads_per_ngram, base, ple_idx, seed=1234):
-    nh = (ngram_size - 1) * heads_per_ngram
-    mult = pin_mod._build_layer_multipliers(vocab_size, ngram_size, ple_idx, seed).tolist()
-    sizes, offs, tot = [], [], 0
-    for h in range(nh):
-        gh = ple_idx * nh + h
-        sz = pin_mod._find_nth_prime_after(base - 1, gh + 1)
-        sizes.append(sz)
-        offs.append(tot)
-        tot += sz
-    return mult, sizes, offs
-
-
-def _row_ids(mult, sizes, offs, ng, hpn, eos, context, tokens):
-    ctx = ng - 1
-    packed = list(context) + list(tokens)
-    W = len(packed)
-    prev, last = [-1] * W, -1
-    for p in range(W):
-        prev[p] = last
-        if packed[p] == eos:
-            last = p
-    in_seg = [p - prev[p] - 1 for p in range(W)]
-    shifted = [list(packed)] + [
-        [packed[p - s] if (p - s >= 0 and in_seg[p] >= s) else eos for p in range(W)]
-        for s in range(1, ng)
-    ]
-    per = [[r[ctx + i] for i in range(len(tokens))] for r in shifted]
-    out = []
-    for i in range(len(tokens)):
-        heads = []
-        for n in range(2, ng + 1):
-            st = (n - 2) * hpn
-            mixed = _s64(per[0][i] * mult[0])
-            for pos in range(1, n):
-                mixed = _s64((mixed & _MASK64) ^ (_s64(per[pos][i] * mult[pos]) & _MASK64))
-            for h in range(st, st + hpn):
-                heads.append(mixed % sizes[h] + offs[h])
-        out.append(heads)
-    return out
-
-
-def _gen_row_ids(config, ple_idx, tokens):
-    """The TEST-SIDE row-id producer (this side of the parity seam; serving
-    uses src/exec/ngram_row_ids.h). Fresh (all-eos) context, no cache. Python
-    ints are true 64-bit and the result is np.int64 -- no float touches the
-    index path. Returns [1, T, num_ngram_heads]."""
-    mult, sizes, offs = _derive(config.vocab_size, config.ngram_size,
-                                config.heads_per_ngram, config.ngram_vocab_size_base, ple_idx)
-    eos = int(config.eos_token_id)
-    ctx = [eos] * (config.ngram_size - 1)
-    rows = _row_ids(mult, sizes, offs, config.ngram_size, config.heads_per_ngram,
-                    eos, ctx, [int(t) for t in tokens])
-    return np.array(rows, dtype=np.int64)[None]  # [1, T, Hn]
+_s64 = _ngram_ids._s64
+_MASK64 = _ngram_ids._MASK64
+_derive = _ngram_ids.derive
+_row_ids = _ngram_ids.row_ids
+_gen_row_ids = _ngram_ids.gen_row_ids
 
 
 # ---------------------------------------------------------------------------

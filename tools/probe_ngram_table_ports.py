@@ -40,7 +40,7 @@ import numpy as np
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "tools"))
 
-ROW_BYTES = 80                      # 160 nibbles, the real row
+ROW_BYTES = 90                      # one 160-wide IQ4_NL row: 5 x 18 bytes
 HN, T = 16, 5
 
 
@@ -64,10 +64,9 @@ def sentinel_row(global_row, row_bytes):
 
 
 def unpack(rows_u8):
-    out = np.empty(rows_u8.shape[:-1] + (2 * rows_u8.shape[-1],), np.float32)
-    out[..., 0::2] = rows_u8 & 0x0F
-    out[..., 1::2] = rows_u8 >> 4
-    return out
+    """The gather's output is the rows' BYTES as f32 (the IQ4_NL decode is a
+    separate function, gated on CPU); the reference is the bytes."""
+    return rows_u8.astype(np.float32)
 
 
 def gpu_mem(core, dev, label):
@@ -185,7 +184,7 @@ def main(argv=None):
         chunk_ids.output(0).set_names({"ngram_chunk_ids"})
         local_ids = op.parameter([1, T, HN], ov.Type.i64)
         local_ids.output(0).set_names({"ngram_local_ids"})
-        out = ss.ngram_chunked_gather(chunk_ids, local_ids, ports, 2 * ROW_BYTES)
+        out = ss.ngram_chunked_gather(chunk_ids, local_ids, ports)
         idx_params = [chunk_ids, local_ids]
     else:
         local_ids = op.parameter([1, T, HN, nchunks], ov.Type.i64)
@@ -201,14 +200,6 @@ def main(argv=None):
                 op.unsqueeze(here, i32c(-1)), rows_k, picked)
         out = op.convert(picked, ov.Type.f32)
         idx_params = [local_ids, chunk_ids]
-    if args.index != "select":
-        # the same nibble unpack the emitter does, so the verdict compares alike
-        x = out
-        hi = op.floor(op.divide(x, op.constant(np.array(16.0, np.float32))))
-        lo = op.subtract(x, op.multiply(hi, op.constant(np.array(16.0, np.float32))))
-        pair = op.concat([op.unsqueeze(lo, i32c(-1)), op.unsqueeze(hi, i32c(-1))], axis=-1)
-        out = op.reshape(pair, op.constant(np.array([1, T, HN, 2 * ROW_BYTES], np.int64)),
-                         special_zero=False)
     model = ov.Model([op.result(out)], idx_params + ports, "ngram_port_probe")
 
     t0 = time.time()
@@ -314,7 +305,7 @@ def main(argv=None):
     ref = unpack(np.stack([sentinel_row(int(r), ROW_BYTES)
                            for r in ids.ravel()]).reshape(1, T, HN, ROW_BYTES))
     bad = np.argwhere((got != ref).any(axis=-1))
-    say("verdict", f"out{tuple(got.shape)} {got.dtype}; rows wrong "
+    say("verdict", f"out{tuple(got.shape)} {got.dtype} (bytes); rows wrong "
                    f"{len(bad)} of {ids.size}; values wrong "
                    f"{int((got != ref).sum())} of {ref.size}")
     if args.verbose:

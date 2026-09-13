@@ -532,7 +532,7 @@ def parse_args(argv=None):
     return ap.parse_args(argv)
 
 
-def verify_serving_shape(seq_len=64, n_layers=None):
+def verify_serving_shape(n_layers=None):
     """Build the full-geometry serving-shape IR and print what it IS.
 
     This is the "honest shape verification" that replaces the residency
@@ -548,14 +548,13 @@ def verify_serving_shape(seq_len=64, n_layers=None):
     try:
         import time
         t0 = time.time()
-        model, rep = ss.build_serving_shape_ir(seq_len=seq_len, arena=arena,
-                                               n_layers=n_layers)
+        model, rep = ss.build_serving_shape_ir(arena=arena, n_layers=n_layers)
         dt = time.time() - t0
         cfg = pwe_.real_config()
         print("serving-shape IR (structure only; no weight data materialised)")
         print(f"  layers                {rep['n_layers']} "
               f"({rep['gdn_layers']} GDN + {rep['attn_layers']} dense-causal)")
-        print(f"  seq_len               {rep['seq_len']}")
+        print(f"  seq_len               dynamic (rope span {rep['rope_span']:,})")
         print(f"  nodes                 {rep['nodes']:,}")
         print(f"  declared const bytes  "
               f"{rep['graph_const_bytes'] / 2**30:.2f} GiB")
@@ -591,7 +590,7 @@ def main(argv=None):
     args = parse_args(argv)
 
     if getattr(args, "serving_shape", False):
-        verify_serving_shape(seq_len=args.seq_len)
+        verify_serving_shape()
         return 0
 
     if args.gguf_ir:

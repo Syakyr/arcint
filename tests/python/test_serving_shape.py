@@ -133,8 +133,7 @@ FLEET_IRS_WITH_MOE_TYPED_OP = 0       # C, and D too
 @pytest.fixture(scope="module")
 def built():
     arena = ss.SparseArena()
-    model, report = ss.build_serving_shape_ir(
-        seq_len=_T, arena=arena, n_layers=_CONTRACT_LAYERS)
+    model, report = ss.build_serving_shape_ir(arena=arena, n_layers=_CONTRACT_LAYERS)
     yield model, report, arena
     arena.close()
 
@@ -151,10 +150,11 @@ def built():
 # asserted equal to it below, so neither can drift without the other noticing.
 _A770_MAX_ALLOC_BYTES = 4_294_959_104
 _B60_MAX_ALLOC_BYTES = 24_385_683_456
-# One row of the table: 160 nibbles (`ple_embed_dim / num_ngram_heads` =
-# 2560 / 16, the "160-wide row" ngram_row_ids.h:22 states), packed two to a
-# byte. The port carries bytes; the nibble width is the declared u4's.
-_NGRAM_ROW_BYTES = 80
+# One row of the table: 160 elements (`ple_embed_dim / num_ngram_heads` =
+# 2560 / 16, the "160-wide row" ngram_row_ids.h:22 states) in the GGUF's own
+# IQ4_NL: 5 blocks of 32, each an f16 scale plus 16 nibble bytes = 18 bytes.
+# The port carries the row's bytes as the file holds them (feed-the-ports).
+_NGRAM_ROW_BYTES = 160 // 32 * 18
 
 
 def _ngram_partition_transcribed(cfg):
@@ -261,22 +261,24 @@ def test_the_ngram_table_travels_as_ports_that_partition_the_vocabulary(built):
 
 def test_the_chunked_gather_is_the_whole_table_gather():
     """NUMERIC, on CPU, at a toy width: gathering through the chunked ports
-    produces exactly what a Gather over the un-chunked u4 table produces --
-    row by row, nibble by nibble, across every chunk boundary.
+    produces exactly the rows a Gather over the un-chunked table produces --
+    row by row, byte by byte, across every chunk boundary.
 
     Three chunks (4096, 4096, 1808 rows of 8 B -- the emitter's own
     partition under a cap of 32,768 B), random bytes in every row, and row
     ids that include both edges of every chunk. The reference is numpy over
-    the concatenated table: low nibble first.
+    the concatenated table: the rows' bytes. (Until feed-the-ports the gather
+    also unpacked nibbles low-first; the decode is now `ngram_dequant_iq4nl`
+    and has its own cell below.)
 
     RED CASES, run 2026-09-13 on the dev host (CPU, the pinned OV) before
-    this went green, figures pasted from the runs: the nibble order swapped
-    (hi first) -> 306 of 320 values wrong; the chunk id computed from `local`
-    instead of the global id (the first, in-graph form of the decomposition)
-    -> 184 of 320 wrong (every row past chunk 0). Both caught by exact
-    equality; neither would be caught by a shape check. And on the old
-    emitter (37d9b33) the cell cannot run at all: there is no chunked gather
-    to call.
+    the first form went green, figures pasted from the runs: the nibble order
+    swapped (hi first) -> 306 of 320 values wrong; the chunk id computed from
+    `local` instead of the global id (the first, in-graph form of the
+    decomposition) -> 184 of 320 wrong (every row past chunk 0). Both caught
+    by exact equality; neither would be caught by a shape check. And on the
+    old emitter (37d9b33) the cell cannot run at all: there is no chunked
+    gather to call.
 
     WHAT THIS CELL CANNOT SEE, and why the ids are now host-split: on CPU the
     in-graph i32 decomposition was exact here and on the card it was wrong
@@ -286,7 +288,6 @@ def test_the_chunked_gather_is_the_whole_table_gather():
     host-split contract says, and the probe on the card gates the rest.
     """
     n_rows, row_bytes, cap = 10_000, 8, 4096 * 8
-    head_dim = 2 * row_bytes
     Hn, T = 4, 5
     rng = np.random.default_rng(5)
     table = rng.integers(0, 256, size=(n_rows, row_bytes), dtype=np.uint8)
@@ -298,7 +299,7 @@ def test_the_chunked_gather_is_the_whole_table_gather():
     chunk_ids.set_friendly_name("ngram_chunk_ids")
     local_ids = ov.opset13.parameter([1, T, Hn], ov.Type.i64)
     local_ids.set_friendly_name("ngram_local_ids")
-    out = ss.ngram_chunked_gather(chunk_ids, local_ids, ports, head_dim)
+    out = ss.ngram_chunked_gather(chunk_ids, local_ids, ports)
     model = ov.Model([ov.opset13.result(out)], [chunk_ids, local_ids] + ports,
                      "chunked_gather")
     req = ov.Core().compile_model(model, "CPU").create_infer_request()
@@ -320,14 +321,63 @@ def test_the_chunked_gather_is_the_whole_table_gather():
     req.infer()
     got = req.get_output_tensor(0).data
 
-    picked = table[ids]                                       # [1,T,Hn,row_bytes]
-    ref = np.empty(picked.shape[:-1] + (head_dim,), np.float32)
-    ref[..., 0::2] = picked & 0x0F
-    ref[..., 1::2] = picked >> 4
+    ref = table[ids].astype(np.float32)                       # the rows' bytes
     print(f"\n[chunked-gather] {len(rows)} chunks {rows}, {ids.size} ids incl. "
           f"edges {edges}; out {got.shape} {got.dtype}; "
           f"mismatches {int((got != ref).sum())} of {ref.size}")
     assert got.shape == ref.shape and got.dtype == np.float32
+    assert np.array_equal(got, ref)
+
+
+def test_the_in_graph_iq4nl_decode_is_gguf_pys_bit_for_bit():
+    """NUMERIC, on CPU: `ngram_dequant_iq4nl` over rows of IQ4_NL bytes
+    equals the gguf package's own `dequantize(raw, IQ4_NL)` EXACTLY -- no
+    tolerance, because every op in the decode is exact by construction
+    (window-050 §4.7's rule for this card class: integers below 2**24,
+    powers of two from a table, the codebook by Gather).
+
+    The rows are synthesised: random nibbles, and scales drawn as random
+    finite f16 values INCLUDING subnormals and both signs (the decode rebuilds
+    the f16 from its bit fields, so the subnormal branch and the sign are
+    what a lucky draw would miss). 128 rows x 160.
+
+    RED on d30db36's emitter: no decode existed; the gather unpacked raw
+    nibbles as values 0..15 with no scale.
+    """
+    from gguf.quants import dequantize
+    from gguf.constants import GGMLQuantizationType as Q
+    head_dim, Hn, T = 160, 16, 8
+    n = T * Hn
+    rb = ss.ngram_row_bytes(head_dim)
+    assert rb == 90
+    rng = np.random.default_rng(9)
+    raw = rng.integers(0, 256, size=(n, rb), dtype=np.uint8)
+    # scales: f16 bit patterns, finite only (exponent 31 = inf/nan excluded),
+    # a quarter of them subnormal (exponent 0), signs mixed
+    nb = head_dim // 32
+    exp = rng.integers(0, 31, size=(n, nb)).astype(np.uint16)
+    exp[rng.random((n, nb)) < 0.25] = 0
+    bits = ((rng.integers(0, 2, size=(n, nb)).astype(np.uint16) << 15)
+            | (exp << 10) | rng.integers(0, 1024, size=(n, nb)).astype(np.uint16))
+    for b in range(nb):
+        raw[:, b * 18] = (bits[:, b] & 0xFF).astype(np.uint8)
+        raw[:, b * 18 + 1] = (bits[:, b] >> 8).astype(np.uint8)
+    ref = dequantize(raw, Q.IQ4_NL).astype(np.float32)        # [n, 160]
+
+    x = ov.opset13.parameter([1, -1, Hn, rb], ov.Type.f32)
+    x.set_friendly_name("rows")
+    out = ss.ngram_dequant_iq4nl(x, head_dim)
+    model = ov.Model([ov.opset13.result(out)], [x], "iq4nl_decode")
+    req = ov.Core().compile_model(model, "CPU").create_infer_request()
+    req.set_input_tensor(ov.Tensor(
+        np.ascontiguousarray(raw.astype(np.float32).reshape(1, T, Hn, rb))))
+    req.infer()
+    got = req.get_output_tensor(0).data.reshape(n, head_dim)
+    subn = int((exp == 0).sum())
+    print(f"\n[iq4nl-decode] {n} rows x {head_dim}, {subn} subnormal scales of "
+          f"{n * nb}; mismatches {int((got != ref).sum())} of {ref.size}; "
+          f"absmax {float(np.abs(ref).max()):.4g}")
+    assert got.shape == ref.shape
     assert np.array_equal(got, ref)
 
 
@@ -353,14 +403,18 @@ def test_the_input_ports_are_the_names_and_shapes_the_serving_path_feeds(built):
 
     got = {name: (tuple(shape), etype)
            for name, shape, etype in report["inputs"]}
+    # -1 is a dynamic dimension (`_dims`): since feed-the-ports the graph is
+    # dynamic in T, every per-token port with it.
     want = {
-        "input_ids":     ((1, _T), "int64_t"),
-        "position_ids":  ((1, _T), "int64_t"),
+        # the served forward feeds this name (backend_ov.cpp:6141), embedded on
+        # the host; the embedding weight left the graph with it
+        "inputs_embeds": ((1, -1, cfg.hidden_size), "float32"),
+        "position_ids":  ((1, -1), "int64_t"),
         # the hashed row, split by the host at the table's port partition
         # (increment 5): no arithmetic on the index path in the graph
-        "ngram_chunk_ids": ((1, _T, Hn), "int32_t"),
-        "ngram_local_ids": ((1, _T, Hn), "int64_t"),
-        "conv_mask":     ((1, _T), "float32"),
+        "ngram_chunk_ids": ((1, -1, Hn), "int32_t"),
+        "ngram_local_ids": ((1, -1, Hn), "int64_t"),
+        "conv_mask":     ((1, -1), "float32"),
         # Declared for the transformation, which looks them up by name and
         # removes them; -1 is a dynamic dimension (`_dims`). `attention_mask`
         # spans past + current, so its length is not the query block's.
@@ -389,7 +443,7 @@ def test_the_output_is_logits_at_the_real_vocabulary(built):
     outs = {n: (tuple(s), t) for n, s, t in report["outputs"]}
     print(f"[contract-ports] outputs: {outs}")
     assert list(outs) == ["logits"], outs
-    assert outs["logits"][0] == (1, _T, cfg.vocab_size), outs["logits"]
+    assert outs["logits"][0] == (1, -1, cfg.vocab_size), outs["logits"]
     assert "float32" in outs["logits"][1]
 
 
@@ -718,7 +772,8 @@ def test_the_serving_shape_survives_save_and_read_back(tmp_path):
         num_experts=8, num_experts_per_tok=2, moe_intermediate_size=128,
         shared_expert_intermediate_size=128,
         hc_count=cfg.hc_count, hc_lowrank=32,
-        ple_embed_dim=256, ple_conv_kernel_size=cfg.ple_conv_kernel_size,
+        # ple_embed_dim 512 = 16 heads x 32: one IQ4_NL block per table row
+        ple_embed_dim=512, ple_conv_kernel_size=cfg.ple_conv_kernel_size,
         ngram_size=cfg.ngram_size, heads_per_ngram=cfg.heads_per_ngram,
         vocab_size=512, rms_norm_eps=cfg.rms_norm_eps,
         linear_key_head_dim=32, linear_num_key_heads=2,
@@ -729,8 +784,7 @@ def test_the_serving_shape_survives_save_and_read_back(tmp_path):
     small.ngram_total_vocab = 4096
     arena = ss.SparseArena(capacity_bytes=1 << 32)
     try:
-        model, report = ss.build_serving_shape_ir(
-            config=small, seq_len=4, arena=arena, n_layers=1)
+        model, report = ss.build_serving_shape_ir(config=small, arena=arena, n_layers=1)
         xml = tmp_path / "serving_shape.xml"
         ov.save_model(model, str(xml), compress_to_fp16=False)
         size_mib = (xml.stat().st_size
@@ -752,7 +806,7 @@ def test_the_serving_shape_survives_save_and_read_back(tmp_path):
         print(f"  u4 constants  before {u4_before}  after {u4_after}")
         assert names_after == names_before, (names_before, names_after)
         assert u4_before > 0 and u4_after == u4_before, (u4_before, u4_after)
-        assert list(back.outputs[0].get_shape()) == [1, 4, small.vocab_size]
+        assert ss._dims(back.outputs[0]) == [1, -1, small.vocab_size]
     finally:
         arena.close()
 
@@ -1035,8 +1089,7 @@ def paged_census():
     """
     arena = ss.SparseArena()
     try:
-        model, _ = ss.build_serving_shape_ir(
-            seq_len=_T, arena=arena, n_layers=_CONTRACT_LAYERS)
+        model, _ = ss.build_serving_shape_ir(arena=arena, n_layers=_CONTRACT_LAYERS)
         before = {p.get_node().get_friendly_name() for p in model.inputs}
         # The variables AS THE LOAD PATH SEES THEM: read off the stateful graph
         # before the pass runs, which is what backend_ov.cpp:2557-2569 does and
@@ -1323,10 +1376,8 @@ def test_the_converted_surface_against_every_tensor_the_forward_feeds(
     # The recorded set, with WHY each one is here. Every entry is a gap, not a
     # decision: none of them is something the serving path knows how to feed.
     expected = {
-        # the forward feeds `inputs_embeds` (the embedding is its own compiled
-        # model); this emitter gathers the embedding inline off `input_ids`,
-        # so the name the forward reaches for is not the name declared.
-        "input_ids",
+        # (`input_ids` left this set with feed-the-ports: the graph takes
+        # `inputs_embeds`, the name the forward feeds.)
         # this emitter's own ports, which no serving forward has ever fed:
         # the hashed n-gram row's chunk and local ids, and the GDN/PLE
         # padding mask.
@@ -1353,39 +1404,35 @@ def test_the_converted_surface_against_every_tensor_the_forward_feeds(
         f"writes to -- read the list, do not widen it.")
 
 
-def test_the_rope_table_only_spans_the_query_block(built):
-    """A KNOWN LIMITATION, PINNED so it cannot be forgotten rather than
-    asserted because it is desirable.
+def test_the_rope_tables_span_the_full_context_and_are_shared(built):
+    """THE LIMITATION THIS CELL'S PREDECESSOR PINNED IS GONE, and this is the
+    cell that replaced it (feed-the-ports increment). Until then
+    `emit_stateful_attention` baked cos/sin for positions 0..T-1 per layer and
+    `test_the_rope_table_only_spans_the_query_block` asserted exactly that,
+    so the fix would go red instead of silent. It went red; this is the fix's
+    own gate: ONE cos and ONE sin constant, `[max_position_embeddings,
+    rotary]`, consumed by every full-attention layer's rope Gather. Shared is
+    what keeps it off the residency keystone -- ~67 MB a side once, against
+    the 1.6 GiB a per-layer table would have cost.
 
-    `emit_stateful_attention` bakes the rope cos/sin for positions 0..T-1 and
-    gathers them by `position_ids`. Every other part of that layer is built for
-    `past > 0` -- the causal mask derives `past` from the KV Variable's dynamic
-    length -- so the rope is the one place the static query block still leaks
-    into correctness: a position at or past T indexes off the end of the table
-    and OpenVINO's Gather does not throw for that.
-
-    This cell asserts the table's extent IS the query block, which is the
-    current state and not the desired one. The day it is sized from
-    `max_position_embeddings` (~1.6 GiB over the 12 full-attention layers at
-    real geometry, which is why it was not done in the increment that found
-    it), this cell fails and the limitation gets promoted instead of forgotten
-    -- the same mechanic the ports table's strict xfail used.
+    RED on d30db36's emitter: no `rope/cos` constant exists there (the tables
+    were anonymous, per layer, T rows).
     """
+    model, report, _ = built
     cfg = pwe.real_config()
-    cos, sin = qattn._freqs_tables(cfg, _T)
-    print(f"\n[contract-rope] cos/sin tables {cos.shape} for a query block of "
-          f"{_T}; max_position_embeddings is {cfg.max_position_embeddings}")
-    assert cos.shape[0] == _T and sin.shape[0] == _T, (
-        f"the rope tables now span {cos.shape[0]} positions, not the query "
-        f"block's {_T}. If they were sized from max_position_embeddings "
-        f"({cfg.max_position_embeddings}) the limitation this cell pins is "
-        f"GONE -- delete the cell, delete the paragraph in "
-        f"emit_stateful_attention's docstring, and re-derive the residency "
-        f"keystone, which this change moves.")
-    assert cos.shape[0] < cfg.max_position_embeddings, (
-        "the query block reaches max_position_embeddings, so there is nothing "
-        "left for a position to run off the end of -- the limitation is gone "
-        "for this configuration and the cell no longer means anything.")
+    consts = {n.get_friendly_name(): n for n in model.get_ordered_ops()
+              if n.get_type_name() == "Constant"
+              and n.get_friendly_name() in ("rope/cos", "rope/sin")}
+    assert set(consts) == {"rope/cos", "rope/sin"}, sorted(consts)
+    for name, node in consts.items():
+        shape = list(node.get_output_shape(0))
+        consumers = [t.get_node() for t in node.output(0).get_target_inputs()]
+        print(f"\n[contract-rope] {name} {shape} -> {len(consumers)} Gather(s)")
+        assert shape[0] == cfg.max_position_embeddings == report["rope_span"], shape
+        assert all(c.get_type_name() == "Gather" for c in consumers)
+        # one Gather per full-attention layer, and the same constant for all
+        assert len(consumers) == report["attn_layers"], (len(consumers), report["attn_layers"])
+    assert report["seq_len"] is None, "the graph is dynamic in T"
 
 
 def test_the_transformation_consumes_attention_mask_and_beam_idx(paged_census):
@@ -1548,7 +1595,7 @@ from q4e import serving_shape as ss
 arena = ss.SparseArena()
 try:
     t0 = time.time()
-    model, report = ss.build_serving_shape_ir(seq_len=64, arena=arena)
+    model, report = ss.build_serving_shape_ir(arena=arena)
     report["build_seconds"] = time.time() - t0
     report["disk_kib"] = arena.disk_kib()
     report["child_self_rss_gib"] = resource.getrusage(
@@ -1671,7 +1718,7 @@ def test_the_full_48_layer_stack_emits_at_real_geometry():
     # test_no_expert_constant_is_materialised for why `disk_kib` cannot
     # distinguish an unwritten arena from a written one on this filesystem
     assert report["disk_kib"] <= 64
-    assert report["outputs"][0][1] == [1, 64, cfg.vocab_size]
+    assert report["outputs"][0][1] == [1, -1, cfg.vocab_size]
     assert rss <= PEAK_RSS_CEILING_GIB, (
         f"peak RSS {rss:.2f} GiB exceeds the derived ceiling "
         f"{PEAK_RSS_CEILING_GIB} GiB. The build declared the same "
