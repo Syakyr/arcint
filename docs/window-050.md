@@ -1519,6 +1519,47 @@ path. **What it is not**: an explanation of the first leg's hang — see the
 retraction under the B60 row: that leg ran while another session held the
 host, and the identical command re-run quiet boots and answers.
 
+## 4.10 FULL DEPTH — THE ARITHMETIC BEFORE THE FILL, PREDICTED BEFORE ANY 48-LAYER CARD OUTPUT (2026-09-13)
+
+Operator CR of 2026-09-13 folds Berlin into 0.5.0: 48 layers, "experts
+host-bound, slow is fine", the France question and the KLD gate at full
+depth. This section is written with the depth-4 served run's numbers in hand
+and **no 48-layer artifact built and no 48-layer compile attempted**. Every
+row below is falsifiable by the fill or the card.
+
+### What the depth-4 artifact measures about the full one (`RUN@wt+6743ffb`, serving-shape.json)
+
+| term | per 4 layers, measured | 48 layers, arithmetic |
+|---|---|---|
+| dense f32 tensors | 95 = 3 × 22 (GDN) + 19 (attn) + 6 (PLE) + 3 (final) + 1 (head) | 36 × 22 + 12 × 19 + 10 = **1,030** |
+| dense f32 bytes | 3,906,155,136, of which the head is 2,542,796,800 and the four layers + PLE + final 1,363,358,336 | 12 × 1,363,358,336 + 2,542,796,800 = **18,903,096,832 B (17.6 GiB)** f32; the plugin carries them as f16 on the card: **8.8 GiB** |
+| expert bodies, u4 | 12 = 4 × 3, 5,387,059,200 B (1,346,764,800 a layer) | 144, **64,644,710,400 B (60.2 GiB)** — u4 is the card's own type, no halving left |
+| rope tables | 2 × [262144, 64] f32, 134,217,728 B, shared | the same 134 MB |
+| `.bin` | 9,427,885,993 B | ≈ 9,427,885,993 + 11 × (1,363,358,336 + 5,387,059,200) = **83,682,478,889 B (77.9 GiB)**, written to /models (1.7 TB free) |
+| build wall | 556.8 s (7.3 s index + fill + 82.1 s save) | ≈ 12 × the per-layer share ≈ **95–110 min**; peak host ≈ the same 21.6 GiB (the arena is a file) |
+| device-resident after compile | 6.79 GiB (A770 and B60 alike, §4.8) | dense f16 8.8 + experts 60.2 + rope ≈ **69 GiB** before one KV page or one activation |
+
+Against the cards: A770 16,225,243,136 B (15.11 GiB), B60 24,385,683,456 B
+(22.71 GiB). Against the host: 48 GiB total, and the table already takes
+26.82 GiB of it as pinned USM host (§4.8 R3).
+
+### The predictions
+
+| # | leg | prediction (written before the run) | dies if |
+|---|---|---|---|
+| F1 | `export_serving_artifact.py --layers 48` | completes: 1,030 dense tensors, 144 bodies, a `.bin` within 2 % of 83.7 GB, build under 2 h, no host OOM (the arena is a file; the d4 peak was 21.6 GiB); config.json `num_hidden_layers 48`, 12 × `qwen_sparse_attention` | a key the feed cannot map, the host OOM-killer, or a `.bin` far off the arithmetic (a per-layer term this table does not know) |
+| F2 | compile on the A770, served props | **REFUSED**: 69 GiB of constants do not fit 15.11 GiB. The device's words are either the per-allocation refusal at `engine.cpp:319` (no single object is over the 4.00 GiB cap — the largest is one gate_up body, 838,860,800 B — so this one is NOT expected) or an out-of-device-memory error from the allocator when the sum crosses the card; which of the two, and at which layer's constant, is what the run measures. UNTESTED alternative on the record (§4.7): the driver spills device allocations to system memory instead of refusing — then the compile proceeds until the host's 48 GiB is consumed. The run is fenced with a cgroup `MemoryMax` (systemd-run --user) so that outcome is a kill of the process with the fence's words, not a host freeze | the compile COMPLETES and a forward runs: then constants are not device-resident the way this arithmetic assumes, and full depth is reachable as built |
+| F3 | compile on the B60 | **REFUSED** the same way at 22.71 GiB; 69 > 22.71 by a factor of three, so no chunk size or KV precision changes it | as F2 |
+| F4 | the France question at full depth | **NOT REACHED through this artifact on these cards** — reached only if F2 or F3 die. The France line for full depth stays EMPTY in this section; the row that fills it is the model's own tokens, raw, in the measurement commit of whichever route runs 48 layers | — |
+| F5 | "experts host-bound" as the CR words it | **does not fit either**, by arithmetic and before any code: 60.2 GiB of expert bodies as USM-host ports next to the 26.82 GiB table is 87 GiB against 48 GiB of host RAM; the table as a host-side gather (0 pinned) leaves 60.2 against ~46 usable. So a single compiled 48-layer graph with every expert port bound at once is refused by the host, not the card — the outcome F2's fence exists for | a host with more RAM, or a route that binds fewer than 48 layers' experts at once (a segmented forward streaming expert bodies per layer group, which is Lisbon's mechanism) |
+
+**What this section does not predict**: timings of a refusal, which
+constant the allocator names, whether the xe driver spills.
+
+### Measured (the measurement commit fills this, with its own marker)
+
+(pending)
+
 ## 4.11 THE KLD GATE'S SERVED HALF — the instrument, red-probed at depth 4 (2026-09-13)
 
 `tools/kld_served.py` (device-free cells in `tests/python/test_kld_served.py`):
