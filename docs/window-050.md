@@ -840,9 +840,9 @@ shape with C > 4.
 
 Written with **no boot output in existence** for the tree it predicts (the last
 boot output this repository holds is `RUN@be57428`, §4.4, taken on the
-pre-stateful graph). Every row below is `UNTESTED` by construction; the
-measurement commit that follows this one turns each into `RUN@<sha>` and pastes
-what the card said, verbatim, next to what was predicted here. Every term is a
+pre-stateful graph). Every row was `UNTESTED` when written — the prediction
+commit is `8a84598` — and the "Measured" table below is the run that followed
+it, `RUN@8a84598`, pasted verbatim next to what was predicted. Every term is a
 B60 / A770 measurement this repository already holds, or a device-free reading
 of the pinned OpenVINO source; no external number appears.
 
@@ -874,7 +874,7 @@ disjoint. There is no depth at which the served path boots this IR on either
 card.** That is the headline, and it is falsified by ANY served-path forward
 returning logits at any depth on any card.
 
-| # | leg | prediction (`UNTESTED`) | dies if |
+| # | leg | prediction (written at `8a84598`, before the run) | dies if |
 |---|---|---|---|
 | P1 | pass, device-free, depth 1 (and 2, 3) | **REFUSED**: `No ScaledDotProductAttention operation observed in the graph, cannot perform the SDPAToPagedAttention transformation.` | the pass converts a graph with no SDPA |
 | P2 | pass, device-free, depth 4 | OK; `PagedAttentionExtension` 1, `PagedCausalConv1D` 3, `PagedGatedDeltaNet` 3, one `key_cache.`/`value_cache.` pair, all nine index ports | the pass refuses depth 4, or the op census differs |
@@ -905,12 +905,12 @@ means the cap as measured.
 ### The commands, in order (one process per leg, `timeout 1200` each)
 
 ```
-# UNTESTED — device-free, the P1/P2 legs
+# RUN@8a84598 — device-free, the P1/P2 legs
 <venv>/bin/python tools/boot_serving_shape.py --layers 1 --stage pass
 <venv>/bin/python tools/boot_serving_shape.py --layers 2 --stage pass
 <venv>/bin/python tools/boot_serving_shape.py --layers 3 --stage pass
 <venv>/bin/python tools/boot_serving_shape.py --layers 4 --stage pass
-# UNTESTED — A770 first (reserved card), then B60; P5, P6, P3
+# RUN@8a84598 — A770 first (reserved card), then B60; P5, P6, P3
 <venv>/bin/python tools/boot_serving_shape.py --layers 1 --device GPU.1 --no-pass --ids 760,6511,314,9338,369
 <venv>/bin/python tools/boot_serving_shape.py --layers 2 --device GPU.1 --no-pass --ids 760,6511,314,9338,369
 <venv>/bin/python tools/boot_serving_shape.py --layers 4 --device GPU.1 --ids 760,6511,314,9338,369
@@ -926,20 +926,100 @@ form of the probe (`"What is the capital of France? Answer in one word."`) is
 12 tokens under the same tokenizer and is not used here: the driver has no
 chat template and the served path would not reach it either way.
 
-### Measured (filled by the measurement commit — EMPTY here)
+### Measured — `RUN@8a84598`, 2026-09-13 07:36:52Z–07:38:46Z, both cards
+
+The ladder above, run verbatim on a `git archive` extract of `8a84598` whose
+`git write-tree` id (`ebadf8df…`) was computed on the export host and
+independently on the dev host over the extracted tree. Plugin: the venv's
+stock `2026.4.0-22849-71640275d29` (the same commit the served `+p15` builds
+from), one process per leg, `timeout -s KILL 1200`, both serving units
+inactive throughout (they were down before the session, by operator word, and
+were not started). Raw logs: one file per leg beside the extract.
 
 | # | card | measured | matches? |
 |---|---|---|---|
-| P1 | — | | |
-| P2 | — | | |
-| P3 | A770 | | |
-| P3b | B60 | | |
-| P4 | both | | |
-| P5 | A770 | | |
-| P5 | B60 | | |
-| P6 | A770 | | |
-| P6 | B60 | | |
-| P7 | A770 / B60 | | |
+| P1 | — | depth 1, 2, 3 each: `RuntimeError: Check 'ov::op::util::has_op_with_type<ov::op::v13::ScaledDotProductAttention>(model)' failed at src/core/src/pass/sdpa_to_paged_attention.cpp:81: No ScaledDotProductAttention operation observed in the graph, cannot perform the SDPAToPagedAttention transformation.` | **yes**, all three |
+| P2 | — | depth 4: pass OK; `{'PagedCausalConv1D': 3, 'PagedGatedDeltaNet': 3, 'PagedAttentionExtension': 1}`; ports after: `input_ids[-1], position_ids[-1], ngram_row_ids[1,T,16], conv_mask[1,T], max_context_len[], past_lens, subsequence_begins, block_indices_begins, block_indices, key_cache.0, value_cache.0, la.block_indices, la.block_indices_begins, la.past_lens, la.cache_interval, conv_state_table.0-2[-1,10240,4], gated_delta_state_table.0-2[-1,48,128,128]` | **yes** |
+| P3 | A770 | depth 4, served props: `FAIL after 4.89s peak_host_GiB=8.55 … Check '!exceed_allocatable_mem_size' failed at src/plugins/intel_gpu/src/runtime/engine.cpp:319: [GPU] Exceeded max size of memory object allocation: requested 25600122880 bytes, but max alloc size supported by device is 4294959104 bytes.` | **yes** |
+| P3b | B60 | depth 4, served props: `FAIL after 4.14s peak_host_GiB=8.55 … requested 25600122880 bytes, but max alloc size supported by device is 24385683456 bytes.` | **yes** |
+| P4 | both | no served-path `infer()` was reached on either card at any depth | **yes** |
+| P5 | A770 | depth 1 control: `COMPILE FAIL after 17.65s peak_host_GiB=7.20 … Error has occured for: convolution:GroupConvolution_118 \| Weights feature maps number(=1) is not equal to: input feature maps number(=10240) \| Weights/ifm mismatch` | **NO — falsified** |
+| P5 | B60 | depth 1 control: `COMPILE FAIL after 6.55s peak_host_GiB=7.45`, the same `GroupConvolution_118` text | **NO — falsified** |
+| P6 | A770 | depth 2 control: `FAIL after 4.03s peak_host_GiB=5.63`, `engine.cpp:319`, `requested 25600122880 … 4294959104` | **yes** |
+| P6 | B60 | depth 2 control: `FAIL after 3.70s peak_host_GiB=5.63`, `engine.cpp:319`, `requested 25600122880 … 24385683456` | **yes** |
+| P7 | A770 / B60 | not reached: no forward compiled, so no `set_tensor` was measured against a static block | **not measured** |
+
+First readings, not predictions: build 3.1–5.8 s at every depth; the stateful
+depth-1 graph is **382 nodes** (`RUN@be57428`'s pre-stateful one was 2,290 —
+the v5::Loop core collapsed the unrolled delta rule); depth 4 declares 63.43
+GiB; the pass adds nothing to peak host (0.96 GiB at depth 4 before compile).
+
+**The §8 France line stays a refusal, as predicted (P4).** Two of the three
+suspects in the handoff (`input_ids` / `ngram_row_ids` / `conv_mask`
+declared-never-fed; the static query block) were never reached; the third
+(the rope span) was never in play at position 0. What the device wrote instead
+is below.
+
+### P5 — the control is dead on both cards, and the root is LOCALISED
+
+The `RUN@be57428` witness ("the structure lights up on the card") no longer
+exists for the stateful graph: the depth-1 control refuses to compile on both
+cards at `GroupConvolution_118`. That op is `stateful_short_conv`'s depthwise
+GroupConvolution, the construct read out of `PagedCausalConv1DFusion`'s source
+in ITEM 2 (rank-4 `[conv_dim, 1, 1, K]` weights, groups = `conv_dim`, over the
+`Concat(axis=-1)` of the K-column state and the new block). The default
+emitter `q4e.gdn._causal_conv_silu` is a K-term slice/multiply unroll and
+carries no GroupConvolution at all — which is why the earlier boot compiled and
+this one does not.
+
+Localised with `tools/repro_stateful_conv_compile.py` (`RUN@wt+8a84598` —
+the reproducer was the working tree's only delta over `8a84598`; it lands in
+the same commit as this section), one op each at the real geometry
+(`conv_dim` 10240, K 4, T 5), one process per leg:
+
+| variant | CPU | GPU.1 (A770) | GPU.0 (B60) |
+|---|---|---|---|
+| `default` — `_causal_conv_silu`, 37 ops | OK, `out(1, 10240, 5)` finite | OK 0.23 s | OK 0.11 s |
+| `groupconv_static` — the SAME GroupConvolution over a static `[1, 10240, 9]`, 4 ops | OK, `out(1, 10240, 6)` finite | **OK** 0.11 s | **OK** 0.11 s |
+| `stateful` — as emitted: ReadValue `[?,10240,4]` → Concat → GroupConvolution → Slice, 32 ops | compiles; **infer throws** `Node Assign_27 of type Assign … Check 'input.getDesc().isDefined() && output.getDesc().isDefined()' failed at src/plugins/intel_cpu/src/nodes/reorder.cpp:550: Can't reorder data with dynamic shapes` | **COMPILE FAIL** 0.11 s, `GroupConvolution_30 … Weights/ifm mismatch` | **COMPILE FAIL** 0.11 s, the same |
+
+So: the op and its weight layout compile and run on both cards; what neither
+plugin takes UNFUSED is the construct's dynamic-length input (the Concat of a
+`[?, conv_dim, K]` ReadValue with the block) — the GPU plugin derives the
+weights' feature-map count as 1 against the input's 10240 and refuses at
+compile, and the CPU plugin compiles it and then cannot reorder the
+dynamic-shaped state at the Assign. On the SERVED path this construct is what
+`PagedCausalConv1DFusion` consumes (P2: `PagedCausalConv1D` ×3 after the
+pass), so the raw op never reaches a plugin there. The construct is therefore
+correct FOR the pass and unrunnable WITHOUT it, and the control form of the
+boot — compile the stateful graph directly — is gone with it.
+
+### What the device wrote as increment 5's spec, in the order it will be met
+
+1. **The n-gram table must leave the graph** (host-mmap gather, as serving
+   reads it through `src/exec/ngram_table.h`) or be chunked under
+   4,294,959,104 B. Until then no depth ≥ 2 compiles on either card, cap or
+   no cap (P3, P3b, P6: the B60's whole-VRAM cap is below the object too).
+2. **The minimum served depth is 4.** The pass refuses anything without an
+   SDPA (P1), and the emitter's first full-attention layer is index 3. A
+   depth ladder for the served path starts at 4, never at 1.
+3. **There is no unfused control any more.** The stateful conv construct is
+   pass-only (P5, localised above). A "does the structure light up" witness
+   for a card has to be the FUSED graph — which needs (1) first — or a
+   static-length variant of the construct that the pass still matches, which
+   is a design question and not decided here.
+4. Only after (1)–(3) reach a forward do the handoff's three suspects become
+   measurable: `inputs_embeds` is fed and not declared (the contract cell's
+   `NOT DECLARED`), `input_ids`/`ngram_row_ids`/`conv_mask` are declared and
+   never fed, and the query block is static in T. None of them was reached
+   in this window and none is fixed by it.
+
+Not done, on purpose: no lever pulled (`enable_large_allocations`), no fill,
+no emitter change, no C++ change, no probe past a refusal. The
+`ZOMBIE after p1-d1-pass` line in the ladder log is the sweep's `pgrep -f`
+matching the launcher shell whose command line carried the pattern (the
+self-match class already on record), not a leftover process; every later leg
+swept clean and both cards were free at the end.
 
 
 ## 5. Residency — the SIZE LEDGER, and the number that decides the window
@@ -1192,13 +1272,12 @@ baseline probe from a different model either.
 
 | probe | served model | answer | tokens | MTP acc/rej |
 |---|---|---|---|---|
-| "What is the capital of France? Answer in one word." | | | | |
+| "What is the capital of France? Answer in one word." | serving-shape IR, `RUN@8a84598`, 2026-09-13 | **no forward reached on either card** — depths 1–3: the pass refuses (`No ScaledDotProductAttention operation observed in the graph`); depth 4 (and 2): `engine.cpp:319`, `requested 25600122880 bytes` against `4294959104` (A770) / `24385683456` (B60). §4.6 | 0 | — |
 
-§4.6 (2026-09-13) predicts, before running, that this row cannot be filled
-with a token in the ITEM 4 window: the served path reaches no forward at any
-depth (P1 + P3). If that holds, the measurement commit writes the refusal here
-in place of an answer, dated, and the row stays a coherence line for the
-window that first gets a forward.
+§4.6 predicted this row before the window ran (P4) and the window wrote it as
+predicted. The row stays the coherence line for the first window that reaches
+a forward; that window replaces the refusal with the token, dated, in the same
+commit as its measurement.
 
 (For contrast and NOT as a substitute: the pre-window baseline of the *resident
 agent* — a different model, `qwen3.8-agent` on :8087 — answered `Paris` in 27
