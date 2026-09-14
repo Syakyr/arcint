@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <vector>
@@ -23,6 +24,42 @@ namespace lgc {
 struct UnloadedIr {
     std::string name;         // basename, e.g. "openvino_vision_embeddings_merger_model.bin"
     uint64_t    bytes = 0;
+};
+
+// SEGMENTED (0.5.1, window-051 §2 / src/exec/segment_plan.h): one compiled
+// sub-model of a segmented artifact, as `serving-shape.json`'s `segments[]`
+// row describes it, plus its own resolved, existence-checked file paths.
+// A non-segmented artifact (no `serving-shape.json`, or one whose
+// `segment_layers` is null) still gets exactly one of these -- index 0,
+// dir ".", the same paths `language_model_xml`/`_bin` already carry -- so
+// callers can always iterate `Artifact::segments` rather than branching on
+// whether the artifact is segmented.
+struct ArtifactSegment {
+    int index = 0;
+    std::string dir;  // "." for a non-segmented artifact, "segmentK" otherwise
+    std::string language_model_xml;
+    std::string language_model_bin;
+    int  layer_lo = 0, layer_hi = 0;
+    bool first = false;
+    bool last  = false;
+    int  inputs_embeds_width = 0;
+    bool has_ple    = false;
+    int  attn_layers = 0;
+    int  gdn_layers  = 0;
+    uint64_t    lm_bin_bytes = 0;
+    std::string xml_sha;  // full 64-hex sha256 of language_model_xml
+};
+
+// One expert body of a segmented artifact's `expert_bodies.u8` blob, as
+// `serving-shape.json`'s `expert_bodies.entries[]` row describes it.
+struct ExpertBodyEntry {
+    std::string name;  // "layerI/moe/experts_{gate,up,down}/weight_u8", I global
+    int segment = 0;
+    int layer   = 0;
+    std::string kind;  // "gate" | "up" | "down"
+    std::vector<int64_t> shape;
+    uint64_t offset = 0;
+    uint64_t bytes  = 0;
 };
 
 struct Artifact {
@@ -49,6 +86,26 @@ struct Artifact {
     // vision tower and projector (M13). Empty for a text-only export.
     std::vector<UnloadedIr> unloaded_vision_irs;
 
+    // SEGMENTED (0.5.1): always >= 1 after a successful load_artifact. A
+    // non-segmented artifact (no serving-shape.json, or segment_layers ==
+    // null) gets exactly one entry, index 0, dir ".", mirroring
+    // language_model_xml/_bin above -- today's behaviour unchanged.
+    std::vector<ArtifactSegment> segments;
+    // Empty when the artifact carries no expert_bodies.u8 blob (a
+    // non-segmented artifact, or a segmented one with no MoE layers).
+    std::string expert_bodies_path;
+    uint64_t    expert_bodies_bytes = 0;
+    std::vector<ExpertBodyEntry> expert_bodies;
+
+    // True iff serving-shape.json declared segment_layers != null, i.e. the
+    // artifact was produced (and must be driven) as a chain of segments,
+    // even a chain of one. `segments.size()` alone does not carry this: a
+    // depth shorter than one segment_layers step still produces exactly one
+    // segment row, and its arch_hash is still the chain form (segplan::
+    // chain_arch_hash), never the plain single-file sha256.
+    bool from_segmented_manifest = false;
+    bool segmented() const { return segments.size() > 1 || from_segmented_manifest; }
+
     // Geometry, from config.json (text_config when the export is a VLM).
     std::string model_type;
     std::string ov_arch;
@@ -62,11 +119,16 @@ struct Artifact {
     bool moe                    = false;
     std::vector<std::string> layer_types;
 
-    // sha256 prefixes, in the allowlist's pinned form.
+    // sha256 prefixes, in the allowlist's pinned form. `arch_hash` is
+    // segment 0's xml sha256 for a non-segmented artifact; for a segmented
+    // one it is segplan::chain_arch_hash over every segment's xml sha256,
+    // in segment order.
     std::string arch_hash;       // openvino_language_model.xml
     std::string template_hash;   // chat_template.jinja
     std::string tokenizer_hash;  // tokenizer.json
 
+    // Sum of every segment's language_model_bin size (one term for a
+    // non-segmented artifact).
     uint64_t weights_bytes = 0;
 
     // Read from generation_config.json, so provenance is "artifact" — this is
