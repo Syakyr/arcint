@@ -520,3 +520,109 @@ TEST(buffer_set_state_ok_after_a_second_refill) {
     st.refill(1);
     st.check_before_infer(1);  // must not throw
 }
+
+// ----------------------------------------------------------------------- (l)
+// The five refusals the 25 cells above do not reach. Each of these was
+// MEASURED as a gap first: disabling that one refusal in segment_plan.h left
+// all 25 cells green (the mutation sweep in the commit that wires this file).
+// So each cell here names the field it bends and the exact words it expects.
+
+TEST(segments_refuse_a_body_offset_stream_that_is_not_contiguous) {
+    json manifest = full_manifest();
+    // One byte of slack after layer0's gate body: the run is no longer what a
+    // sequential read of expert_bodies.u8 produces, so the refill would copy
+    // the wrong bytes into slot 1.
+    for (auto& e : manifest["expert_bodies"]["entries"]) {
+        if (e["name"] == "layer0/moe/experts_up/weight_u8") {
+            e["offset"] = kBodyBytes + 1;
+        }
+    }
+    const std::string why = refusal(manifest);
+    CHECK(why.find("not contiguous/ascending") != std::string::npos);
+    CHECK(why.find("layer0/moe/experts_up/weight_u8") != std::string::npos);
+}
+
+TEST(segments_refuse_body_bytes_that_do_not_sum_to_the_blob_size) {
+    json manifest = full_manifest();
+    // The blob claims one body more than its index holds: a refill driven by
+    // the index would run off the end of it (or leave a body unread).
+    manifest["expert_bodies"]["bytes"] =
+        manifest["expert_bodies"]["bytes"].get<uint64_t>() + kBodyBytes;
+    const std::string why = refusal(manifest);
+    CHECK(why.find("disagrees with expert_bodies.bytes") != std::string::npos);
+}
+
+TEST(segments_refuse_a_chain_whose_first_segment_is_not_the_embedding_taker) {
+    json manifest = full_manifest();
+    manifest["segments"][0]["first"] = false;
+    const std::string why = refusal(manifest);
+    CHECK(why.find("segment 0 has first=false") != std::string::npos);
+}
+
+TEST(segments_refuse_a_chain_whose_last_segment_does_not_carry_the_head) {
+    json manifest = full_manifest();
+    manifest["segments"][3]["last"] = false;
+    const std::string why = refusal(manifest);
+    CHECK(why.find("has last=false") != std::string::npos);
+}
+
+TEST(segments_refuse_an_expert_body_kind_outside_gate_up_down) {
+    json manifest = full_manifest();
+    // A kind the slot table has no shape for cannot be bound to the one
+    // buffer set at all, whatever its bytes say.
+    for (auto& e : manifest["expert_bodies"]["entries"]) {
+        if (e["name"] == "layer0/moe/experts_down/weight_u8") e["kind"] = "down_proj";
+    }
+    const std::string why = refusal(manifest);
+    CHECK(why.find("not one of gate/up/down") != std::string::npos);
+    CHECK(why.find("layer0/moe/experts_down/weight_u8") != std::string::npos);
+}
+
+// ----------------------------------------------------------------------- (m)
+
+TEST(artifact_arch_hash_of_a_segmented_manifest_is_the_chain_form_in_segment_order) {
+    TempSegmentedArtifactDir d;
+    Artifact a;
+    const auto err = load_artifact(d.dir(), a);
+    CHECK(!err.has_value());
+    const std::string s0 = sha256_file(d.dir() + "/segment0/openvino_language_model.xml");
+    const std::string s1 = sha256_file(d.dir() + "/segment1/openvino_language_model.xml");
+    CHECK_EQ(a.segments[0].xml_sha, s0);
+    CHECK_EQ(a.segments[1].xml_sha, s1);
+    CHECK_EQ(a.arch_hash, segplan::chain_arch_hash({s0, s1}));
+    // Not segment 0's own digest: an allowlist entry for a chain and the
+    // plain single-file form must not be able to agree by accident.
+    CHECK(a.arch_hash != hash_prefix(s0));
+    CHECK(a.arch_hash != hash_prefix(s1));
+    // Order matters, so a chain that reads back as {s1, s0} is a different
+    // artifact to the loader.
+    CHECK(a.arch_hash != segplan::chain_arch_hash({s1, s0}));
+    // And the .bin sizes SUM: segment0 8 B + segment1 9 B, not the largest.
+    CHECK_EQ(a.weights_bytes, static_cast<uint64_t>(17));
+}
+
+TEST(artifact_without_a_manifest_falls_back_to_the_plain_form_and_one_mirror_segment) {
+    TempSegmentedArtifactDir d;
+    // The manifest gone, and with it the segment directories the loader could
+    // have read: this is every artifact on the allowlist today, and the rule
+    // is that its load is unchanged -- one segment, dir ".", the top-level
+    // pair, the plain xml digest, one term in weights_bytes.
+    ::unlink((d.dir() + "/serving-shape.json").c_str());
+    d.write("openvino_language_model.xml", "<xmlall/>");
+    d.write("openvino_language_model.bin", "weights0");
+    Artifact a;
+    const auto err = load_artifact(d.dir(), a);
+    CHECK(!err.has_value());
+    CHECK(!a.segmented());
+    CHECK(!a.from_segmented_manifest);
+    CHECK_EQ(a.segments.size(), static_cast<size_t>(1));
+    if (!a.segments.empty()) {
+        CHECK_EQ(a.segments[0].dir, std::string("."));
+        CHECK_EQ(a.segments[0].layer_lo, 0);
+        CHECK_EQ(a.segments[0].layer_hi, a.n_layer);
+    }
+    CHECK_EQ(a.arch_hash, hash_prefix(sha256_file(d.dir() + "/openvino_language_model.xml")));
+    CHECK_EQ(a.weights_bytes, static_cast<uint64_t>(8));
+    ::unlink((d.dir() + "/openvino_language_model.xml").c_str());
+    ::unlink((d.dir() + "/openvino_language_model.bin").c_str());
+}
