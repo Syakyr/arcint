@@ -233,6 +233,7 @@ if(ARCINT_TESTS)
     tests/test_profile_cycle.cpp
     tests/test_rope_precision.cpp
     tests/test_segments.cpp
+    tests/test_segment_runtime.cpp
   )
   target_link_libraries(arcint-test PRIVATE arcint_core)
   target_include_directories(arcint-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/tests")
