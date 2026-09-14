@@ -182,18 +182,21 @@ ArtifactInfo Artifact::to_info(Quant quant) const {
     return info;
 }
 
-std::optional<std::string> load_artifact(const std::string& dir, Artifact& out) {
+std::optional<std::string> load_artifact(const std::string& dir, Artifact& out,
+                                       bool require_allowlisted) {
     Artifact          a;
     a.dir            = dir;
     a.directory_name = basename_of(dir);
 
     const ModelEntry* entry = find_by_artifact(a.directory_name);
-    if (entry == nullptr) {
+    if (entry == nullptr && require_allowlisted) {
         return log::format(
             "'%s' is not an allowlisted artifact directory (see models/allowlist-raw.json)",
             a.directory_name.c_str());
     }
-    a.id = entry->id;
+    // --inspect-artifact reaches here with no entry: the id stays empty and the
+    // sampler keeps its unset family-card state rather than claiming a family.
+    if (entry != nullptr) a.id = entry->id;
 
     a.language_model_xml  = dir + "/openvino_language_model.xml";
     a.language_model_bin  = dir + "/openvino_language_model.bin";
@@ -227,6 +230,7 @@ std::optional<std::string> load_artifact(const std::string& dir, Artifact& out) 
         } catch (const json::exception& e) {
             return log::format("serving-shape.json is not valid JSON: %s", e.what());
         }
+        a.serving_shape = shape;  // plan_segments reads this; the file is read once
     }
     if (shape.is_object() && shape.contains("segments") && shape.at("segments").is_array()) {
         int position = 0;
@@ -330,6 +334,7 @@ std::optional<std::string> load_artifact(const std::string& dir, Artifact& out) 
 
     a.n_layer                 = int_or(tc, "num_hidden_layers", 0);
     a.n_embd                  = int_or(tc, "hidden_size", 0);
+    a.hc_count                = int_or(tc, "hc_count", 0);
     a.n_ctx_train             = int_or(tc, "max_position_embeddings", 0);
     a.n_expert                = int_or(tc, "num_experts", 0);
     a.moe                     = a.n_expert > 0;
@@ -386,7 +391,11 @@ std::optional<std::string> load_artifact(const std::string& dir, Artifact& out) 
     // token 0 would silently act as a boundary.
 
     // ------------------------------------------------------ tokens, sampler
-    a.sampler = entry->sampler;  // family-card fallback, marked provisional
+    // The family-card defaults are the fallback; the artifact's own
+    // generation_config.json overrides them below and marks the provenance
+    // "artifact". No entry (--inspect-artifact on a directory the allowlist
+    // does not claim) leaves them as the struct's own zeros.
+    if (entry != nullptr) a.sampler = entry->sampler;
     if (!a.generation.is_null()) {
         collect_eos(a.generation, a.eos_ids);
         if (a.generation.contains("temperature") && a.generation["temperature"].is_number()) {

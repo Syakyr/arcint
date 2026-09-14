@@ -396,6 +396,12 @@ std::string usage_text() {
         "                            print the Flash-Next expert-offload serving\n"
         "                            plan for the target card at measured per-layer\n"
         "                            LRU hit-rate HIT (0..1), then exit (WP7 dry-run)\n"
+        "  --inspect-artifact        with --model PATH, print the artifact contract\n"
+        "                            the runtime drives (geometry, segment chain,\n"
+        "                            expert-body blob, the one buffer set it implies,\n"
+        "                            whether the allowlist admits the directory) and\n"
+        "                            exit. Device-free; the directory needs no entry\n"
+        "                            yet -- reading a contract is what precedes a pin.\n"
         "  --version                 print version and exit\n"
         "  -h, --help                print this help and exit\n";
 }
@@ -451,6 +457,8 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
             }
             cfg.flash_next_offload_plan = true;
             cfg.flash_next_offload_hit = h;
+        } else if (arg == "--inspect-artifact") {
+            cfg.inspect_artifact = true;
         } else if (arg == "--gguf-native") {
             cfg.gguf_native = true;
             cfg.gguf_mode = 1;

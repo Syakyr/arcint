@@ -114,10 +114,22 @@ struct Artifact {
     int n_attn_layer            = 0;
     int full_attention_interval = 0;
     int n_embd                  = 0;
+    // The hyper-connection width term: the hidden state carried between two
+    // segments is hc_count * hidden_size wide (window-051 §2), and
+    // segplan::plan_segments refuses a segment whose inputs_embeds_width
+    // disagrees with it. Zero when the checkpoint declares no hyper-connection
+    // (every non-qwen4exp export).
+    int hc_count                = 0;
     int n_ctx_train             = 0;
     int n_expert                = 0;
     bool moe                    = false;
     std::vector<std::string> layer_types;
+
+    // The artifact's own serving-shape.json, verbatim (null when the directory
+    // carries none). The segment rows are transcribed into `segments` above for
+    // the file contract; this is what segplan::plan_segments reads for the
+    // graph contract, so the loader stays the only reader of the file.
+    nlohmann::json serving_shape;
 
     // sha256 prefixes, in the allowlist's pinned form. `arch_hash` is
     // segment 0's xml sha256 for a non-segmented artifact; for a segmented
@@ -197,6 +209,13 @@ std::string admit_ngram_table_from_disk(const Artifact& artifact,
 // Returns an error message on failure. The directory basename decides which
 // allowlist entry the artifact claims to be; a name outside the allowlist is
 // refused here rather than after a two-minute compile.
-std::optional<std::string> load_artifact(const std::string& dir, Artifact& out);
+//
+// `require_allowlisted` false is --inspect-artifact's reading: report what the
+// directory IS (geometry, segments, hashes, blob) even when no allowlist entry
+// claims that name, because reading a new artifact's contract is exactly the
+// work that happens before its pin exists. `id` stays empty then, and nothing
+// about the file's own validation changes.
+std::optional<std::string> load_artifact(const std::string& dir, Artifact& out,
+                                        bool require_allowlisted = true);
 
 }  // namespace lgc

@@ -32,6 +32,12 @@ struct Config {
     // gather it sizes is parked on the backbone IR (FIX A).
     bool        flash_next_offload_plan = false;
     double      flash_next_offload_hit  = 0.0;
+    // --inspect-artifact: print the artifact contract the runtime drives
+    // (geometry, the segment chain, the expert-body blob and the buffer set it
+    // implies, whether the allowlist admits the directory) and exit. Reading a
+    // segmented artifact's arithmetic is device-free work, and it has to be:
+    // window-051 §2 sizes the cut before any card is asked for it.
+    bool        inspect_artifact = false;
     bool        gguf_native = false;  // --gguf-native: the file's own rows in the plugin's K-quant kernel instead of the repack (0.4.1)
     int         gguf_mode = 2;        // --gguf-mode: 0 = repack, 1 = native (also --gguf-native), 2 = mixed (Q4_K repacked, the rest native; the default, DESIGN 7.0.2be) (0.4.1)
     bool        gguf_embed_file = true;  // --gguf-embed file|template: the token embedding rows from the file, dequantised on the host per token (0.4.1)

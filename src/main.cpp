@@ -2,6 +2,7 @@
 #include <csignal>
 #include <cstdio>
 #include <memory>
+#include <string>
 
 #include "api/handlers.h"
 #include "build_info.h"
@@ -9,6 +10,7 @@
 #include "core/artifact.h"
 #include "exec/backend.h"
 #include "exec/flash_next_offload.h"
+#include "exec/segment_plan.h"
 #include "http/server.h"
 #include "util/log.h"
 #include "util/text.h"
@@ -32,6 +34,112 @@ lgc::log::Level level_for(int verbosity) {
     if (verbosity >= 1) return lgc::log::Level::Verbose;
     return lgc::log::Level::Info;
 }
+
+// --inspect-artifact: the artifact contract, printed. Every number here is
+// on-disk arithmetic -- bytes, hashes, port names, the buffer set the expert
+// index implies. No card is opened, no IR compiled, nothing measured: what a
+// card makes of this budget is a separate commit and a separate number (the
+// discipline that keeps a predicted GiB out of a measured column).
+// Inside the OpenVINO branch because that is where an artifact is read at all;
+// the stub backend serves no artifact to inspect.
+#ifdef ARCINT_OPENVINO
+void print_artifact_inspection(const lgc::Config& cfg, const lgc::Artifact& a) {
+    const double kGiB = 1.0 / (1024.0 * 1024.0 * 1024.0);
+    const auto   GiB  = [&](uint64_t bytes) { return static_cast<double>(bytes) * kGiB; };
+
+    std::printf("artifact inspection: %s\n", a.dir.c_str());
+
+    const lgc::ModelEntry* entry = lgc::find_by_artifact(a.directory_name);
+    if (entry == nullptr) {
+        std::printf("  allowlist: NOT admitted -- no entry claims the directory name "
+                    "'%s'\n",
+                    a.directory_name.c_str());
+    } else {
+        std::printf("  allowlist: admitted as %s (status: %s)\n", entry->id.c_str(),
+                    entry->status.c_str());
+    }
+
+    std::printf("  geometry: %d layers = %d GDN + %d attn, hidden %d, hc_count %d, "
+                "experts %d (%s), ctx %d\n",
+                a.n_layer, a.n_gdn_layer, a.n_attn_layer, a.n_embd, a.hc_count, a.n_expert,
+                a.moe ? "moe" : "dense", a.n_ctx_train);
+    std::printf("  hashes: arch %s [%s], template %s, tokenizer %s\n", a.arch_hash.c_str(),
+                a.segmented() ? "chain over every segment xml, in segment order"
+                              : "the single language-model xml",
+                a.template_hash.c_str(), a.tokenizer_hash.c_str());
+    std::printf("  weights: %s (%llu B) in %zu segment .bin(s)\n",
+                lgc::text::human_bytes(a.weights_bytes).c_str(),
+                static_cast<unsigned long long>(a.weights_bytes), a.segments.size());
+
+    if (a.segmented()) {
+        std::printf("  segments: %zu (declared by serving-shape.json segment_layers), "
+                    "hidden boundary port %d x %d = %d wide\n",
+                    a.segments.size(), a.hc_count, a.n_embd, a.hc_count * a.n_embd);
+        for (const lgc::ArtifactSegment& s : a.segments) {
+            std::printf("    seg %d  layers [%2d,%2d)  dir %-9s  %s%s  in_w %5d  attn %d gdn %d  "
+                        "bin %11llu B  xml %s\n",
+                        s.index, s.layer_lo, s.layer_hi, s.dir.c_str(), s.first ? "first " : "",
+                        s.last ? "last" : (s.has_ple ? "ple" : ""), s.inputs_embeds_width,
+                        s.attn_layers, s.gdn_layers,
+                        static_cast<unsigned long long>(s.lm_bin_bytes), s.xml_sha.c_str());
+        }
+    } else {
+        std::printf("  segments: 1 (the whole model; no segment_layers in serving-shape.json)\n");
+    }
+
+    if (a.expert_bodies_path.empty()) {
+        std::printf("  expert bodies: the artifact carries no expert_bodies blob\n");
+        return;
+    }
+    std::printf("  expert bodies: %s, %llu B (%.2f GiB), %zu bodies indexed\n",
+                a.expert_bodies_path.c_str(),
+                static_cast<unsigned long long>(a.expert_bodies_bytes),
+                GiB(a.expert_bodies_bytes), a.expert_bodies.size());
+    if (!a.segmented()) return;
+
+    // The graph contract is segplan's, not the loader's: it is the runtime's
+    // first call, so it is printed here as the runtime would meet it.
+    try {
+        const lgc::segplan::Plan plan =
+            lgc::segplan::plan_segments(a.serving_shape, a.n_layer, a.n_embd, a.hc_count);
+        std::printf("  segment plan: accepted\n");
+        for (size_t k = 0; k < lgc::segplan::kKinds.size(); ++k) {
+            std::string dims = "[";
+            for (size_t d = 0; d < plan.slot_shape[k].size(); ++d) {
+                dims += (d ? " x " : "") + std::to_string(plan.slot_shape[k][d]);
+            }
+            dims += "]";
+            std::printf("    kind %-4s slot shape %s  %llu B\n", lgc::segplan::kKinds[k],
+                        dims.c_str(), static_cast<unsigned long long>(plan.buffer_bytes(k)));
+        }
+        std::printf("    one buffer set: %zu slots, %llu B (%.2f GiB) -- resident for EVERY segment\n",
+                    plan.slots_per_segment,
+                    static_cast<unsigned long long>(plan.buffer_set_bytes()),
+                    GiB(plan.buffer_set_bytes()));
+        for (const lgc::segplan::SegmentSpec& s : plan.segments) {
+            uint64_t bytes = 0;
+            size_t   ops   = 0;
+            for (const lgc::segplan::RefillOp& op : lgc::segplan::refill_ops(plan, s.index)) {
+                bytes += op.bytes;
+                ++ops;
+            }
+            std::printf("    refill for segment %d: %zu bodies, %llu B (%.2f GiB)\n", s.index, ops,
+                        static_cast<unsigned long long>(bytes), GiB(bytes));
+        }
+        std::printf("    per forward the chain reads the whole blob: %llu B (%.2f GiB)\n",
+                    static_cast<unsigned long long>(a.expert_bodies_bytes),
+                    GiB(a.expert_bodies_bytes));
+    } catch (const std::exception& e) {
+        std::printf("  SEGMENT PLAN REFUSED: %s\n", e.what());
+    }
+
+    if (entry == nullptr) return;
+    const lgc::ValidationResult v = lgc::validate_artifact(*entry, a.to_info(cfg.quant));
+    for (const std::string& w : v.warnings) std::printf("  validate WARN: %s\n", w.c_str());
+    for (const std::string& err : v.errors) std::printf("  validate ERROR: %s\n", err.c_str());
+    std::printf("  validate: %s\n", v.ok ? "OK" : "REJECTED by the allowlist");
+}
+#endif  // ARCINT_OPENVINO
 
 }  // namespace
 
@@ -129,9 +237,14 @@ int main(int argc, char** argv) {
     } else {
 #ifdef ARCINT_OPENVINO
         lgc::Artifact artifact;
-        if (auto err = lgc::load_artifact(cfg.model_path, artifact)) {
+        if (auto err = lgc::load_artifact(cfg.model_path, artifact,
+                                         /*require_allowlisted=*/!cfg.inspect_artifact)) {
             lgc::log::error("load", "%s", err->c_str());
             return 2;
+        }
+        if (cfg.inspect_artifact) {
+            print_artifact_inspection(cfg, artifact);
+            return 0;
         }
         if (!cfg.model_id.empty() && cfg.model_id != artifact.id) {
             lgc::log::error("load", "--model-id says '%s' but the artifact is '%s'",
