@@ -165,5 +165,24 @@
     "status": "measurement artifact: depth 12 of 48, the depth ladder's first rung; not the model's answers",
     "mtp_num_hidden_layers": 1,
     "mtp_head_exported": false
+  },
+  "qwen38-flash-next-seg12-ov": {
+    "_note": "2026-09-14: ALL 48 layers as a SEGMENTED chain of four 12-layer compiled models (tools/export_serving_artifact.py --layers 48 --segment-layers 12, tree c00500f, filled 2026-09-13 22:09-23:39Z on the dev host). The directory holds segment0/..segment3/ (own openvino_language_model.{xml,bin} each) and one expert_bodies.u8 blob (144 bodies, 60,397,977,600 B) that the segmented runtime refills one segment at a time; serving-shape.json carries segments[] and the body index. lm_xml_sha is NOT a file digest here: a segmented artifact hashes as segplan::chain_arch_hash over the four segment xml digests in segment order (src/core/artifact.cpp), and it was read off the directory with `arcint --model <dir> --inspect-artifact`, which printed arch 32d3060ca30238d1, per-segment bins 4,944,946,409 + 4,813,218,673 + 4,813,218,673 + 7,382,270,833 = 21,953,654,588 B, and one 36-slot buffer set of 15,099,494,400 B (14.06 GiB). A measurement artifact: no segmented runtime drives it yet, so its answers are not the model's either way.",
+    "arch": [
+      "Qwen4ExpForConditionalGeneration"
+    ],
+    "model_type": "qwen4_exp",
+    "hidden": 2560,
+    "layers": 48,
+    "experts": 512,
+    "ctx": 262144,
+    "full_attention_interval": 4,
+    "template_sha": "12827f24b742ea4e",
+    "tokenizer_sha": "87a7830d63fcf43b",
+    "lm_xml_sha": "32d3060ca30238d1",
+    "lm_bin_bytes": 21953654588,
+    "status": "measurement artifact: 48 layers as a 4x12 segment chain; no segmented runtime yet; not the model's answers",
+    "mtp_num_hidden_layers": 1,
+    "mtp_head_exported": false
   }
 }

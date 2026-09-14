@@ -309,6 +309,51 @@ std::vector<ModelEntry> build_registry() {
     }
 
     {
+        // SEGMENTED (2026-09-14): ALL 48 layers as a chain of four 12-layer
+        // compiled models (tools/export_serving_artifact.py --layers 48
+        // --segment-layers 12, tree c00500f): segment0/..segment3/ each hold
+        // their own openvino_language_model.{xml,bin}, and the 144 expert
+        // bodies live beside them in one expert_bodies.u8 blob the runtime
+        // refills one segment at a time (docs/window-051 §2). Allowlisted so a
+        // runtime can be pointed at it; NO segmented runtime drives it yet, so
+        // its answers are not the model's either way -- admission here is a
+        // pin, not a capability claim.
+        //
+        // lm_xml_sha is NOT a file digest for this entry: a segmented artifact
+        // hashes as segplan::chain_arch_hash over every segment's xml sha in
+        // segment order (src/core/artifact.cpp), so re-exporting one segment,
+        // or reordering the chain, changes it. Read off the directory with
+        // `arcint --model <dir> --inspect-artifact`, which prints the chain
+        // digest and each segment's own; template/tokenizer are the GGUF's
+        // own, identical to the d4 and d12 rungs.
+        ModelEntry e;
+        e.id                      = "qwen3.8-flash-next-seg12";
+        e.family                  = "qwen3.8";
+        e.artifact_aliases        = {"qwen38-flash-next-seg12-ov"};
+        e.ov_arch                 = "Qwen4ExpForConditionalGeneration";
+        e.model_type              = "qwen4_exp";
+        e.moe                     = true;
+        e.has_mtp_head            = false;
+        e.mtp_head_pinned         = true;   // the export writes none
+        e.mtp_in_checkpoint       = true;
+        e.n_embd                  = 2560;
+        e.n_expert                = 512;
+        e.full_attention_interval = 4;
+        e.n_layer                 = 48;     // the whole model, over four segments
+        e.n_ctx_train             = 262144;
+        e.quants                  = {Quant::Q4};
+        e.arch_hash               = "32d3060ca30238d1";  // the CHAIN hash, not one file's
+        e.template_hash           = "12827f24b742ea4e";
+        e.tokenizer_hash          = "87a7830d63fcf43b";
+        e.weights_bytes           = 21953654588ull;  // SUM over the four segment .bins
+        e.status                  = "measurement artifact: 48 layers as a 4x12 segment "
+                                    "chain; no segmented runtime yet; not the model's answers";
+        e.sampler = qwen_card_defaults();
+        split_layers(e);
+        r.push_back(std::move(e));
+    }
+
+    {
         // FULL-DEPTH (2026-09-13): the same serving-shape IR at ALL 48 layers
         // (tools/export_serving_artifact.py --layers 48, tree 092df69): 1,030
         // dense f32 tensors, 144 u4 expert bodies, ~78 GiB .bin. Allowlisted
