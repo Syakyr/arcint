@@ -11,6 +11,7 @@
 
 #include "core/ngram_header.h"
 #include "exec/fit.h"
+#include "exec/segment_plan.h"
 #include "exec/ngram_row_ids.h"
 #include "util/log.h"
 #include "util/sha256.h"
@@ -91,6 +92,67 @@ int int_or(const json& j, const char* key, int fallback) {
     return fallback;
 }
 
+uint64_t uint64_or(const json& j, const char* key, uint64_t fallback) {
+    if (j.contains(key) && j[key].is_number_integer() && !j[key].is_number_float()) {
+        return j[key].get<uint64_t>();
+    }
+    return fallback;
+}
+
+// Resolve one `segments[]` row of serving-shape.json into paths under `dir`
+// and the file contract the loader needs (both files present, the row's own
+// geometry). Returns an empty string on success, else the refusal naming the
+// segment. The row's SEMANTICS -- whether the chain tiles the model, whether
+// a segment holds a full-attention layer, whether the expert bodies' shapes
+// agree across segments -- belong to segplan::plan_segments, the runtime's
+// first call; the loader refuses a directory whose files are not there, not a
+// graph it has not read.
+std::string resolve_segment(const std::string& dir, const json& row, int position,
+                            ArtifactSegment& out) {
+    const int index = int_or(row, "index", -1);
+    if (index != position) {
+        return log::format("serving-shape.json segment at position %d has index %d; "
+                           "segments must be listed in index order with no gap",
+                           position, index);
+    }
+    out.index = index;
+    out.dir   = row.value("dir", std::string("."));
+    if (out.dir.empty()) {
+        return log::format("segment %d has an empty 'dir'", index);
+    }
+    if (!row.contains("layers") || !row.at("layers").is_array() ||
+        row.at("layers").size() != 2 || !row.at("layers")[0].is_number_integer() ||
+        !row.at("layers")[1].is_number_integer()) {
+        return log::format("segment %d: 'layers' must be [lo, hi]", index);
+    }
+    out.layer_lo            = row.at("layers")[0].get<int>();
+    out.layer_hi            = row.at("layers")[1].get<int>();
+    out.first               = row.value("first", false);
+    out.last                = row.value("last", false);
+    out.inputs_embeds_width = int_or(row, "inputs_embeds_width", 0);
+    out.has_ple             = row.value("has_ple", false);
+    out.attn_layers         = int_or(row, "attn_layers", 0);
+    out.gdn_layers          = int_or(row, "gdn_layers", 0);
+
+    const std::string sub = out.dir == "." ? dir : dir + "/" + out.dir;
+    out.language_model_xml = sub + "/openvino_language_model.xml";
+    out.language_model_bin = sub + "/openvino_language_model.bin";
+    // A subdirectory segment is checked here; the top-level pair goes through
+    // the required-files loop below, keeping today's "artifact is missing"
+    // wording for a non-segmented artifact.
+    if (out.dir != ".") {
+        if (!file_exists(out.language_model_xml)) {
+            return log::format("segment %d is missing %s", index,
+                               out.language_model_xml.c_str());
+        }
+        if (!file_exists(out.language_model_bin)) {
+            return log::format("segment %d is missing %s", index,
+                               out.language_model_bin.c_str());
+        }
+    }
+    return {};
+}
+
 void collect_eos(const json& j, std::vector<int>& out) {
     if (!j.contains("eos_token_id")) return;
     const json& e = j["eos_token_id"];
@@ -146,6 +208,93 @@ std::optional<std::string> load_artifact(const std::string& dir, Artifact& out) 
     const std::string template_path   = dir + "/chat_template.jinja";
     const std::string tokenizer_json  = dir + "/tokenizer.json";
     const std::string tokenizer_cfg   = dir + "/tokenizer_config.json";
+    const std::string shape_path      = dir + "/serving-shape.json";
+
+    // ------------------------------------------- segments (0.5.1, window-051 §2)
+    // A segmented export writes its language model as segmentK/openvino_
+    // language_model.{xml,bin} and its expert bodies into one expert_bodies.u8
+    // blob; serving-shape.json's `segments[]` says which directory carries
+    // which layer range. It is read BEFORE the required-files loop, because a
+    // segmented artifact has no top-level openvino_language_model.* to require,
+    // and requiring one would refuse a good artifact for a file it never had.
+    // An artifact with no manifest at all -- every artifact on the allowlist
+    // today -- still gets exactly one segment (index 0, dir ".", the paths
+    // above), so callers iterate `segments` instead of branching.
+    json shape;
+    if (file_exists(shape_path)) {
+        try {
+            shape = json::parse(read_file(shape_path));
+        } catch (const json::exception& e) {
+            return log::format("serving-shape.json is not valid JSON: %s", e.what());
+        }
+    }
+    if (shape.is_object() && shape.contains("segments") && shape.at("segments").is_array()) {
+        int position = 0;
+        for (const json& row : shape.at("segments")) {
+            ArtifactSegment seg;
+            if (auto err = resolve_segment(dir, row, position++, seg); !err.empty()) {
+                return err;
+            }
+            a.segments.push_back(std::move(seg));
+        }
+    }
+    // "declared as a chain", not "has more than one segment": an export with
+    // segment_layers set to the whole depth is one segment and must still be
+    // hashed (and driven) as a chain of one.
+    a.from_segmented_manifest =
+        shape.is_object() && !shape.value("segment_layers", json()).is_null();
+    if (a.segments.empty()) {
+        ArtifactSegment seg;
+        seg.index              = 0;
+        seg.dir                = ".";
+        seg.language_model_xml = a.language_model_xml;
+        seg.language_model_bin = a.language_model_bin;
+        a.segments.push_back(std::move(seg));
+    }
+    // Segment 0 IS the language model for every caller that does not know
+    // about segments (the compile, the allowlist check, the load-time log).
+    a.language_model_xml = a.segments.front().language_model_xml;
+    a.language_model_bin = a.segments.front().language_model_bin;
+
+    // ------------------------------------------- expert bodies (window-051 §2)
+    // The blob the runtime refills one segment at a time from. Its `entries[]`
+    // is the index (global layer, kind, offset, bytes); the loader transcribes
+    // it and checks the blob against the manifest's own size claim.
+    if (shape.is_object() && shape.contains("expert_bodies") &&
+        shape.at("expert_bodies").is_object()) {
+        const json& eb = shape.at("expert_bodies");
+        a.expert_bodies_path = dir + "/" + eb.value("file", std::string("expert_bodies.u8"));
+        if (!file_exists(a.expert_bodies_path)) {
+            return log::format("artifact is missing %s (serving-shape.json's "
+                               "expert_bodies.file)",
+                               a.expert_bodies_path.c_str());
+        }
+        a.expert_bodies_bytes = file_size(a.expert_bodies_path);
+        const uint64_t claimed = uint64_or(eb, "bytes", a.expert_bodies_bytes);
+        if (claimed != a.expert_bodies_bytes) {
+            return log::format("%s is %llu bytes, serving-shape.json claims %llu",
+                               a.expert_bodies_path.c_str(),
+                               static_cast<unsigned long long>(a.expert_bodies_bytes),
+                               static_cast<unsigned long long>(claimed));
+        }
+        if (eb.contains("entries") && eb.at("entries").is_array()) {
+            for (const json& e : eb.at("entries")) {
+                ExpertBodyEntry entry;
+                entry.name    = e.value("name", std::string());
+                entry.segment = int_or(e, "segment", -1);
+                entry.layer   = int_or(e, "layer", -1);
+                entry.kind    = e.value("kind", std::string());
+                if (e.contains("shape") && e.at("shape").is_array()) {
+                    for (const json& d : e.at("shape")) {
+                        if (d.is_number_integer()) entry.shape.push_back(d.get<int64_t>());
+                    }
+                }
+                entry.offset = uint64_or(e, "offset", 0);
+                entry.bytes  = uint64_or(e, "bytes", 0);
+                a.expert_bodies.push_back(std::move(entry));
+            }
+        }
+    }
 
     for (const std::string& required :
          {a.language_model_xml, a.language_model_bin, a.text_embeddings_xml, a.tokenizer_xml,
@@ -306,10 +455,34 @@ std::optional<std::string> load_artifact(const std::string& dir, Artifact& out) 
         a.mtp_lm_head_xml.clear();
     }
 
-    a.arch_hash      = hash_prefix(sha256_file(a.language_model_xml));
+    // A non-segmented artifact's single segment spans the whole model; a
+    // segmented one carries its own ranges in the manifest rows.
+    if (!a.from_segmented_manifest) {
+        for (ArtifactSegment& s : a.segments) {
+            s.layer_lo = 0;
+            s.layer_hi = a.n_layer;
+        }
+    }
+
     a.template_hash  = hash_prefix(sha256_hex(a.chat_template));
     a.tokenizer_hash = hash_prefix(sha256_file(tokenizer_json));
-    a.weights_bytes  = file_size(a.language_model_bin);
+    // Every segment's xml is hashed (the chain hash is over those, in segment
+    // order) and every segment's .bin counts toward weights_bytes: a
+    // segmented artifact's resident set is the SUM, and reporting only
+    // segment 0's would understate it by K-1 segments.
+    {
+        std::vector<std::string> xml_shas;
+        uint64_t weights = 0;
+        for (ArtifactSegment& s : a.segments) {
+            s.xml_sha        = sha256_file(s.language_model_xml);
+            s.lm_bin_bytes   = file_size(s.language_model_bin);
+            xml_shas.push_back(s.xml_sha);
+            weights += s.lm_bin_bytes;
+        }
+        a.weights_bytes = weights;
+        a.arch_hash     = a.segmented() ? segplan::chain_arch_hash(xml_shas)
+                                        : hash_prefix(xml_shas.front());
+    }
 
     out = std::move(a);
     return std::nullopt;
