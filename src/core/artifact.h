@@ -218,4 +218,18 @@ std::string admit_ngram_table_from_disk(const Artifact& artifact,
 std::optional<std::string> load_artifact(const std::string& dir, Artifact& out,
                                         bool require_allowlisted = true);
 
+// Whether today's single-graph backend can SERVE this artifact at all.
+//
+// A segmented artifact (window-051 §2) is loadable, hashable and inspectable,
+// and it is NOT servable until a segmented forward exists: the single-graph
+// path reads `language_model_xml`, which for a chain resolves to segment 0's
+// file -- so the served binary would compile ONE segment (its own layer range,
+// say layers 0..11 of 48), answer tokens from it, and do so under an allowlist
+// entry that says 48 layers. That is a wrong answer with a valid pin on it, so
+// it refuses by name instead.
+//
+// Returns the refusal, naming the artifact and what to run instead; empty when
+// the artifact is servable as it stands.
+std::string serve_refusal_for(const Artifact& artifact);
+
 }  // namespace lgc

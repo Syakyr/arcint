@@ -284,6 +284,15 @@ int main(int argc, char** argv) {
                        artifact.sampler.provenance.c_str(), artifact.sampler.temperature,
                        artifact.sampler.top_p, artifact.sampler.top_k);
 
+        // The allowlist says what an artifact IS; this says whether anything can
+        // DRIVE it. A segmented artifact passes the allowlist (its pin is the
+        // chain hash) and would otherwise compile ONE segment and answer under a
+        // full-depth pin.
+        if (const std::string refuse = lgc::serve_refusal_for(artifact); !refuse.empty()) {
+            lgc::log::error("load", "%s", refuse.c_str());
+            return 2;
+        }
+
         if (cfg.parallel > 1 && !cfg.paged) {
             // The stateful graph has one internal state, so a second sequence
             // would overwrite the first's. The paged path is what made lanes

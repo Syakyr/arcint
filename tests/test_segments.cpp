@@ -626,3 +626,35 @@ TEST(artifact_without_a_manifest_falls_back_to_the_plain_form_and_one_mirror_seg
     ::unlink((d.dir() + "/openvino_language_model.xml").c_str());
     ::unlink((d.dir() + "/openvino_language_model.bin").c_str());
 }
+
+// ----------------------------------------------------------- (n) THE SERVE GATE
+// An allowlist entry says what an artifact IS. Something else has to say
+// whether anything can DRIVE it, or a segmented artifact compiles its first
+// segment and answers under a full-depth pin.
+
+TEST(serve_gate_refuses_a_segmented_artifact_and_names_the_file_it_would_have_opened) {
+    TempSegmentedArtifactDir d;
+    Artifact a;
+    const auto err = load_artifact(d.dir(), a);
+    CHECK(!err.has_value());
+    const std::string why = serve_refusal_for(a);
+    CHECK(!why.empty());
+    CHECK(why.find("SEGMENTED") != std::string::npos);
+    CHECK(why.find("2 compiled segments") != std::string::npos);
+    CHECK(why.find("8 layers in all") != std::string::npos);
+    CHECK(why.find("segment0/openvino_language_model.xml") != std::string::npos);
+    CHECK(why.find("layers 0..3") != std::string::npos);
+}
+
+TEST(serve_gate_says_nothing_about_a_non_segmented_artifact) {
+    TempSegmentedArtifactDir d;
+    ::unlink((d.dir() + "/serving-shape.json").c_str());
+    d.write("openvino_language_model.xml", "<xmlall/>");
+    d.write("openvino_language_model.bin", "weights0");
+    Artifact a;
+    const auto err = load_artifact(d.dir(), a);
+    CHECK(!err.has_value());
+    CHECK(serve_refusal_for(a).empty());
+    ::unlink((d.dir() + "/openvino_language_model.xml").c_str());
+    ::unlink((d.dir() + "/openvino_language_model.bin").c_str());
+}

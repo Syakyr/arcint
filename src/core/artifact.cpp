@@ -638,4 +638,18 @@ std::string admit_ngram_table_from_disk(const Artifact& artifact,
     return {};
 }
 
+std::string serve_refusal_for(const Artifact& artifact) {
+    if (!artifact.segmented()) return {};
+    const ArtifactSegment& first = artifact.segments.front();
+    return log::format(
+        "'%s' is a SEGMENTED artifact (%zu compiled segments, %d layers in all) and "
+        "nothing in this build drives a chain: the single-graph path would open %s "
+        "(its OWN range is layers %d..%d) and serve that under an allowlist entry "
+        "that says %d layers -- a wrong answer with a valid pin on it. Read the "
+        "contract with --inspect-artifact; the segmented forward is window-051 §2 "
+        "and does not exist yet.",
+        artifact.directory_name.c_str(), artifact.segments.size(), artifact.n_layer,
+        first.language_model_xml.c_str(), first.layer_lo, first.layer_hi - 1,
+        artifact.n_layer);
+}
 }  // namespace lgc
