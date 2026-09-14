@@ -102,6 +102,29 @@ DECIDED by the measured 12-layer staging in (b): if 4 × 12 measures over
 the headroom, 6 × 8 is the cut and this table's row says so with the
 number.
 
+> [AMENDED 2026-09-14, B.1 — the artifact side of row (a) is now readable off disk, and it is still arithmetic, not a peak.
+>
+> `arcint --model <dir> --inspect-artifact` (0.5.1 B.1, commit 84b63b8) loads an artifact the same way the served path does and prints the contract; run against the real segmented export `/models/ov/qwen38-flash-next-seg12-ov` (`--layers 48 --segment-layers 12`, tree c00500f, filled 2026-09-13 22:09–23:39Z), it read:
+>
+> | quantity (artifact arithmetic, read off disk) | value |
+> |---|---|
+> | segments | 4 × 12, `attn 3 gdn 9` each, hidden boundary port 4 × 2560 = **10240** wide |
+> | segment `.bin` bytes | 4,944,946,409 / 4,813,218,673 / 4,813,218,673 / 7,382,270,833 = **21,953,654,588** |
+> | chain `arch_hash` | **32d3060ca30238d1** (the four segment xml digests in segment order; no file has this digest) |
+> | expert bodies | `expert_bodies.u8` **60,397,977,600 B (56.25 GiB)**, 144 bodies, all 419,430,400 B |
+> | one buffer set, every segment | 36 slots × 419,430,400 = **15,099,494,400 B (14.06 GiB)** |
+> | per forward, the chain reads | the **whole blob: 56.25 GiB** (K refills of 14.06 GiB each) |
+>
+> Against the 48 GiB host: buffer set 14.06 GiB **plus** the table's 26.82 GiB pinned = **40.9 GiB before any dense staging or the process** — which is row (a)'s own 4 × 12 arithmetic coming out the same way from the other direction, and it is why C3 ("4 × 12 does NOT fit") is still the standing prediction rather than a worry.
+>
+> Every `measured` column in row (a) **stays EMPTY**: no compile of a segment has run beside the table, and no seconds appear in the instrument's output on purpose. C8's ~35 s/forward cold stays a clause until a card leg reads it.]
+
+The admission side, for the record (de48de5): the artifact is allowlisted as
+`qwen3.8-flash-next-seg12`, pinned to that chain hash, and `serve_refusal_for`
+(3e69176) refuses to SERVE it — the single-graph path would open segment 0
+(layers 0..11) and answer under an entry that says 48. "Admitted" is a pin, not
+a capability, until §2's runtime exists.
+
 ### (b) Depth ladder prices
 
 | depth | fill (predicted → measured) | compile, served binary (predicted → measured) | device-resident after compile | warm decode t/s | per-forward NVMe reads (predicted → measured) | card |
