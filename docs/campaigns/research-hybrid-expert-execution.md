@@ -152,32 +152,6 @@ own Q3_K/IQ3_XXS/Q2_K quant types (the same block formats and byte counts
 arcint's own kquant campaign already inventories), decoded by hand-written
 AVX2/AVX-512 kernels; no Arc/OpenCL/SYCL/Vulkan.
 
-> [ADDED 2026-09-15 — EXTERNAL, UNVERIFIED BY US (a Reddit-sourced how-to,
-> operator-supplied: bittide.aicompass.dev/article/1f3aaea5-d358-410d-a8e7-fb0ac4f7e82e).
-> It reports **Qwen3.8-Flash — our own target model — served on a single RTX
-> 3090 using 12 of its 24 GB**, on a llama.cpp fork, with **the MoE offloaded
-> to host RAM and the n-gram table on disk**, IQ4_XS weights, ~160 t/s prefill
-> and **16 t/s decode**; it also reports "MTP works but actually slows decode
-> down even with 80% draft acceptance" (relevant to 0.5.5 ROMA, and against it).
-> No number here is ours and none may be quoted as ours.
->
-> Why it is filed under llama.cpp rather than treated as news: the section
-> above already says how it is done — `mul_mat_id` batches per ROUTED expert
-> across the ubatch with the K-quant dequant inside the kernel, experts
-> host-resident. **The capability is not hypothetical and was never blocked on
-> a kernel needing invention.** What is Arc-specific is the last clause of this
-> section — "no Arc/OpenCL/SYCL/Vulkan" — and llama.cpp's own limit, that it
-> assigns whole LAYERS rather than experts within a layer.
->
-> CONSEQUENCE, recorded because a session got it wrong the other way: "the
-> experts do not fit in VRAM" is NOT a finding and never was. The model is
-> served today on a card no bigger than ours with the experts in host RAM. The
-> arcint-specific blocker is narrower and must be stated in its narrow form —
-> **OpenVINO's MoE fusion requires `u4` Constants (`DESIGN.md`:4489), so the
-> fused path cannot take a host-resident expert at all**, and the kernel that
-> can is CPU/CUDA-only. See `sub4bit-vram-kernel.md`, which this re-frames from
-> an invention into a port.]
-
 ## ik_llama.cpp
 
 ikawrakow/ik_llama.cpp, MIT. **(a)** `-fmoe` fuses the up/gate/down FFN ops
