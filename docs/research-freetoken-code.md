@@ -136,3 +136,84 @@ throughput on our hardware remains unmeasured and is not quotable as ours
 (ROADMAP: comparisons pinned only by our own runs). Whether arcint's shipped
 slot pool converges at Flash-Next's admission ratio is still RED-C-02,
 still unrun, and still needs no export.
+
+---
+
+## 5. The correct course was written down TEN DAYS EARLIER, in this repository
+
+Operator direction 2026-09-15 pointed at `docs/campaigns/`, which the
+FreeToken passes never cite. `docs/campaigns/research-hybrid-expert-execution.md`
+is dated **2026-09-05** — ten days before the segmented export was filled —
+and it already had the answer:
+
+> Arcint's own `moe_cpu_expert` kernel **already batches per expert** — the
+> missing piece is the *split*: route resident-expert tokens to the existing
+> device grouped-GEMM and the rest to the existing host kernel, in the same
+> layer, exactly what the campaign scopes. **That is a plugin change
+> (`exec_prefill_onednn`'s refusal rule), not an engine change — none of the
+> surveyed systems replaced their serving engine, they added a
+> kernel-dispatch branch.**
+
+0.5.1 did the thing that sentence warns against. It replaced the serving
+representation — a new artifact format, segmented graphs, whole-tensor u8
+ports, an unwritten K-drive — rather than adding the kernel-dispatch branch.
+
+The same document identifies FreeToken correctly ("the one actually
+on-topic"), carries the 753B GLM-5.2 / RTX PRO 6000 / 14.9 t/s row, and
+records an existence proof on **our own silicon**: `ipex-llm` / FlashMoE
+running DeepSeek V3/R1 (671B) and Qwen3MoE-235B on **A770 and B580**, on
+Intel's SYCL stack rather than OpenVINO — "an existence proof that CPU-tier
+MoE offload works on Arc silicon".
+
+### What arcint already had while 0.5.1 built the port route
+
+Read out of `patches/` and `cells.json`, not inferred:
+
+| piece | where | state |
+|---|---|---|
+| per-expert host kernel, AVX2 + ref | `moe_cpu_expert` (patches 0011–0012) | shipped, 5 tests |
+| expert LRU cache | `moe_lru_cache` (patch 0012 series) | shipped, 18 tests |
+| device-resident per-expert slot pool + async upload | patches 0005–0007 | shipped, measured |
+| host CPU tier + decode split | patches 0011–0012 | shipped, measured |
+| static partition / readback decomposition | patches 0017–0019 | shipped |
+| routing histogram | patch 0013 | shipped |
+| user-facing dial | `--offload-ratio`, `--moe-cpu-tier` (`src/config.cpp`) | shipped |
+| end-to-end cell | `cells.json` `tier-reference-cell` | **16.4 t/s decode, 16 GiB card** |
+
+That is the FreeToken mechanism set, in the tree, with tests, measured. The
+three campaigns that would finish it — `static-partition-prefill`,
+`partition-seeding`, `kquant-host-storage` — are listed as OPEN in
+`docs/campaigns/README.md`.
+
+### The count
+
+Operator, 2026-09-15: this happened "approximately 10 times". The number is
+exact for `docs/research-freetoken.md`: it carries **10 section verdicts**
+(plus a 15-entry claim sweep, 26 disposition markers), and by its own header
+every one rests on the paper text alone. One (§"Not in FreeToken", the PLE
+table) is disproven above; one (§3.2 LRU, "adoption deferred until FIX A's
+export blocker clears") is the deferral whose precondition cleared on
+2026-09-13 when the artifact was filled, and which nothing re-opened. The
+other eight are unaudited against the code as of this commit.
+
+### The mechanism of the failure, since no instruction forbade the check
+
+Searched for a standing order not to question the operator or the design
+premises: `CLAUDE.md`, `CLAUDE.local.md`, the fleet `~/claude/CLAUDE.md`
+(139 lines), the user-global `~/.claude/CLAUDE.md`, and the repo's single
+agent definition. **No `AGENTS.md` exists in this repository.** None of those
+files contains "question", "premise", "assume" or "challenge". The nearest
+text protects *invariants and gates*, not premises. And the one agent
+contract that exists requires the opposite
+(`.claude/agents/fix-implementer.md`): "Materials are acquireable unless you
+prove otherwise … fetching it IS part of the fix … **A negative that was
+never tried is not verified.**"
+
+So the omission violated the written contract rather than following it. What
+carried it forward was not an order but a FORM: dispositions were recorded as
+labels — CONFIRMED / DEVIATION / UNSUPPORTED — the paper-only basis was stated
+once in a header, and downstream documents then cite the labels instead of
+re-deriving them (`design-qwen-flash-next.md`'s 15-reference claim sweep does
+exactly that). A label travels; its basis does not. Any future research pass
+in this repository states its EVIDENCE CLASS on every row — paper, code, or
+our own measurement — or the row is not a disposition.
