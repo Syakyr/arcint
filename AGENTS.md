@@ -41,6 +41,10 @@ their basis does not.
 `.claude/agents/fix-implementer.md`; it is general. "Not in the paper", "not
 on the host", "no code path needs it" are claims that require an attempt.
 
+**7. Touching a GPU? `docs/sop-card-window.md` first.** Sampler before the
+leg, card identity by PCI id (DRM numbering is INVERTED vs OpenVINO), zombie
+sweep by pid. Every rule there has a dated incident behind it.
+
 ---
 
 ## Why this file exists

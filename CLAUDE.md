@@ -22,6 +22,9 @@ that touches a design decision, a mechanism, a milestone or a campaign:
 5. A label is not evidence. `CONFIRMED`/`DEVIATION`/`UNSUPPORTED` records
    what someone concluded from the evidence they had; check what that was.
 6. A negative that was never tried is not verified.
+7. Touching a GPU? `docs/sop-card-window.md` first — sampler before the
+   leg, card identity by PCI id (DRM numbering is INVERTED vs OpenVINO),
+   zombie sweep by pid.
 
 The cost of ignoring this is on the record in `AGENTS.md` and in
 `docs/research-freetoken-code.md`: a 0.5.1 serving route measured at 7.06x
