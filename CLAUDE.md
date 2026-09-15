@@ -4,6 +4,30 @@ Source of truth: README.md (scope), DESIGN.md (architecture, invariants,
 milestones), llm.txt (machine summary). Read DESIGN.md before touching
 anything; the invariants in §3.4/§3.8 and the gates in §5 are not negotiable.
 
+## RTFM MANDATE — first, every turn
+
+`AGENTS.md` carries this mandate in full and binds OpenCode and Pi; it binds
+Claude Code identically. Before the first substantive tool call of any turn
+that touches a design decision, a mechanism, a milestone or a campaign:
+
+1. Read `docs/campaigns/README.md`, and the campaign document covering the
+   work. Each is written to be sufficient on its own.
+2. Check `docs/campaigns/research-*.md` — the prior art may already be
+   surveyed.
+3. If the task cites an external project, read its SOURCE, not only its
+   paper (`~/src/FreeToken-ref`, `~/src/ninfer` are checked out). Where
+   paper and code disagree, the code wins.
+4. State the EVIDENCE CLASS of every disposition you write — `paper`,
+   `code`, or `measured-here`. A row without one is not a disposition.
+5. A label is not evidence. `CONFIRMED`/`DEVIATION`/`UNSUPPORTED` records
+   what someone concluded from the evidence they had; check what that was.
+6. A negative that was never tried is not verified.
+
+The cost of ignoring this is on the record in `AGENTS.md` and in
+`docs/research-freetoken-code.md`: a 0.5.1 serving route measured at 7.06x
+the device residency per layer and 623x the warm forward, whose root cause
+sat in `docs/campaigns/` for ten days before it was built.
+
 ## This repository is public
 
 Every commit lands where anyone can read it. That is an authoring rule, not a

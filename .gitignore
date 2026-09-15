@@ -5,7 +5,8 @@ __pycache__/
 tools/flash-next-watch.log
 CLAUDE.local.md
 *.local.md
-.claude/
+.claude/*
+!.claude/settings.json
 *.local.md.tmp.*
 *.local.md.bak*
 review.md
