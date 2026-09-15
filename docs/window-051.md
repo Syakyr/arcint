@@ -119,6 +119,42 @@ number.
 >
 > Every `measured` column in row (a) **stays EMPTY**: no compile of a segment has run beside the table, and no seconds appear in the instrument's output on purpose. C8's ~35 s/forward cold stays a clause until a card leg reads it.]
 
+> [AMENDED 2026-09-15, B.3 — row (a) adds two terms that live in DIFFERENT POOLS, and it assumes an ORDER the export does not force. Both are now read off the artifact device-free; every measured column below stays EMPTY until a card leg fills it.
+>
+> **(i) The table is segment 0's alone.** The four segment xml files read with no device (`tools/boot_serving_shape.py --stage pass --artifact <segN>`, 2026-09-15, tree e8cb312):
+>
+> | segment | `ngram_table.*` ports | expert ports | `inputs_embeds` |
+> |---|---|---|---|
+> | segment0 | **7** (6 x 47,718,400 + 1 x 33,691,136 rows x 90 B = 28,800,138,240 B = **26.82 GiB**) | 36 x 419,430,400 B | `[1, -1, 2560]` |
+> | segment1 | **0** | 36 x 419,430,400 B | `[1, -1, 10240]` |
+> | segment2 | **0** | 36 x 419,430,400 B | `[1, -1, 10240]` |
+> | segment3 | **0** | 36 x 419,430,400 B | `[1, -1, 10240]` |
+>
+> The PLE rides in segment 0, so only segment 0 declares the table. The table is bound to a REQUEST, and a request exists only after its own model is compiled. In the serving order — compile every segment, create the requests, then bind — **no compile ever runs beside a bound table**. Row (a)'s peak column adds the table to a segment's staging; that co-residency is a property of the ORDER, not of the artifact, and the order is free.
+>
+> **(ii) "the 48 GiB host" is two budgets.** The table is USM host, and window-050 §4.10 F2 measured that driver / USM-host memory is NOT charged to the container's cgroup — the `MemoryMax=44G` fence never engaged while the PHYSICAL host ran out (fleet mneme 372). The heap buffer set is ordinary process pages and IS charged. Read on the dev host 2026-09-15: the container's limit is `memory: 49152` MB (**48 GiB**, the number §1 records); the PHYSICAL host's `MemTotal` is **65,765,352 kB = 62.7 GiB**. Row (a)'s `26.8 + 15.1 + 3.4 + 3 = 48.3–50.7 GiB` compares a sum whose largest term is charged to the 62.7 GiB pool against the 48 GiB one. The two columns are not addable and this file will not add them again.
+>
+> **The predictions B.3 measures (stated before the card leg, falsifiable):**
+>
+> | # | prediction | dies if |
+> |---|---|---|
+> | P1 | in `compile-then-table`, no compile's peak carries table bytes; a segment's staging is dense-only (its `.bin` is 4.81–7.38 GB, the experts being ports) | a compile's peak host GTT exceeds its own dense bytes by the table's order of magnitude |
+> | P2 | the table's 26.82 GiB does NOT appear in the process's RSS or the cgroup's `MemAvailable`; it appears on the physical host | the container's RSS climbs by ~26.8 GiB when the table is allocated |
+> | P3 | `--buffer-set heap`: the 14.06 GiB set DOES appear in RSS (cgroup), so cgroup peak ≈ set + process ≈ 17 GiB of 48 | RSS stays flat across the buffer-set allocation |
+> | P4 | **4 x 12 FITS** — physical ≈ table 26.82 + set 14.06 + staging + process ≈ 44–48 GiB of 62.7, with the four segments' 20.45 GiB of dense on the card, not the host | any leg refuses with an allocation error, or the physical host's MemAvailable crosses the 4 GiB watchdog |
+> | P5 | `--order table-then-compile` (row (a)'s own premise) is the ONLY order that can die, and if it dies it dies on the PHYSICAL host | it completes with room to spare, which would retire the premise rather than the order |
+>
+> **C3 is therefore predicted FALSE as written** ("4 x 12 does NOT fit"): not because the arithmetic is wrong but because its budget is the container's and its peak assumes an order the geometry does not force. C3 stands unerased until the card leg reads P1–P5; if P4 holds, the cut stays 4 x 12 and no re-export is owed.
+>
+> | leg (`tools/probe_segment_residency.py`) | order | buffer set | measured cgroup peak | measured physical peak | outcome |
+> |---|---|---|---|---|---|
+> | L1 | compile-then-table | heap | EMPTY | EMPTY | EMPTY |
+> | L2 | compile-then-table | usm | EMPTY | EMPTY | EMPTY |
+> | L3 | table-then-compile | heap | EMPTY | EMPTY | EMPTY |
+> | L4 | compile-then-table, `--table skip` (control) | heap | EMPTY | EMPTY | EMPTY |
+>
+> No seconds and no peaks appear above on purpose: this is the prediction commit.]
+
 The admission side, for the record (de48de5): the artifact is allowlisted as
 `qwen3.8-flash-next-seg12`, pinned to that chain hash, and `serve_refusal_for`
 (3e69176) refuses to SERVE it — the single-graph path would open segment 0
