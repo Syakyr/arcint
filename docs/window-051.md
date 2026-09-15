@@ -68,6 +68,21 @@ segmentation lands.
   fusion matches a Constant, not a Parameter, so every expert computes for
   every token inside a segment: ~5 GFLOP / token / layer, "slow" is the
   accepted regime of 0.5.1 (Venice buys speed on top of a model that answers).
+
+> [CORRECTED 2026-09-15 — this bullet IS the deviation, now measured and sourced.
+> (a) MEASURED (window-051 B.3): the port route costs **7.06x the device residency
+> per layer** and **623x the warm forward** against the same graph with the bodies
+> as Constants; "slow" is 9.15 s for ONE token at 4 layers, ~110 s/token at 48.
+> There is no model underneath for Venice to buy speed on top of.
+> (b) SOURCED (`docs/research-freetoken-code.md`): the reference implementation
+> never computes an unrouted expert — `ensure_experts(layer_id, expert_ids)` takes
+> the router's own ids (`moe/offload_cache.py:843`) — and never materialises a
+> dequantised weight (`:43,45,48`: dequant in the GEMM K-loop, inside the ggml
+> kernels, or by Triton inline-dequant). Flash-Next activates **10 of 512** experts
+> per token (`num_experts_per_tok: 10`), so "every expert computes for every token"
+> is **51.2x** the work the architecture requires, by construction.
+> The sentence stands as the decision that was taken; it was never the mandate.]
+
 - **The runtime** drives the K compiled models per forward in order and
   refills ONE expert buffer set (the 15 GiB class at 12 layers) per segment
   from the GGUF mmap before that segment runs — so at most one segment's

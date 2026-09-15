@@ -224,6 +224,20 @@ repo; the two efforts happen to touch overlapping problems
 FreeToken's design. Any repository claim that attributes FIX D to
 FreeToken is UNSUPPORTED and should be reattributed.
 
+> [CORRECTED 2026-09-15 by the CODE pass — `docs/research-freetoken-code.md` §4.
+> This section's conclusion rests on a grep of the extracted PAPER TEXT only
+> (`freetoken/paper.txt`, 9218 words). The REPOSITORY has a full
+> implementation: `models/qwen4_exp/ple.py` (the Flash-Next PLE math, HF
+> reference lines cited), `models/qwen4_exp/ple_disk.py` (a **disk-backed**
+> table, `--ple-backend disk`), and `engine/config.py:32` where
+> `ple_backend = "disk"` is the **DEFAULT**. arcint pins the same table as
+> 26.82 GiB of USM host for the life of the process; the reference never
+> holds it in RAM. The "arcint-original / UNSUPPORTED to attribute"
+> disposition is WITHDRAWN as a code-level claim — the kernel may still be
+> arcint's own, but the problem and a shipped solution are in the reference,
+> and 26.82 GiB of the host budget is a CHOICE, not a constraint. Marked,
+> not erased: the paper-text finding stands as what the paper says.]
+
 ---
 
 ## Claim sweep across `docs/design-qwen-flash-next.md`
