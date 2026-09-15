@@ -208,6 +208,35 @@ number.
 >
 > **NOT MEASURED, and owed before the next cut is chosen:** whether BINDING the expert ports as USM-host tensors before the first inference changes the compile's device residency at all (the probe allocates its buffer set after the compile, and the compile is where the cost appears — so this instrument cannot answer it); the A770 leg (GPU.1 was untouched, reserved for the city); and the ~7× mechanism.]
 
+> [MEASURED 2026-09-15 07:27–07:29Z, B.3 round 4 — **the question round 3 left owed is answered, and the answer is the bad one.** GPU.0 (B60), same tree, `boot_serving_shape.py --stage forward`, 4 layers, 8 tokens, zeros; `--expert-ports` the only difference between the pair.
+>
+> The design's premise (§2 here, and the n-gram table's precedent in window-050 §4.8) is that a **USM-host u8 port is SHARED with the graph, not copied to the device**. That premise is CONFIRMED on the host side and IRRELEVANT on the device side, in the same leg:
+>
+> | step | `usm_device` | `usm_host` |
+> |---|---|---|
+> | after compile (nothing bound) | **39.38 GiB** | 0.01 GiB |
+> | after the n-gram table bound | 39.38 GiB | 26.83 GiB (+26.82, exactly the table) |
+> | after the 12 expert ports bound | **39.38 GiB** | 31.52 GiB (+4.69, exactly the port bytes) |
+> | after a real forward | **39.42 GiB** | 31.52 GiB |
+>
+> The plugin does share both the table and the expert bodies from host memory without copying them to the device — `usm_host` grows by exactly the declared bytes and `usm_device` does not move. **But `usm_device` was already 39.38 GiB when `compile_model` returned, before any tensor existed to bind.** Binding moves it by 0.04 GiB. The port route's device cost is committed at compile and no binding discipline can reduce it. The control at the same geometry sits at **6.72 GiB** through the identical sequence.
+>
+> **AND THE FORWARD IS 623× SLOWER**, warm (`--repeat 2`, so cold and warm are both read and the jit is separated):
+>
+> | 4 layers, 8 tokens, GPU.0 | experts as PORTS | experts as constants | ratio |
+> |---|---|---|---|
+> | forward #1 (cold, pays the jit) | 15.203 s | 0.097 s | 157× |
+> | **forward #2 (warm)** | **11.211 s** | **0.018 s** | **623×** |
+> | decode probe, 1 token after 8 | 9.152 s | 0.045 s | 203× |
+>
+> Risk R1 (the unpack materialisation) has its first number, and it is not a tax, it is the whole cost: **9.15 s for a ONE-TOKEN forward at 4 layers**. At 48 layers on the same slope that is ~110 s per token, before any of the 56.25 GiB blob is refilled.
+>
+> Both routes return digest `b31205cb6685` — **bit-identical, and that is not a determinism claim**: the bodies are zeros, so the output is all zeros (`absmax=0.0`) and bit-identity is trivial. What it does say is that the two routes are the same graph; the port route is not wrong, it is ruinous.
+>
+> **VERDICT ON THE PORT ROUTE:** dead on two independent axes measured in the same hour — 7.06× the device residency per layer (round 3) and 623× the warm forward (round 4). Segmentation was introduced to escape the constants route's 66 GiB staging; its own mechanism costs more on both. **0.5.1 needs a different mechanism for host-resident experts, not a different cut.** No re-export of `qwen38-flash-next-seg12-ov` at 6 × 8 or 12 × 4 is worth 82 minutes: the per-layer numbers above are what any cut multiplies.
+>
+> What is NOT measured: the ~7× and the 623× are both unexplained mechanisms (an in-graph u4→f16 unpack accounts for 4× of the first and none of the second by itself); whether a u8 port that skips the in-graph unpack (bodies pre-unpacked to f16 on the host, 2× the bytes) changes either number; and the A770 — **GPU.1 was never touched in this session**.]
+
 The admission side, for the record (de48de5): the artifact is allowlisted as
 `qwen3.8-flash-next-seg12`, pinned to that chain hash, and `serve_refusal_for`
 (3e69176) refuses to SERVE it — the single-graph path would open segment 0
