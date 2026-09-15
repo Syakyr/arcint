@@ -217,3 +217,68 @@ re-deriving them (`design-qwen-flash-next.md`'s 15-reference claim sweep does
 exactly that). A label travels; its basis does not. Any future research pass
 in this repository states its EVIDENCE CLASS on every row — paper, code, or
 our own measurement — or the row is not a disposition.
+
+---
+
+## 6. THE CAUSAL CHAIN, entirely from this repository's own documents
+
+Read after operator direction 2026-09-15 to read `docs/campaigns/`. Every
+link below is cited, none inferred. It explains the 7.06× / 623× exactly.
+
+1. **To serve 48 layers the experts must be host-resident.** Full residency
+   is 56.25 GiB against a 22.71 GiB card (`design-qwen-flash-next.md`).
+2. **A host-resident expert cannot be a `Constant`.** The GPU plugin stages
+   every Constant in host memory at compile — measured 66 GiB for 48 layers
+   (window-050 §4.10 F2), reproduced independently today at 1.347 GiB/layer
+   → 66.0 GiB.
+3. **But the MoE fusion requires Constants.** The pinned runtime's matcher
+   `keep_moe_3gemm_const_precision.cpp` "requires `u4` on all twelve weight
+   and zero-point constants of the fused op" (`DESIGN.md`:4489,
+   `campaigns/sub4bit-vram-kernel.md`:22, `milestone-0.3.0.md`:95).
+4. **So leaving Constant-land leaves the fusion** — and the fusion is what
+   applies the routing. window-051 §2 says it in the design's own words:
+   "The MoE fusion matches a Constant, not a Parameter, so **every expert
+   computes for every token**".
+5. **Which is the 623×.** At `num_experts_per_tok: 10` of 512, losing the
+   routing is 51.2× the required expert work by construction; measured warm
+   forward 11.211 s vs 0.018 s at 4 layers.
+
+**0.5.1 tried to get host-residency for free by dropping out of the fusion.
+The 623× is the price of the fusion it dropped.** That is not a tuning
+problem and no cut of the layer range changes it.
+
+### The two campaigns that own the real fix, both opened 2026-09-05, both "nothing started"
+
+- **`campaigns/sub4bit-vram-kernel.md`** — "the kernel work — a fusion
+  matcher for the new element type, an oneDNN bypass, a GEMV/GEMM with
+  **in-kernel dequant** — new plugin code with no analog in the patch
+  series, **none of it started**". This is link 3 above: the only thing that
+  makes a non-`u4`-Constant expert reach a fused kernel at all. Sized
+  *large*; the 800–1,500-line figure is marked HYPOTHESIS.
+- **`campaigns/static-partition-prefill.md`** — `exec_prefill_onednn`'s
+  grouped-GEMM path "refuses any batch that contains a non-resident
+  expert", so under a static partition every layer takes the per-expert
+  fallback and tier-ON prefill runs at a third of tier OFF. The lever is
+  to split a layer's batch by residency: resident subset → device
+  grouped-GEMM, rest → the existing `moe_cpu_expert` host kernel. Opened
+  2026-09-05, **nothing started**. (Status note on that page: the
+  `grouped_fallbacks` counter reads 400, not 40, and its unit is unread.)
+
+Both were surveyed against prior art on 2026-09-05
+(`research-hybrid-expert-execution.md`, `research-sub4bit-weights.md`) and
+neither was started. 0.5.1 instead built a route that needs neither — and
+cannot work, because the fusion it bypasses is the routing.
+
+### The order of work these documents already imply
+
+1. **RED-C-02** — plateau probe at `--offload-ratio` in the high 80s on a
+   synthetic 512-expert config. Buildable today, no export, one free GPU
+   (`design-qwen-flash-next.md`:470). Tells us whether the SHIPPED slot pool
+   converges at Flash-Next's admission ratio.
+2. **`static-partition-prefill`** — the batch split. The pieces
+   (`moe_cpu_expert`, `static_partition_resident_experts`,
+   `grouped_fallbacks`) all exist.
+3. **`sub4bit-vram-kernel`** — the in-kernel-dequant kernel and its fusion
+   matcher. The large one, and the one nothing substitutes for.
+
+None of these needs the seg12 artifact, a new export, or the K-drive.
