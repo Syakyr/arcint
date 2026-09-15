@@ -25,6 +25,10 @@ that touches a design decision, a mechanism, a milestone or a campaign:
 7. Touching a GPU? `docs/sop-card-window.md` first — sampler before the
    leg, card identity by PCI id (DRM numbering is INVERTED vs OpenVINO),
    zombie sweep by pid.
+8. "It does not fit" is NOT a finding. Before writing that a capability
+   is blocked by a hardware limit, name who runs it anyway and on what.
+   State the narrow blocker (which stack, which pass, which requirement),
+   never the broad one.
 
 The cost of ignoring this is on the record in `AGENTS.md` and in
 `docs/research-freetoken-code.md`: a 0.5.1 serving route measured at 7.06x

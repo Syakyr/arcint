@@ -141,6 +141,37 @@ transfers from M10's close (§7.0.2ah), mostly on the record already
 model, nothing below W4A16 on vLLM's roadmap, ik_llama.cpp/QuantMoE-Bench
 as comparators), inherited rather than repeated.
 
+## Re-frame 2026-09-15: this is a PORT, not an invention
+
+The scope section calls the kernel work "new plugin code with no analog in the
+patch series", and the pipeline calls it "the open-ended remainder". Both are
+true of *this tree*. Neither is true of the world, and the difference changes
+the risk this campaign carries.
+
+`research-hybrid-expert-execution.md` (llama.cpp section, surveyed 2026-09-05)
+already records the mechanism in production: ggml's `mul_mat_id` batches per
+ROUTED expert across the ubatch and dequantises GGUF K-quant blocks **inside
+the kernel**, with the experts host-resident — MIT-licensed, readable. An
+operator-supplied external report (2026-09-15, unverified by us) has
+**Qwen3.8-Flash on a single RTX 3090 using 12 of 24 GB**, MoE in host RAM,
+n-gram table on disk, 16 t/s decode.
+
+So the open question this campaign carries is **"does it land on Arc /
+OpenVINO"**, not "can such a kernel exist". The 800–1,500-line HYPOTHESIS in
+"Known against hypothesised" stands as an estimate of the Arc port's size; it
+should not be read as the size of an unexplored problem.
+
+And the reason a port is needed at all is narrower than "the weights do not
+fit": **OpenVINO's MoE fusion matcher requires `u4` Constants on all twelve
+weight and zero-point constants of the fused op** (`DESIGN.md`:4489,
+`milestone-0.3.0.md`:95), so the fused path cannot take a host-resident expert
+in any form — and leaving the fusion costs the routing itself, measured
+2026-09-15 at 7.06x device residency per layer and 623x the warm forward
+(window-051 B.3). "It does not fit in VRAM" is not this campaign's problem
+statement and never was.
+
 ## Status
 
 - 2026-09-05 — opened from the 0.3.1 backlog; nothing started.
+- 2026-09-15 — re-framed above: a port of a shipping mechanism, not an
+  invention. Nothing started.

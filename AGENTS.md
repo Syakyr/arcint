@@ -45,6 +45,15 @@ on the host", "no code path needs it" are claims that require an attempt.
 leg, card identity by PCI id (DRM numbering is INVERTED vs OpenVINO), zombie
 sweep by pid. Every rule there has a dated incident behind it.
 
+
+**8. "It does not fit" is NOT a finding.** Before writing that a capability is
+blocked by a hardware limit — VRAM, host RAM, bandwidth — name **who runs it
+anyway, on what**. If nobody does, say that is what you checked. A resource
+limit is a property of a chosen vehicle far more often than of the problem, and
+the narrow statement ("*this stack's fused path cannot take a host-resident
+expert*") is the one that is true and actionable. The broad one ("*the experts
+do not fit in VRAM*") is neither.
+
 ---
 
 ## Why this file exists
