@@ -318,6 +318,75 @@ TEST(expert_slot_bytes_exact_division_stays_exact) {
     CHECK_EQ(expert_slot_bytes(kNumExpert, kRatioPct, kPerExpertBytes, kMoeLayers), want);
 }
 
+// ------------------------------------- RED-C-02, arithmetic half (Flash-Next geometry)
+
+// docs/design-qwen-flash-next.md's FIX C audit (RED-C-02) says the
+// offload-ratio machinery "takes num_expert, per_expert_bytes and moe_layers
+// as plain parameters; nothing in the probed path reads a compiled Flash-Next
+// graph", and that there is no existing test at Flash-Next's own ratio. Every
+// expert_slot_bytes cell above runs the 128-expert / ratio-20 fixture. These
+// pin the real geometry so the design's ratio table cannot drift from the
+// function again.
+//
+// Flash-Next (design-qwen-flash-next.md Fit section): 512 experts, 48 MoE
+// layers, 2,457,600 B per expert per layer.
+constexpr int      kFnExperts        = 512;
+constexpr int      kFnMoeLayers      = 48;
+constexpr uint64_t kFnPerExpertBytes = 2457600;
+constexpr uint64_t kFnSlotBytes      = kFnPerExpertBytes * kFnMoeLayers;  // 117,964,800
+
+TEST(flash_next_full_residency_is_the_56_GiB_figure) {
+    // The number the whole 0.5.1 residency argument rests on.
+    CHECK_EQ(expert_slot_bytes(kFnExperts, 0, kFnPerExpertBytes, kFnMoeLayers),
+             60397977600ull);  // 56.25 GiB
+}
+
+// THE DEFECT THIS CELL EXISTS FOR (measured-here, device-free, 2026-09-15):
+// the design's ratio table listed `resident slots` computed as
+// budget / slot_bytes, and `admitted ratio_pct` computed independently -- but
+// slots = ceil(512 * (100 - pct) / 100) does NOT produce those counts. Two of
+// the five rows admitted MORE bytes than their own budget:
+//   6 GiB row  said 89% -> 54 slots; 89% actually yields 57 slots = 6.26 GiB
+//  10 GiB row  said 82% -> 91 slots; 82% actually yields 93 slots = 10.22 GiB
+// and 54 / 91 / 109 slots are not reachable at ANY integer ratio_pct.
+// The pairs below are (budget GiB, smallest integer pct whose slot bytes fit).
+TEST(flash_next_admitted_ratio_never_overcommits_its_budget) {
+    struct Row { uint64_t budget_gib; int pct; uint64_t slots; };
+    const Row rows[] = {
+        {4,  93, 36},
+        {6,  90, 52},
+        {8,  86, 72},
+        {10, 83, 88},
+        {12, 79, 108},
+    };
+    for (const Row& r : rows) {
+        const uint64_t budget = r.budget_gib * kGiB;
+        const uint64_t got = expert_slot_bytes(kFnExperts, r.pct, kFnPerExpertBytes,
+                                               kFnMoeLayers);
+        CHECK_EQ(got, r.slots * kFnSlotBytes);
+        // the whole point: the admitted ratio must FIT the budget it is quoted for
+        CHECK(got <= budget);
+        // and one percent more resident must NOT fit -- otherwise the row is
+        // not the largest admissible resident set and the table understates it
+        if (r.pct > 0) {
+            CHECK(expert_slot_bytes(kFnExperts, r.pct - 1, kFnPerExpertBytes,
+                                    kFnMoeLayers) > budget);
+        }
+    }
+}
+
+TEST(flash_next_ratio_is_high_80s_to_low_90s_by_construction) {
+    // The design's CONCLUSION survives the table's correction: a device-side
+    // expert-slot budget in the 4-12 GiB class admits Flash-Next only at a
+    // ratio in the high 70s to low 90s, nowhere near the 50/75 every measured
+    // offload cell (patches 0005-0007, 0011-0012, 0017-0019) was tuned at.
+    CHECK(expert_slot_bytes(kFnExperts, 93, kFnPerExpertBytes, kFnMoeLayers) <= 4 * kGiB);
+    CHECK(expert_slot_bytes(kFnExperts, 79, kFnPerExpertBytes, kFnMoeLayers) <= 12 * kGiB);
+    // ratio 50 -- the measured working point of every existing cell -- needs
+    // more than the whole 24 GiB card for the slot pool alone.
+    CHECK(expert_slot_bytes(kFnExperts, 50, kFnPerExpertBytes, kFnMoeLayers) > 24 * kGiB);
+}
+
 // ------------------------------------------------- expert_slot_bytes_static (patch 0018)
 
 // backend_ov.cpp's load-time bug (this milestone's fix): with

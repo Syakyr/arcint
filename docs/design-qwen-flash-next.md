@@ -347,6 +347,32 @@ device-resident expert-slot budget:
 | 10 GiB | 91 of 512 | ~82% |
 | 12 GiB | 109 of 512 | ~79% |
 
+> [CORRECTED 2026-09-15, RED-C-02 arithmetic half. Evidence class: measured-here,
+> device-free, `tests/test_fit.cpp` cells `flash_next_*`, ladder rc=0. The table
+> above computes `resident slots` as budget / slot_bytes and `admitted ratio_pct`
+> INDEPENDENTLY, but the function is
+> `slots = ceil(512 * (100 - pct) / 100)` (`fit.h:95`) and it does not produce
+> those counts. Two rows admit MORE than their own budget, i.e. the quoted ratio
+> overcommits the device pool:
+>
+> | budget | table says | 512-expert reality at that pct | verdict |
+> |---|---|---|---|
+> | 4 GiB | 93% -> 36 | 36 slots, 3.96 GiB | consistent |
+> | 6 GiB | 89% -> 54 | **57 slots, 6.26 GiB** | **OVER the 6 GiB budget** |
+> | 8 GiB | 86% -> 72 | 72 slots, 7.91 GiB | consistent |
+> | 10 GiB | 82% -> 91 | **93 slots, 10.22 GiB** | **OVER the 10 GiB budget** |
+> | 12 GiB | 79% -> 109 | 108 slots, 11.87 GiB | fits; slot count off by one |
+>
+> 54, 91 and 109 slots are not reachable at ANY integer `ratio_pct`. The
+> corrected rows -- smallest integer pct whose slot bytes fit, i.e. the largest
+> admissible resident set -- are **4 GiB -> 93% (36)**, **6 GiB -> 90% (52)**,
+> **8 GiB -> 86% (72)**, **10 GiB -> 83% (88)**, **12 GiB -> 79% (108)**.
+>
+> The section's CONCLUSION is unaffected: the admitted ratio is still far above
+> the 50/75 every measured offload cell was tuned at, which is what RED-C-02
+> exists to probe. The table stands as written, marked; the cells now pin the
+> arithmetic so it cannot drift from `fit.h` again.]
+
 Every measured cell for the offload-tier patches (0005-0007, 0011-0012,
 0017-0019) sits at `ratio_pct` 50 or 75 -- the served model's own working
 point, where up to half the experts stay resident. Flash-Next's arithmetic
