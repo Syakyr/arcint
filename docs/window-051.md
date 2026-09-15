@@ -155,6 +155,59 @@ number.
 >
 > No seconds and no peaks appear above on purpose: this is the prediction commit.]
 
+> [MEASURED 2026-09-15 07:17–07:26Z, B.3, **GPU.0 = Intel Arc Pro B60 22.71 GiB**, tree `1bd2121` staged at `~/wp/wt-1bd2121` and byte-verified both ends (395 files, per-file sha256 list identical, chain `7983bdd9ebd1a79661474aa9ed68464710bba341cbe3ffad90c00ada48b5438b`), OpenVINO 2026.4.0-22849 from `~/openarc-venv`, both units inactive throughout, one process per leg, `pgrep`+SIGKILL after each.
+>
+> **THE CUT QUESTION WAS THE WRONG QUESTION.** No leg ever reached the table, the buffer set or a pool comparison, because **no 12-layer segment of this artifact compiles at all**:
+>
+> | leg | segment | table ports | outcome |
+> |---|---|---|---|
+> | L0 | segment0 | 7 | SIGKILL at 49 s, physical MemAvailable 43.3 → 3.5 GiB |
+> | R1 | segment1 | **0** | SIGKILL at 58 s |
+> | R2 | segment3 | **0** | SIGKILL at 64 s |
+> | R3 | segment0 | 7 | SIGKILL at 53 s |
+>
+> The probe allocated NOTHING of its own in any of them (`--table skip --buffer-set none`). R1 and R2 carry no table port at all and died the same way, so **the table is not the cause** and the first hypothesis (a declared-but-unbound port costing its bytes) is not what this is either.
+>
+> **THE VARIABLE, ISOLATED** (`tools/boot_serving_shape.py --stage compile`, GPU.0, same graph, `--expert-ports` the only difference; `device_resident` is the plugin's own `GPU_MEMORY_STATISTICS` `usm_device + cl_mem`, the column A.1 used):
+>
+> | cell | layers | expert bodies as | declared | compile | peak host RSS | **device_resident** |
+> |---|---|---|---|---|---|---|
+> | c1 | 4 | constants | 13.51 GiB | 9.38 s | 9.75 GiB | **6.72 GiB** |
+> | c2 | 4 | **PORTS** | 4.13 GiB | 8.78 s | 5.28 GiB | **39.38 GiB** |
+> | c3 | 8 | constants | 24.37 GiB | 10.99 s | 16.08 GiB | **12.11 GiB** |
+> | c4 | 8 | **PORTS** | 5.62 GiB | 16.96 s | 6.81 GiB | **77.44 GiB** |
+>
+> All four rc=0. The port route makes the graph SMALLER to declare (13.51 → 4.13 GiB) and its device residency LARGER by 5.9×.
+>
+> | route | slope | intercept | 12 layers | 48 layers |
+> |---|---|---|---|---|
+> | experts as constants | **1.347 GiB/layer** | 1.33 GiB | 17.50 GiB | **66.0 GiB** |
+> | experts as PORTS | **9.515 GiB/layer** | 1.32 GiB | **115.50 GiB** | 458.0 GiB |
+>
+> **Ratio of slopes 7.06×.** Expert bytes per layer are 3 × 419,430,400 = 1.172 GiB, and the extra device cost per layer is 9.515 − 1.347 = 8.167 GiB = **6.97× the port bytes**. WHY it is ~7× is NOT measured here — an in-graph u4→f16 unpack would be 4×, the u8 source another 1×, and the rest is unaccounted. Named as unmeasured, not explained.
+>
+> **THE INSTRUMENT IS VALIDATED BY A.1.** c1 and c3 reproduce row (b′)'s c01 and c03 **exactly** — 6.72 and 12.11 GiB, same property, same host, a different session and a different leg script. And the constants slope gives 48 × 1.347 + 1.33 = **66.0 GiB**, which is row (b′)'s independently derived "the 48-layer set needs ~66–69 GiB" arriving from the other direction. The ports numbers are trustworthy for the same reason the constants numbers are.
+>
+> **WHAT THIS KILLS.** The largest segment that fits the B60's 22.71 GiB without spilling is **2.2 layers** on the port route (15.9 on the constants route). Every cut row (a) prices — 4 × 12, 6 × 8, 12 × 4 — is dead, and so is the premise that segmentation rescues the 48-layer model: **the port route is 7× worse per layer than the constants route it was introduced to escape.** A 12-layer segment needs 115.5 GiB of device residency; the three that died were each asking for that.
+>
+> **C3 ("4 × 12 does NOT fit") is CONFIRMED — and not for its own reason.** Its arithmetic is host staging against a container budget; the cause is device residency of the port route. Both the row and this amendment stand.
+>
+> **MY OWN PREDICTIONS, SCORED HONESTLY:**
+>
+> | # | verdict |
+> |---|---|
+> | P1 "a segment's staging is dense-only" | **DEAD**. ~50 GiB of shmem for a 4.94 GB `.bin`. |
+> | P2 the table is absent from RSS / cgroup | **UNREACHED** — no leg reached the table. |
+> | P3 heap buffer set shows in RSS | **UNREACHED** — no leg reached the buffer set. |
+> | P4 "**4 × 12 FITS**" | **DEAD**, and it was the headline. |
+> | P5 table-then-compile is the only order that can die | **DEAD**: every order dies, before the table is ever touched. |
+>
+> Two of five unreached and three dead. The two-pools reading of row (a) (container 48 GiB vs physical 62.7 GiB) is still correct as far as it goes, and it is now also **moot**: the binding constraint is the card, not either host pool.
+>
+> **A HOST FACT THAT RE-PRICES EVERY STAGING NUMBER IN THIS CAMPAIGN.** `data` is ZFS with **`arc_c_max = 40 GiB`** on a 62.7 GiB host, and **ARC is not counted in `MemAvailable`**. L0 began with MemAvailable 43.3 GiB against a warm ARC and spent its life racing ARC eviction; after the kill the host settled at 59.7 GiB available with ARC at 2.72 GiB. Rounds 2 and 3 ran against a cold ARC and sample ARC as its own column. A.1's staging numbers were taken without that column.
+>
+> **NOT MEASURED, and owed before the next cut is chosen:** whether BINDING the expert ports as USM-host tensors before the first inference changes the compile's device residency at all (the probe allocates its buffer set after the compile, and the compile is where the cost appears — so this instrument cannot answer it); the A770 leg (GPU.1 was untouched, reserved for the city); and the ~7× mechanism.]
+
 The admission side, for the record (de48de5): the artifact is allowlisted as
 `qwen3.8-flash-next-seg12`, pinned to that chain hash, and `serve_refusal_for`
 (3e69176) refuses to SERVE it — the single-graph path would open segment 0
