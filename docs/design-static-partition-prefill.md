@@ -98,10 +98,15 @@ takes the miss list instead of iterating all experts.
 
 **NOT BUILT (2026-09-16):** patch 0037 calls the existing
 `exec_prefill_onednn(host_only=true)` loop for the non-resident subset
-instead of the batched `exec_prefill_host_misses` described above. The
-serial per-expert dispatch dominates prefill time (~128 non-resident
-experts × 40 layers on the host CPU) and is the reason the prefill gate
-is not met (§7.0.2bx). Batching the host dispatch is the next lever.
+instead of the batched `exec_prefill_host_misses` described above. This
+extraction is a code-quality cleanup: `exec_prefill_onednn(host_only)`
+already skips resident experts (the `is_cpu_tier` check), so the miss-list
+walk saves the skip logic, not the work. The serial host compute (~4
+non-resident experts per layer × 40 layers × gather/matmul/index_add)
+dominates prefill time and is the reason the prefill gate is not met
+(§7.0.2bx). The mechanism that would close the gate — overlapping host
+dispatch with the GPU grouped-GEMM, or reducing the non-resident set —
+is not designed.
 
 **7. Output initialisation:**
 

@@ -9149,9 +9149,8 @@ layers on the host CPU. The grouped-GEMM for the resident half completes
 quickly; the sequential host dispatch for the non-resident half dominates.
 The campaign's "Known against hypothesised" section noted this path was
 "undesigned… has not been designed, built, or measured for its own overhead."
-Now it is measured: the overhead is the entire loss. A follow-on campaign
-targeting the host dispatch (parallelism, batching, or reducing the
-non-resident set) is the next lever.
+Now it is measured: the overhead is the entire loss. The mechanism that
+would close the gate is not designed; the campaign remains open.
 
 Coder offload regression (GPU.0, qwen36-coder-b5-ov, ratio 20, u8:i4):
 1lane PASS (all byte-identity checks, speculative decoding deterministic,

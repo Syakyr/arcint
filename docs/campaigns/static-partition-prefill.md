@@ -139,5 +139,5 @@ keep passing throughout.
   layer dominates. Coder offload regression 1lane PASS. Design note §6/§7
   describe a batched `exec_prefill_host_misses` that was not built — the
   patch calls the existing `exec_prefill_onednn(host_only)` loop instead.
-  Campaign remains open; the next lever is parallelising or batching the
-  host dispatch. DESIGN §7.0.2bx records the window.
+  Campaign remains open; the mechanism that would close the prefill gate
+  is not designed. DESIGN §7.0.2bx records the window.
