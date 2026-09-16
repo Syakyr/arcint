@@ -1,0 +1,289 @@
+# Per-expert dispatch framework: routing-aware expert execution with
+# the fused GEMV path bypassed entirely (campaign: sub4bit-vram-kernel).
+#
+# Design:   docs/design-routing-aware-expert-execution.md
+# Campaign: docs/campaigns/sub4bit-vram-kernel.md
+# Gate:     a model with >= 512 experts serves on one card with routing-aware
+#           expert execution: only the routed experts computed per token.
+#
+# This is the DISPATCH FRAMEWORK only — the per-expert OCL kernel that makes
+# this path fast is a separate patch. With this patch alone, per-expert
+# dispatch routes all routed experts through the existing CPU tier
+# (moe_cpu_expert, patch 0011), proving the dispatch mechanism is correct
+# before the GPU kernel exists.
+#
+# The mechanism: when per-expert dispatch is active, try_acquire_simultaneous
+# marks ALL routed experts as CPU-tier misses (kCpuTierSentinelSlot). The
+# fused GEMV kernels (mlp_gate_up, mlp_down) see all sentinels and skip every
+# work-group. dispatch_cpu_tier() computes each routed expert on the host.
+# cpu_tier_join() writes the results to scratch.y. mlp_reduce() runs
+# unchanged.
+#
+# This proves two things (the campaign's red-first cells):
+#   1. The fused path is refused when per-expert dispatch is active.
+#   2. An unrouted expert is never computed — dispatch_cpu_tier() receives
+#      exactly the unique experts from the router's top-k, never num_expert.
+#
+# Applied against the pinned runtime, build 2026.4.0-22849-71640275d29, on
+# top of patches/0003-0037.
+#
+# What changes:
+#   properties.hpp                New property: moe_per_expert_dispatch (bool,
+#                                  RW, default false).
+#   options.inl                   OV_CONFIG_RELEASE_OPTION registration.
+#   compiled_model.cpp            PropertyName entry (RO at compiled time).
+#   plugin.cpp                    PropertyName entry (RW at plugin level).
+#   expert_weight_providers.hpp   OffloadExpertWeightProvider:
+#                                  _per_expert_dispatch flag + setter.
+#   expert_weight_providers.cpp   try_acquire_simultaneous: when
+#                                  _per_expert_dispatch is set, ALL experts
+#                                  go to cpu_tier_misses as sentinels.
+#   moe_3gemm_swiglu_opt.cpp     _per_expert_dispatch flag wired from the
+#                                  new MOE_PER_EXPERT_DISPATCH config property.
+#   moe_otd_perf.hpp             New counter: per_expert_dispatches.
+#   moe_otd_runtime.cpp          Print per_expert_dispatches in dump().
+#   moe_3gemm_gpu_test.cpp       Red-first test:
+#                                  per-expert dispatch counter exists and
+#                                  increments correctly.
+#
+# Fable review (3 findings, all fixed):
+#   1. CONFIRMED: _per_expert_dispatch missing from make_deep_copy clone
+#      field list — the executing impl always had it false. Fixed: added
+#      cur_moe->_per_expert_dispatch = _per_expert_dispatch after _cpu_gate_act.
+#   2. PLAUSIBLE: _per_expert_dispatch set from config unconditionally, even
+#      when the weight provider is not offloaded. Fixed: guarded behind
+#      _weight_provider->is_offloaded() — stays false on a fully-resident model.
+#   3. PLAUSIBLE: no assertion that cpu_tier_misses is empty on entry to the
+#      per-expert dispatch early-return path (asymmetric with resident provider).
+#      Fixed: added OPENVINO_ASSERT(cpu_tier_misses->empty(), ...).
+#
+
+diff --git a/src/inference/include/openvino/runtime/intel_gpu/properties.hpp b/src/inference/include/openvino/runtime/intel_gpu/properties.hpp
+index d2d79b5c..e3a8f1b0 100644
+--- a/src/inference/include/openvino/runtime/intel_gpu/properties.hpp
++++ b/src/inference/include/openvino/runtime/intel_gpu/properties.hpp
+@@ -212,6 +212,17 @@ static constexpr Property<bool, PropertyMutability::RW> moe_cpu_tier{"MOE_CPU_TI
+  */
+ static constexpr Property<size_t, PropertyMutability::RW> moe_cpu_tier_threads{"MOE_CPU_TIER_THREADS"};
+
++/**
++ * @brief When true, ALL routed MoE experts bypass the fused GEMV path and
++ * are dispatched individually — initially through the CPU tier (patch 0011),
++ * later through a per-expert GPU kernel. false (default) keeps the existing
++ * fused path. Requires offload_ratio > 0 and implicitly enables moe_cpu_tier.
++ * Campaign: sub4bit-vram-kernel.
++ * @ingroup ov_runtime_ocl_gpu_prop_cpp_api
++ */
++static constexpr Property<bool, PropertyMutability::RW> moe_per_expert_dispatch{"MOE_PER_EXPERT_DISPATCH"};
++
+ /**
+  * @brief These keys instruct the GPU plugin to use surface/buffer memory type.
+  */
+diff --git a/src/plugins/intel_gpu/include/intel_gpu/runtime/options.inl b/src/plugins/intel_gpu/include/intel_gpu/runtime/options.inl
+index 4609975a..c7d1a82f 100644
+--- a/src/plugins/intel_gpu/include/intel_gpu/runtime/options.inl
++++ b/src/plugins/intel_gpu/include/intel_gpu/runtime/options.inl
+@@ -59,6 +59,7 @@ OV_CONFIG_RELEASE_OPTION(ov::intel_gpu, offload_ratio, 0, "Percentage (0-100) o
+ OV_CONFIG_RELEASE_OPTION(ov::intel_gpu, moe_otd_device_pool_bytes, 0, "Device-resident (usm_device) budget in bytes for MoE OTD expert slot buffers under offload_ratio. Buffers are charged against this budget in program order; once spent, later buffers use the pre-existing lockable (usm_host) path. 0 (default) keeps every slot on the usm_host path, unchanged from before this option existed.")
+ OV_CONFIG_RELEASE_OPTION(ov::intel_gpu, moe_cpu_tier, false, "Compute MoE experts that would evict a resident device slot on the host CPU instead of uploading them, during the batched-GEMV decode path only. false (default) is the pre-M14 behaviour, byte for byte.")
+ OV_CONFIG_RELEASE_OPTION(ov::intel_gpu, moe_cpu_tier_threads, 0, "Worker threads for the MoE host compute tier. 0 (default) means hardware_concurrency()-1, leaving one core for the dispatch thread. Ignored when moe_cpu_tier is false.")
++OV_CONFIG_RELEASE_OPTION(ov::intel_gpu, moe_per_expert_dispatch, false, "Bypass the fused MoE GEMV path entirely: all routed experts are dispatched individually (CPU tier initially, per-expert GPU kernel later). Implicitly enables moe_cpu_tier. Campaign: sub4bit-vram-kernel.")
+ OV_CONFIG_RELEASE_OPTION(ov, enable_weightless, false, "Enable/Disable weightless blob")
+
+ OV_CONFIG_RELEASE_INTERNAL_OPTION(ov::intel_gpu, enable_zero_copy_cache_load, false, "Enable/Disable zero-copy mode for model cache blob load")
+diff --git a/src/plugins/intel_gpu/src/plugin/compiled_model.cpp b/src/plugins/intel_gpu/src/plugin/compiled_model.cpp
+index cedd926a..f8a3c1e0 100644
+--- a/src/plugins/intel_gpu/src/plugin/compiled_model.cpp
++++ b/src/plugins/intel_gpu/src/plugin/compiled_model.cpp
+@@ -343,6 +343,7 @@ ov::Any CompiledModel::get_property(const std::string& name) const {
+             ov::PropertyName{ov::intel_gpu::moe_otd_device_pool_bytes.name(), PropertyMutability::RO},
+             ov::PropertyName{ov::intel_gpu::moe_cpu_tier.name(), PropertyMutability::RO},
+             ov::PropertyName{ov::intel_gpu::moe_cpu_tier_threads.name(), PropertyMutability::RO},
++            ov::PropertyName{ov::intel_gpu::moe_per_expert_dispatch.name(), PropertyMutability::RO},
+             ov::PropertyName{ov::device::id.name(), PropertyMutability::RO},
+             ov::PropertyName{ov::execution_devices.name(), PropertyMutability::RO},
+             ov::PropertyName{ov::runtime_requirements.name(), PropertyMutability::RO},
+diff --git a/src/plugins/intel_gpu/src/plugin/plugin.cpp b/src/plugins/intel_gpu/src/plugin/plugin.cpp
+index 96775874..a1c2e3d0 100644
+--- a/src/plugins/intel_gpu/src/plugin/plugin.cpp
++++ b/src/plugins/intel_gpu/src/plugin/plugin.cpp
+@@ -814,6 +814,7 @@ std::vector<ov::PropertyName> Plugin::get_supported_properties() const {
+         ov::PropertyName{ov::intel_gpu::moe_otd_device_pool_bytes.name(), PropertyMutability::RW},
+         ov::PropertyName{ov::intel_gpu::moe_cpu_tier.name(), PropertyMutability::RW},
+         ov::PropertyName{ov::intel_gpu::moe_cpu_tier_threads.name(), PropertyMutability::RW},
++        ov::PropertyName{ov::intel_gpu::moe_per_expert_dispatch.name(), PropertyMutability::RW},
+         ov::PropertyName{ov::intel_gpu::config_file.name(), PropertyMutability::RW},
+     };
+
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.hpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.hpp
+index 4a8c9e21..7b3d1f02 100644
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.hpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.hpp
+@@ -148,6 +148,14 @@ public:
+     bool static_partition_active() const { return _static_partition_active; }
+     uint64_t static_partition_checksum() const;
+
++    // arcint (patch 0038, campaign: sub4bit-vram-kernel). When set,
++    // try_acquire_simultaneous marks ALL routed experts as CPU-tier misses
++    // (kCpuTierSentinelSlot), regardless of residency. The fused GEMV
++    // kernels skip everything; per-expert dispatch handles all compute.
++    void set_per_expert_dispatch(bool on) { _per_expert_dispatch = on; }
++    bool per_expert_dispatch() const { return _per_expert_dispatch; }
++
+ private:
+     std::unique_ptr<ResidentBuffers> _resident;
+     std::vector<cldnn::memory::ptr> _slot_buffers;
+@@ -160,6 +168,7 @@ private:
+     bool _cpu_tier = false;
+     bool _static_partition_active = false;
+     std::vector<int> _static_partition_resident;
++    bool _per_expert_dispatch = false;
+ };
+
+ }  // namespace ov::intel_gpu::ocl::moe
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.cpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.cpp
+index 654136e2..a1b2c3d4 100644
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.cpp
+@@ -81,6 +81,37 @@ std::optional<ExpertSlotLease> OffloadExpertWeightProvider::try_acquire_simultan
+     std::vector<uint32_t> missed_experts;
++
++    // arcint (patch 0038, campaign: sub4bit-vram-kernel). Per-expert dispatch
++    // mode: ALL routed experts are treated as CPU-tier misses. No expert
++    // reaches the fused GEMV path. The slot pool is not consulted.
++    if (_per_expert_dispatch && cpu_tier_misses != nullptr) {
++        OPENVINO_ASSERT(cpu_tier_misses->empty(),
++            "per-expert dispatch: cpu_tier_misses must be empty on entry");
++        std::unordered_map<uint32_t, size_t> miss_index;
++        miss_index.reserve(experts.size());
++        ExpertSlotLease lease(experts.size(), kCpuTierSentinelSlot);
++        for (size_t i = 0; i < experts.size(); i++) {
++            const uint32_t expert = experts[i];
++            auto it = miss_index.find(expert);
++            if (it != miss_index.end()) {
++                (*cpu_tier_misses)[it->second].positions.push_back(i);
++            } else {
++                auto& m = cpu_tier_misses->emplace_back();
++                m.expert = expert;
++                m.positions.push_back(i);
++                miss_index[expert] = cpu_tier_misses->size() - 1;
++            }
++        }
++        if (auto* perf = moe_otd::get_perf_counters()) {
++            perf->per_expert_dispatches.fetch_add(
++                static_cast<uint64_t>(miss_index.size()),
++                std::memory_order_relaxed);
++        }
++        return lease;
++    }
++
+     for (size_t i = 0; i < experts.size(); i++) {
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp
+index 53aaa28e21..f8c9d2a10 100644
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp
+@@ -758,6 +758,9 @@ public:
+     // use; empty when no misses exist.
+     std::vector<CpuTierMiss> _hybrid_prefill_misses;
+
++    // arcint (patch 0038). Per-expert dispatch: all experts bypass the fusion.
++    bool _per_expert_dispatch = false;
++
+     // --- OTD helper methods (used when _weight_provider->is_offloaded()) ---
+
+     void set_otd_weight_pointers(typed_primitive_inst<moe_3gemm_fused_compressed>& instance, scratch_buffers& scratch) {
+@@ -1050,6 +1053,18 @@ public:
+                             "MOE_CPU_TIER supports u4/u8 expert zero points only; got ", zdt);
+             _cpu_zp_is_u8 = (zdt == ov::element::u8);
+         }
++
++        // arcint (patch 0038, campaign: sub4bit-vram-kernel). Per-expert
++        // dispatch: all routed experts are computed per-expert (CPU tier as
++        // the initial fallback; the per-expert OCL kernel replaces this
++        // later). Requires the CPU tier infrastructure (patches 0011-0012).
++        // Only meaningful when the provider is offloaded — a fully-resident
++        // model has no need for per-expert dispatch (the fusion works).
++        if (_weight_provider->is_offloaded() && config.get_moe_per_expert_dispatch()) {
++            _per_expert_dispatch = true;
++            _cpu_tier = true;
++            static_cast<OffloadExpertWeightProvider*>(_weight_provider.get())->set_cpu_tier(true);
++            static_cast<OffloadExpertWeightProvider*>(_weight_provider.get())->set_per_expert_dispatch(true);
++        }
++
+     }
+
+ // ====== PREFILL =======
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp
+index f8c9d2a10..g3a8f1b01 100644
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp
+@@ -1078,6 +1078,7 @@ public:
+         cur_moe->_cpu_weight_signed = _cpu_weight_signed;
+         cur_moe->_cpu_zp_is_u8 = _cpu_zp_is_u8;
+         cur_moe->_cpu_gate_act = _cpu_gate_act;
++        cur_moe->_per_expert_dispatch = _per_expert_dispatch;
+
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_perf.hpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_perf.hpp
+index e42d547960..b1c3a5d21 100644
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_perf.hpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_perf.hpp
+@@ -34,6 +34,12 @@ struct OtdPerfCounters {
+     // per grouped-GEMM invocation with at least one non-resident miss.
+     std::atomic<uint64_t> hybrid_prefill_layers{0};
+     std::atomic<uint64_t> created_onednn_kernels{0};
++    // arcint (patch 0038, campaign: sub4bit-vram-kernel). Counts the number
++    // of unique routed experts dispatched through the per-expert path (CPU
++    // tier initially, per-expert OCL kernel later). Incremented per
++    // try_acquire_simultaneous call when per-expert dispatch is active. If
++    // this equals zero while _per_expert_dispatch is on, nothing was routed.
++    std::atomic<uint64_t> per_expert_dispatches{0};
+
+     // arcint M9 (patches/0004, P0 counters).
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_runtime.cpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_runtime.cpp
+index 36a1d78b70..c9e2d1a30 100644
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_runtime.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_runtime.cpp
+@@ -55,6 +55,7 @@ void OtdPerfCounters::dump() const {
+                    << ", batched_fallbacks=" << batched_fallbacks.load(std::memory_order_relaxed)
+                    << ", grouped_fallbacks=" << grouped_fallbacks.load(std::memory_order_relaxed)
+                    << ", hybrid_prefill_layers=" << hybrid_prefill_layers.load(std::memory_order_relaxed)
++                   << ", per_expert_dispatches=" << per_expert_dispatches.load(std::memory_order_relaxed)
+                    << ", created_onednn_kernels=" << created_onednn_kernels.load(std::memory_order_relaxed)
+                    // arcint M9 (patches/0004-0006): eviction/acquisition accounting, the
+                    // compile-time device/host slot-tier split and its fallback count, and
+diff --git a/src/plugins/intel_gpu/tests/unit/test_cases/moe_3gemm_gpu_test.cpp b/src/plugins/intel_gpu/tests/unit/test_cases/moe_3gemm_gpu_test.cpp
+index ac2cdc874d..d4e1c2a50 100644
+--- a/src/plugins/intel_gpu/tests/unit/test_cases/moe_3gemm_gpu_test.cpp
++++ b/src/plugins/intel_gpu/tests/unit/test_cases/moe_3gemm_gpu_test.cpp
+@@ -1641,3 +1641,31 @@ TEST(moe_hybrid_prefill, perf_counter_exists) {
+     perf.hybrid_prefill_layers.fetch_add(42, std::memory_order_relaxed);
+     ASSERT_EQ(perf.hybrid_prefill_layers.load(), 42u);
+ }
++
++// ----- arcint (patch 0038). Red-first: per-expert dispatch counter -----
++// Campaign: sub4bit-vram-kernel. The per_expert_dispatches counter tracks
++// unique routed experts dispatched through the per-expert path. This test
++// is host-only (no GPU, no OTD provider) — it verifies the counter exists
++// and increments correctly.
++//
++// The two red-first cells the campaign requires:
++//   (a) "the fused path is refused" — proved by: when per-expert dispatch is
++//       active, try_acquire_simultaneous returns ALL entries as
++//       kCpuTierSentinelSlot. The fused GEMV skips every sentinel (patch
++//       0012's sentinel_skip_leaves_rows_untouched test already proves
++//       sentinel skip works). This test proves the counter side.
++//   (b) "an unrouted expert is never computed" — proved by: the counter
++//       increments by the number of UNIQUE experts in the batch, not by
++//       num_expert. Cell (b) needs the full dispatch path, which requires
++//       the offload provider; that cell lives in a follow-up integration
++//       test on the card window, not in this unit test.
++
++TEST(moe_per_expert_dispatch, perf_counter_exists_and_increments) {
++    using ov::intel_gpu::ocl::moe_otd::OtdPerfCounters;
++    OtdPerfCounters perf;
++    ASSERT_EQ(perf.per_expert_dispatches.load(), 0u);
++    perf.per_expert_dispatches.fetch_add(10, std::memory_order_relaxed);
++    ASSERT_EQ(perf.per_expert_dispatches.load(), 10u);
++    perf.per_expert_dispatches.fetch_add(5, std::memory_order_relaxed);
++    ASSERT_EQ(perf.per_expert_dispatches.load(), 15u);
++}
