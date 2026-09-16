@@ -315,6 +315,9 @@ std::string usage_text() {
         "  --fit-margin-mib N        headroom the paged-path auto-fit budget leaves\n"
         "                            unclaimed (default: 256). The only policy term in\n"
         "                            the reservation; every other term is measured\n"
+        "  --fit-ledger-dir PATH     persist the admission fit terms (slot pool,\n"
+        "                            activation fit, chunk cap) to skip the load-time\n"
+        "                            probes on subsequent starts (default: off)\n"
         "  --paged-attention-max-partitions N\n"
         "                            bound the GPU plugin's mixed-stage paged-attention\n"
         "                            partition count (default: 0, unbounded). Passed to\n"
@@ -624,6 +627,9 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
             if (!value(v) || !parse_int(v, cfg.fit_margin_mib)) {
                 return fail("--fit-margin-mib needs an integer");
             }
+        } else if (arg == "--fit-ledger-dir") {
+            if (!value(v)) return fail("--fit-ledger-dir needs a path");
+            cfg.fit_ledger_dir = std::string(v);
         } else if (arg == "--paged-attention-max-partitions") {
             if (!value(v) || !parse_int(v, cfg.paged_attention_max_partitions)) {
                 return fail("--paged-attention-max-partitions needs an integer");

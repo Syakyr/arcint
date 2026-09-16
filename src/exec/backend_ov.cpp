@@ -2868,6 +2868,7 @@ private:
                 for (const auto& kv : core_.get_versions(device)) {
                     const char* build = kv.second.buildNumber;
                     if (build == nullptr) continue;
+                    gpu_plugin_build_ = build;
                     gpu_plugin_patch_level_ =
                         std::max(gpu_plugin_patch_level_, marfrit_patch_level(build));
                 }
@@ -3060,7 +3061,7 @@ private:
             throw;
         }
         const size_t resident_base = device_resident_bytes(device);
-        log::info("load", "paged model ready in %.1f s; device-resident %.2f GiB",
+        log::info("load", "language model ready in %.1f s (paged); device-resident %.2f GiB",
                   seconds_since(t0), static_cast<double>(resident_base) / (1u << 30));
 
         // One InferRequest per lane, all from the one CompiledModel. Weights are
@@ -3576,6 +3577,43 @@ private:
 
         size_t       probe_pool_blocks = 0;
 
+        // ---- Fit ledger: try to reuse previously measured fit terms ----
+        bool ledger_hit = false;
+        FitLedgerKey ledger_key;
+        ledger_key.arch_hash      = artifact_.arch_hash;
+        ledger_key.weights_bytes  = artifact_.weights_bytes;
+        ledger_key.device         = device;
+        ledger_key.plugin_build   = gpu_plugin_build_;
+        ledger_key.offload_ratio  = offload_ratio_;
+        ledger_key.paged_kv       = cfg.paged_kv;
+        ledger_key.moe_cpu_tier   = moe_cpu_tier_;
+        ledger_key.lanes          = lanes;
+        ledger_key.kv_block_size  = cfg.kv_block_size;
+        ledger_key.slice_logits   = cfg.slice_logits;
+        ledger_key.drafts_max     = static_cast<int>(drafts_max_);
+        ledger_key.fit_margin_mib = cfg.fit_margin_mib;
+        ledger_key.paged_attention_max_partitions = cfg.paged_attention_max_partitions;
+        ledger_key.prefill_chunk  = cfg.prefill_chunk;
+        ledger_key.cap_off        = std::getenv("ARCINT_PREFILL_CHUNK_CAP") != nullptr &&
+                                    std::string(std::getenv("ARCINT_PREFILL_CHUNK_CAP")) == "off";
+
+        FitLedgerEntry ledger_entry;
+        const std::string ledger_path = fit_ledger_path(cfg.fit_ledger_dir, artifact_.arch_hash);
+        if (!ledger_path.empty()) {
+            if (auto loaded = fit_ledger_read(ledger_path)) {
+                if (loaded->key == ledger_key) {
+                    ledger_entry = *loaded;
+                    ledger_hit   = true;
+                    log::info("load", "fit ledger hit (%s) -- skipping plateau probe and "
+                                      "activation-fit ladder",
+                              ledger_path.c_str());
+                } else {
+                    log::info("load", "fit ledger key mismatch (%s) -- re-measuring",
+                              ledger_path.c_str());
+                }
+            }
+        }
+
         // ---- Phase B: expert slot pool (M7 §1/§2, reworked after on-card
         // measurement) ------------------------------------------------------
         //
@@ -3698,7 +3736,15 @@ private:
             }
 
             if (!forced) {
-                {
+                if (ledger_hit) {
+                    slot_pool           = ledger_entry.slot_pool;
+                    slot_source         = ledger_entry.slot_source;
+                    probe_priced_device = ledger_entry.probe_priced_device;
+                    log::info("load",
+                              "expert slot pool: %.2f GiB (source: %s, fit ledger)",
+                              static_cast<double>(slot_pool) / (1u << 30),
+                              slot_source.c_str());
+                } else {
                     // Device term: the plateau probe, under BOTH residency
                     // partitions. The analytic IR walk (slot_pool_from_ir) is
                     // not used to charge the device budget -- measured on the
@@ -3922,6 +3968,13 @@ private:
             }
         }
 
+        // ---- Phase C: activation fit (may be skipped by the fit ledger) ----
+        size_t    chunk            = probe_floor_c;
+        long long activation_total = 0;
+        double    slope            = 0.0;
+        double    intercept        = 0.0;
+        double    slope_extra      = 0.0;
+
         // The baseline every activation probe below measures against:
         // resident_base plus everything Phase A and B have already
         // committed to the device (drafters always; the GDN slab rows via
@@ -3988,6 +4041,19 @@ private:
                    static_cast<long long>(probe_blocks * kv_block_bytes) +
                    static_cast<long long>(baseline_probe_pool_blocks * kv_block_bytes);
         };
+
+        if (ledger_hit) {
+            chunk            = static_cast<size_t>(std::max(ledger_entry.chunk, 1));
+            activation_total = ledger_entry.activation_total;
+            slope            = ledger_entry.slope;
+            intercept        = ledger_entry.intercept;
+            slope_extra      = ledger_entry.slope_extra;
+            log::info("load", "activation fit (ledger): %.3f GiB fixed + %.1f KiB per chunk "
+                              "token; served chunk %zu, activation %.2f GiB",
+                      intercept / static_cast<double>(1u << 30), slope / 1024.0, chunk,
+                      static_cast<double>(activation_total) / (1u << 30));
+        } else {
+
         // The peak is affine in the chunk, not linear from the origin: measured
         // on the A770, 0.62 GiB at 128 tokens and 0.77 at 256, so most of it is
         // a fixed cost that a single probe smears into a slope and then charges
@@ -4016,7 +4082,6 @@ private:
         // redeclared here.
         long long act128 = 0;
         long long extra128 = 0;
-        double    slope_extra = 0.0;
         {
             act128 = probe(lane0, probe_floor_c);
             // The slice's layout claim, checked against what the graph returned
@@ -4093,11 +4158,11 @@ private:
         // buys the step back without giving up the climb.
         const double kHeadroom = 1.25;
 
-        size_t    chunk      = probe_floor_c;
+        chunk      = probe_floor_c;
         long long activation = act128;
-        double    slope      = static_cast<double>(std::max<long long>(act128, 1)) /
+        slope      = static_cast<double>(std::max<long long>(act128, 1)) /
                           static_cast<double>(probe_floor_c);
-        double    intercept  = 0.0;
+        intercept  = 0.0;
 
         while (chunk * 2 <= configured && chunk * 2 <= chunk_ceiling) {
             const size_t next      = chunk * 2;
@@ -4148,7 +4213,7 @@ private:
         // The other lanes again, now at the chunk that will actually be served:
         // whatever they add on top of lane 0's peak is what the budget below
         // pays for.
-        long long activation_total = activation;
+        activation_total = activation;
         for (size_t i = 1; i < lanes_.size(); ++i) {
             const long long before = static_cast<long long>(device_resident_bytes(device));
             probe(*lanes_[i], chunk);
@@ -4170,6 +4235,32 @@ private:
         // wrap around into a number in the exabytes -- and if it ever does
         // fire again, the honest statement is that the baseline accounting
         // is wrong somewhere, not that anything evicted anything.
+        // Write the fit ledger if we measured (not a ledger hit, not forced).
+        if (!ledger_hit && !ledger_path.empty() && slot_source != "forced") {
+            FitLedgerEntry entry;
+            entry.key                       = ledger_key;
+            entry.slot_pool                 = slot_pool;
+            entry.slot_source               = slot_source;
+            entry.probe_priced_device       = probe_priced_device;
+            entry.static_partition_reported =
+                slot_source == "probe-static" || slot_source == "static";
+            entry.chunk                     = static_cast<int>(chunk);
+            entry.activation                = activation_total;
+            entry.activation_total          = activation_total;
+            entry.slope                     = slope;
+            entry.intercept                 = intercept;
+            entry.slope_extra               = slope_extra;
+            entry.slot_host_bytes           = slot_host_bytes;
+            entry.slot_host_source          = slot_host_source;
+            if (fit_ledger_write(ledger_path, entry)) {
+                log::info("load", "fit ledger written (%s)", ledger_path.c_str());
+            } else {
+                log::warn("load", "fit ledger write failed (%s)", ledger_path.c_str());
+            }
+        }
+
+        }  // !ledger_hit (activation fit)
+
         if (activation_total < 0) {
             log::warn("load",
                       "activation delta measured negative (%.3f GiB) -- a baseline accounting "
@@ -5682,6 +5773,36 @@ private:
         status_.reservation.lanes              = lanes;
         status_.reservation.prefill_chunk      = prefill_chunk_;
         status_.reservation.n_ctx              = paged_n_ctx_;
+
+        // Pre-warm: one forward on lane 0 with diverse token IDs to fill
+        // the pinned expert slots before the first real request (campaign
+        // static-partition-cold-start §4, DESIGN §7.0.2aq). Gated on the
+        // fit ledger hitting: when probes ran, their forwards already filled
+        // the slots as a side effect; the pre-warm is for the case where
+        // probes were skipped.
+        if (offload_ratio_ > 0 && ledger_hit) {
+            Lane& pw_lane = *lanes_[0];
+            const size_t pw_tokens = std::min<size_t>(
+                128, static_cast<size_t>(std::max(prefill_chunk_, 1)));
+            if (pw_tokens > 0 && ensure_blocks(pw_lane, pw_tokens)) {
+                try {
+                    zero_paged_rows(pw_lane);
+                    std::vector<int> pw_ids(pw_tokens);
+                    for (size_t i = 0; i < pw_tokens; ++i)
+                        pw_ids[i] = static_cast<int>(i % 1000);
+                    auto t_pw = std::chrono::steady_clock::now();
+                    paged_forward(pw_lane, embed_paged(pw_lane, pw_ids), 0, {0, 0}, 0);
+                    release_lane(pw_lane);
+                    log::info("load", "pre-warm forward (%zu tokens) in %.1f s",
+                              pw_tokens, seconds_since(t_pw));
+                } catch (const std::exception& e) {
+                    log::warn("load", "pre-warm forward failed: %s", e.what());
+                    reset_lane_request(pw_lane);
+                }
+            } else if (pw_tokens > 0) {
+                log::info("load", "pre-warm skipped (ensure_blocks failed)");
+            }
+        }
 
         if (std::getenv("ARCINT_PROFILE") != nullptr) profile_paged(*lanes_[0]);
     }
@@ -7820,6 +7941,7 @@ private:
     // at the climb, the ceiling and the belt call site, like the two
     // members above.
     int                            gpu_plugin_patch_level_ = 0;
+    std::string                    gpu_plugin_build_;
     bool                           packed_values_mixed_stage_on_micro_ = false;
     size_t                         la_row_bytes_     = 0;
     size_t                         logits_keep_rows_ = 0;  // 0: unsliced

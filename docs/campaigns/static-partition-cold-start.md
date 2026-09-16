@@ -234,3 +234,81 @@ for a faster cold start.
   (the plugin's own kernel persistence, `cache_dir`) — moot, since the
   JIT term is 7 s. Next: the ledger's red case and the tier cell's cold
   metric.
+- 2026-09-15 — the fit ledger built, not yet measured on the card.
+  `--fit-ledger-dir PATH`: persists the plateau-probe and activation-fit
+  results per (artifact, device, flags, runtime) as a JSON file, keyed by
+  `FitLedgerKey` (`exec/fit.h`). On a subsequent start with a matching key,
+  the plateau probe (up to 8 × 128-token prefills) and the activation-fit
+  ladder (128…2,048-token prefills) are skipped entirely — the stored
+  `slot_pool`, `chunk`, `activation_total`, `slope`, `intercept` and
+  `slope_extra` are used directly. A key mismatch or a missing/corrupt
+  file triggers a full re-measurement and writes a fresh entry.
+  `ARCINT_FIT_SLOT_BYTES` (the forced path) overrides the ledger.
+  Tier-reference cell (`tests/acceptance/cells/tier_reference.sh`) now
+  emits cold (first-request) metrics: `decode-cold-1st-on/off`,
+  `prefill-cold-1st-on/off`, `decode-cold-warm-ratio-on`. The gate (first
+  request within 2× of warm) is the ratio metric. Design note updated
+  (`docs/design-static-partition-cold-start.md` §4). Unit tests: key/entry
+  JSON round-trip, file round-trip, key mismatch, path construction (7
+  cases, all passing). Not yet measured on the card: the first window with
+  the ledger is the next step, to confirm the probes are actually skipped
+  and the served configuration is identical to a fresh measurement.
+- 2026-09-16 — fit-ledger verification window on the A770 (GPU.1, 16 GiB).
+  Three tier-ON processes (P1 no ledger, P2 ledger write, P3 ledger hit),
+  the reference cell (35B int4, ratio 50, 8 GiB pool, u8 KV, 1 lane,
+  n_ctx 65,536, 1,167-token prompt, 64 greedy tokens), file cache warmed
+  by the sizing server; runtime `/usr/lib/marfrit-openvino/openvino/libs/
+  libopenvino.so.2640`, source build `arcint 0.5.0`.
+  **Probes confirmed skipped on ledger hit:** P3 log: `fit ledger hit …
+  skipping plateau probe and activation-fit ladder`. OTD_PERF counters
+  confirm: P3 `grouped_fallbacks=80` vs P1/P2's `400` (the 320 plateau-
+  probe forwards absent), `created_onednn_kernels=2,331` vs `4,687`,
+  `acquisitions=58,134` vs `79,356`.
+  **Served configuration identical:** P3 activation fit `-0.002 GiB +
+  215.4 KiB/token`, chunk 2048, activation 0.42 GiB, slot pool 0.12 GiB
+  (probe-static) — all matching P1/P2 and the ledger JSON.
+  **Cold/warm gate:** P3 req1 decode 17.0 t/s, req2 17.9 t/s, ratio
+  17.9/17.0 = 1.05 (gate ≥ 0.5). Warm decode 17.9 t/s ≥ 16.4 (record).
+  **Output identity:** P2 and P3 produce identical greedy text for both
+  requests — the ledger does not change arithmetic.
+  **First-request cold residual** (first-use fills, not the probe term):
+  P1 req1 12.1 t/s vs req2 18.1 — the first tier-ON process on a warm
+  file cache still pays the slot fills. P2/P3 req1 17.0–17.2, req2
+  17.9–18.2 — a second/third process is nearly warm from its first
+  request; the pre-warm lever (campaign scope, not yet built) addresses
+  the P1-shaped case.
+  **Load-time regex fault** in the window script: `load_time()` grepped
+  `language model ready` but the log says `paged model ready` — load times
+  not captured. The probes' share is visible in the OTD_PERF delta instead.
+  Evidence class: measured-here.
+- 2026-09-16, later — both residuals closed.
+  **Pre-warm lever built and measured** (`backend_ov.cpp`, end of
+  `load_paged()`): when `offload_ratio > 0` AND `ledger_hit`, one
+  128-token forward with diverse IDs on lane 0 fills the pinned expert
+  slots before the first real request, then releases the lane. Gated on
+  the fit ledger hitting: when probes ran, their forwards already filled
+  slots as a side effect; the pre-warm is for the case where probes were
+  skipped. The pre-warm time is charged to the load phase, not the first
+  request.
+  **Log message harmonised:** the paged path's `"paged model ready in N s"`
+  changed to `"language model ready in N s (paged)"` so both paths match
+  the `"language model ready"` grep pattern the window script expected.
+  Unit tests: 568 pass, 0 fail.
+  **Card window** (A770 GPU.1, 16 GiB, source build `arcint 0.5.0`,
+  runtime `libopenvino.so.2640`, reference cell flags: 35B int4, ratio 50,
+  8 GiB pool, u8 KV, 1 lane, n_ctx 65,536, 64 greedy tokens).
+  First window (pre-warm on every `offload_ratio > 0` process): P1 (probes,
+  writes ledger, cold file cache): req1 3.7 t/s, req2 18.5 — the disk
+  term dominated (dd failed, file cache not warmed). P2 (ledger hit,
+  pre-warm 8.5 s): req1 16.4, req2 18.3 — ratio 1.12. Pre-warm ran on
+  BOTH (6.4 s on P1, redundant after probes).
+  Gate fix: pre-warm now fires only on `ledger_hit`. Verification window:
+  P1 (probes, no pre-warm, `ledger_hit=false`): req1 8.2, req2 18.2 —
+  0 pre-warm occurrences in log, ratio 2.22. P2 (ledger hit, pre-warm
+  8.4 s, `ledger_hit=true`): req1 15.2, req2 18.4 — 1 pre-warm occurrence,
+  ratio 1.21. Output identity: P1 == P2 (IDENTICAL). Gate: 18.4/15.2 =
+  1.21 (≥ 0.5). Warm decode 18.4 t/s ≥ 16.4 (record).
+  The pre-warm nearly doubled the ledger-hit process's first-request
+  decode (from the ~8 t/s range without it to 15.2 with it, at the cost
+  of 8.4 s of startup). Services restored on the dev host after the window.
+  Evidence class: measured-here.

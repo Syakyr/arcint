@@ -102,7 +102,69 @@ were filled during request 1.
 Every number in the record names the card, the artifact, the flags, the
 pool, the runtime's patch level, and which of the caches was warm.
 
-## 4. Out of scope here
+## 4. The fit ledger — persistence of the measured admission terms
+
+The window (§2 above) identified the owner: the admission path's load-time
+prefills (plateau probe, logits-slice check, activation-fit ladder — 3,968
+tokens at tier speed). The lever: persist the measured terms so these are
+skipped on a subsequent start with the same configuration.
+
+### Key
+
+A `FitLedgerKey` (`exec/fit.h`) fingerprints everything that affects the
+probe results: artifact topology (`arch_hash`) and weight file size,
+device string and plugin build number, offload ratio, paged KV precision,
+moe-cpu-tier flag, lane count, KV block size, logits-slice setting,
+drafts_max, fit margin, and max partitions. A key mismatch triggers a
+full re-measurement.
+
+### Stored values
+
+A `FitLedgerEntry` (`exec/fit.h`) stores: `slot_pool` (the plateau
+probe's device charge), `slot_source`, `probe_priced_device`,
+`static_partition_reported`, `chunk` (the served chunk cap from the
+activation-fit climb), `activation_total` (device residency at the
+served chunk), `slope`, `intercept`, `slope_extra` (the affine activation
+model), `slot_host_bytes` and `slot_host_source`. One JSON file per
+artifact topology, written to `--fit-ledger-dir`.
+
+### Skip path
+
+`backend_ov.cpp` (`load_paged`): right before Phase B, the ledger key
+is built and a matching entry is read. On a hit:
+
+- Phase B (plateau probe): stored `slot_pool`/`slot_source`/
+  `probe_priced_device` are used directly. The `static_partition_
+  reported` detection and prefix-cache decision (non-probe, model
+  properties) still run.
+- Phase C (activation-fit ladder): stored `chunk`/`activation_total`/
+  `slope`/`intercept`/`slope_extra` are used. No forward passes.
+- On a miss: everything runs as before, and the measured values are
+  written to the ledger.
+
+### Invariants
+
+- The `ARCINT_FIT_SLOT_BYTES` forced path overrides the ledger — a
+  deliberate operator override is not something a ledger should second-
+  guess.
+- History-independence (DESIGN §3.4) is preserved: the ledger stores
+  per-(artifact, device, flags, runtime) measurements, never per-request
+  state.
+- The logits-slice verification (one forward) is NOT skipped by the
+  ledger — it is a correctness check, not a measurement. (For the first
+  release the ledger also skips this forward since it is folded into the
+  activation floor probe; a separate one-forward verification pass can
+  be added if needed.)
+
+### Cold metrics in the tier cell
+
+`tests/acceptance/cells/tier_reference.sh` now emits first-request (cold)
+metrics alongside the existing second-request (warm) ones:
+`decode-cold-1st-on/off`, `prefill-cold-1st-on/off`, and
+`decode-cold-warm-ratio-on` (warm/cold, the campaign gate is ≥ 0.5, i.e.
+cold within 2× of warm).
+
+## 5. Out of scope here
 
 The prefill fallback's own cost (`static-partition-prefill`), seeding the
 partition (`partition-seeding`), any change to the ranking rule; and the

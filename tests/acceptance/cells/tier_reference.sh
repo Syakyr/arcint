@@ -197,10 +197,22 @@ decode_off=$(metric_value "$WORK/off2.log" decode 2)
 prefill_off=$(metric_value "$WORK/off2.log" prefill 2)
 decode_on=$(metric_value "$WORK/on2.log" decode 2)
 prefill_on=$(metric_value "$WORK/on2.log" prefill 2)
+decode_cold_off=$(metric_value "$WORK/off1.log" decode 1)
+prefill_cold_off=$(metric_value "$WORK/off1.log" prefill 1)
+decode_cold_on=$(metric_value "$WORK/on1.log" decode 1)
+prefill_cold_on=$(metric_value "$WORK/on1.log" prefill 1)
+emit_metric decode-cold-1st-off  "$decode_cold_off"  t/s
+emit_metric prefill-cold-1st-off "$prefill_cold_off" t/s
+emit_metric decode-cold-1st-on   "$decode_cold_on"   t/s
+emit_metric prefill-cold-1st-on  "$prefill_cold_on"  t/s
 emit_metric decode-warm-2nd-off  "$decode_off"  t/s
 emit_metric prefill-warm-2nd-off "$prefill_off" t/s
 emit_metric decode-warm-2nd-on   "$decode_on"   t/s
 emit_metric prefill-warm-2nd-on  "$prefill_on"  t/s
+if [[ -n "$decode_cold_on" && -n "$decode_on" ]]; then
+  cold_warm_ratio_on=$(python3 -c "d=float('${decode_on}'); c=float('${decode_cold_on}'); print(f'{d/c:.2f}' if c > 0 else 'inf')" 2>/dev/null || true)
+  emit_metric decode-cold-warm-ratio-on "$cold_warm_ratio_on" ratio
+fi
 if [[ -n "$decode_off" && -n "$decode_on" ]]; then
   # Two decimals: the first real run put the ratio at 1.31-1.34 against a
   # band derived by §8.3 from those samples, and one decimal would quantise

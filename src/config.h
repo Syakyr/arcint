@@ -123,6 +123,14 @@ struct Config {
     // Replaces what used to be a hardcoded 256 MiB constant in load_paged.
     int fit_margin_mib = 256;
 
+    // Fit-ledger persistence (static-partition-cold-start campaign): a
+    // directory where the admission path writes the fit terms it measured
+    // (slot_pool, activation slope/intercept, chunk cap) keyed to the
+    // (artifact, device, flags, runtime) tuple. A subsequent load with a
+    // matching key skips the plateau probe and activation-fit ladder,
+    // cutting the tier-ON load from minutes to seconds. Empty = off.
+    std::string fit_ledger_dir;
+
     // Slice the hidden state to its last row before the LM head, so prefill
     // computes one logit row rather than one per prompt token. On by default:
     // it is what makes deep prompts fit at all, it is faster, and it does not

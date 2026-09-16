@@ -17,6 +17,28 @@ nightly is a different ABI, and since 0.3.0 floors the patch level within
 it (`>= +pN`, `<<` the next nightly) instead of pinning it exactly: an exact
 pin made apt remove arcint when the runtime was upgraded to +p3.
 
+## Unreleased (qfndev)
+
+### Fit ledger and pre-warm lever (campaign: static-partition-cold-start)
+
+- **Fit ledger** (`--fit-ledger-dir`): persists the plateau-probe and
+  activation-fit results per (artifact, device, flags, runtime) as JSON.
+  On a matching key, probes are skipped entirely (~170 s saved on tier-ON
+  loads). Key includes `prefill_chunk` and `ARCINT_PREFILL_CHUNK_CAP` to
+  prevent cross-configuration hits.
+- **Pre-warm lever**: after `load_paged()`, when `offload_ratio_ > 0` and
+  the fit ledger hit (probes skipped), runs one 128-token forward on
+  lane 0 to fill pinned expert slots before the first real request.
+  Gated on `ledger_hit` because probe forwards fill slots as a side effect.
+  Wrapped in try/catch so a failure degrades to a cold first request
+  instead of aborting the load.
+- **Forced-slot guard**: `ARCINT_FIT_SLOT_BYTES` (the debug override) no
+  longer writes its forced value into the fit ledger, preventing a debug
+  run from poisoning subsequent production starts.
+- **Log harmonization**: paged path now logs `"language model ready in N s
+  (paged)"` instead of `"paged model ready"`, matching the stateful path's
+  grep pattern.
+
 ## 0.5.0 — 2026-09-13
 
 Requires `marfrit-openvino 2026.4.0~dev20260821+p15` (patches 0003–0033) —
@@ -1084,13 +1106,14 @@ the package was built from.
 
 ### Scope
 - M10 (sub-4-bit expert weights) is re-scoped (DESIGN §7.0.2ah): the
-  context claim it was written to buy is discharged by `--paged-kv u8:i4`
-  (+28% on both served configurations, §7.0.2y); the VRAM-resident sub-4-bit
-  expert path is a new GPU-kernel milestone -- the pinned runtime's MoE
-  fusion matches u4 only, its kernels carry no sub-4-bit type, and the gate
-  is priced in VRAM, which neither route as written reaches without that
-  kernel -- and is backlogged to 0.3.1 with its entry criteria in
-  `docs/milestone-0.3.0.md`. No M10 code in this release.
+  context claim the row was written to buy is discharged by `--paged-kv
+  u8:i4` (+28% on both served configurations, §7.0.2y); the per-expert
+  GEMM kernel with in-kernel dequant -- bypassing the MoE fusion for
+  routing-aware expert execution (GPU LRU cache, compute only the routed
+  experts, host miss tier) -- is a new GPU-kernel milestone, backlogged
+  to 0.3.1 with its entry criteria in `docs/milestone-0.3.0.md`.
+  Sub-4-bit precision is one cache-headroom lever, not a gate.
+  No M10 code in this release.
 
 ### Release gate
 - The §5/§5.1 acceptance set, run on these bits with the built `+p4`

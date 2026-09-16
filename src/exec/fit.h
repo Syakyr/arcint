@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <fstream>
 #include <optional>
 #include <string>
 #include <utility>
@@ -1996,6 +1997,172 @@ inline HostRamFit host_ram_fit(uint64_t ngram_bytes, uint64_t expert_pool_bytes,
     r.refuse = host_ram_fit_must_refuse(ngram_bytes, expert_pool_bytes, other_resident_bytes,
                                         host_ram_bytes, margin_bytes);
     return r;
+}
+
+// ---------------------------------------------------------------------------
+// Fit ledger — persist the admission path's measured terms across processes
+// (static-partition-cold-start campaign). The key fingerprints everything
+// that affects the probe results; a match lets a subsequent load skip the
+// plateau probe and the activation-fit ladder entirely.
+// ---------------------------------------------------------------------------
+
+struct FitLedgerKey {
+    std::string arch_hash;         // artifact topology identity
+    uint64_t    weights_bytes = 0; // artifact weight file size
+    std::string device;            // OpenVINO device string (GPU.0, ...)
+    std::string plugin_build;      // plugin buildNumber from core_.get_versions
+    int         offload_ratio = 0;
+    std::string paged_kv;          // KEY[:VALUE] as given
+    bool        moe_cpu_tier = false;
+    int         lanes        = 1;
+    int         kv_block_size = 32;
+    bool        slice_logits  = true;
+    int         drafts_max    = 0; // draft_tokens + MTP/DFlash contribution
+    int         fit_margin_mib = 256;
+    int         paged_attention_max_partitions = 0;
+    int         prefill_chunk  = 0;
+    bool        cap_off        = false;
+
+    bool operator==(const FitLedgerKey& o) const {
+        return arch_hash == o.arch_hash && weights_bytes == o.weights_bytes &&
+               device == o.device && plugin_build == o.plugin_build &&
+               offload_ratio == o.offload_ratio && paged_kv == o.paged_kv &&
+               moe_cpu_tier == o.moe_cpu_tier && lanes == o.lanes &&
+               kv_block_size == o.kv_block_size && slice_logits == o.slice_logits &&
+               drafts_max == o.drafts_max && fit_margin_mib == o.fit_margin_mib &&
+               paged_attention_max_partitions == o.paged_attention_max_partitions &&
+               prefill_chunk == o.prefill_chunk && cap_off == o.cap_off;
+    }
+    bool operator!=(const FitLedgerKey& o) const { return !(*this == o); }
+};
+
+struct FitLedgerEntry {
+    FitLedgerKey key;
+
+    uint64_t    slot_pool          = 0;
+    std::string slot_source;
+    bool        probe_priced_device = false;
+    bool        static_partition_reported = false;
+
+    int         chunk              = 0;
+    int64_t     activation         = 0;
+    int64_t     activation_total   = 0;
+    double      slope              = 0.0;
+    double      intercept          = 0.0;
+    double      slope_extra        = 0.0;
+
+    uint64_t    slot_host_bytes    = 0;
+    std::string slot_host_source;
+};
+
+inline nlohmann::json fit_ledger_key_to_json(const FitLedgerKey& k) {
+    return {
+        {"arch_hash",          k.arch_hash},
+        {"weights_bytes",      k.weights_bytes},
+        {"device",             k.device},
+        {"plugin_build",       k.plugin_build},
+        {"offload_ratio",      k.offload_ratio},
+        {"paged_kv",           k.paged_kv},
+        {"moe_cpu_tier",       k.moe_cpu_tier},
+        {"lanes",              k.lanes},
+        {"kv_block_size",      k.kv_block_size},
+        {"slice_logits",       k.slice_logits},
+        {"drafts_max",         k.drafts_max},
+        {"fit_margin_mib",     k.fit_margin_mib},
+        {"paged_attention_max_partitions", k.paged_attention_max_partitions},
+        {"prefill_chunk",      k.prefill_chunk},
+        {"cap_off",            k.cap_off}
+    };
+}
+
+inline FitLedgerKey fit_ledger_key_from_json(const nlohmann::json& j) {
+    FitLedgerKey k;
+    k.arch_hash      = j.at("arch_hash").get<std::string>();
+    k.weights_bytes  = j.at("weights_bytes").get<uint64_t>();
+    k.device         = j.at("device").get<std::string>();
+    k.plugin_build   = j.at("plugin_build").get<std::string>();
+    k.offload_ratio  = j.at("offload_ratio").get<int>();
+    k.paged_kv       = j.at("paged_kv").get<std::string>();
+    k.moe_cpu_tier   = j.at("moe_cpu_tier").get<bool>();
+    k.lanes          = j.at("lanes").get<int>();
+    k.kv_block_size  = j.at("kv_block_size").get<int>();
+    k.slice_logits   = j.at("slice_logits").get<bool>();
+    k.drafts_max     = j.at("drafts_max").get<int>();
+    k.fit_margin_mib = j.at("fit_margin_mib").get<int>();
+    k.paged_attention_max_partitions = j.at("paged_attention_max_partitions").get<int>();
+    if (j.contains("prefill_chunk")) k.prefill_chunk = j.at("prefill_chunk").get<int>();
+    if (j.contains("cap_off"))       k.cap_off       = j.at("cap_off").get<bool>();
+    return k;
+}
+
+inline nlohmann::json fit_ledger_entry_to_json(const FitLedgerEntry& e) {
+    nlohmann::json j;
+    j["key"]                       = fit_ledger_key_to_json(e.key);
+    j["slot_pool"]                 = e.slot_pool;
+    j["slot_source"]               = e.slot_source;
+    j["probe_priced_device"]       = e.probe_priced_device;
+    j["static_partition_reported"] = e.static_partition_reported;
+    j["chunk"]                     = e.chunk;
+    j["activation"]                = e.activation;
+    j["activation_total"]          = e.activation_total;
+    j["slope"]                     = e.slope;
+    j["intercept"]                 = e.intercept;
+    j["slope_extra"]               = e.slope_extra;
+    j["slot_host_bytes"]           = e.slot_host_bytes;
+    j["slot_host_source"]          = e.slot_host_source;
+    return j;
+}
+
+inline FitLedgerEntry fit_ledger_entry_from_json(const nlohmann::json& j) {
+    FitLedgerEntry e;
+    e.key                       = fit_ledger_key_from_json(j.at("key"));
+    e.slot_pool                 = j.at("slot_pool").get<uint64_t>();
+    e.slot_source               = j.at("slot_source").get<std::string>();
+    e.probe_priced_device       = j.at("probe_priced_device").get<bool>();
+    e.static_partition_reported = j.at("static_partition_reported").get<bool>();
+    e.chunk                     = j.at("chunk").get<int>();
+    e.activation                = j.at("activation").get<int64_t>();
+    e.activation_total          = j.at("activation_total").get<int64_t>();
+    e.slope                     = j.at("slope").get<double>();
+    e.intercept                 = j.at("intercept").get<double>();
+    e.slope_extra               = j.at("slope_extra").get<double>();
+    e.slot_host_bytes           = j.at("slot_host_bytes").get<uint64_t>();
+    e.slot_host_source          = j.at("slot_host_source").get<std::string>();
+    return e;
+}
+
+// Read a ledger entry from a JSON file. Returns std::nullopt on any I/O
+// or parse failure — the caller treats a missing/corrupt ledger identically
+// to "no ledger" and runs the probes.
+inline std::optional<FitLedgerEntry> fit_ledger_read(const std::string& path) {
+    std::ifstream f(path);
+    if (!f.is_open()) return std::nullopt;
+    try {
+        nlohmann::json j;
+        f >> j;
+        return fit_ledger_entry_from_json(j);
+    } catch (const std::exception&) {
+        return std::nullopt;
+    }
+}
+
+// Write a ledger entry to a JSON file. Returns true on success.
+inline bool fit_ledger_write(const std::string& path, const FitLedgerEntry& e) {
+    std::ofstream f(path);
+    if (!f.is_open()) return false;
+    try {
+        f << fit_ledger_entry_to_json(e).dump(2) << '\n';
+        return f.good();
+    } catch (const std::exception&) {
+        return false;
+    }
+}
+
+// Build the ledger file path from the directory and the key's arch_hash.
+// One file per artifact topology, overwritten when the key changes.
+inline std::string fit_ledger_path(const std::string& dir, const std::string& arch_hash) {
+    if (dir.empty() || arch_hash.empty()) return {};
+    return dir + "/fit-" + arch_hash.substr(0, 16) + ".json";
 }
 
 }  // namespace lgc

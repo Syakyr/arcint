@@ -1,4 +1,4 @@
-# kquant-host-storage — the M14 host tier computing K-quant blocks natively, VRAM untouched
+# kquant-host-storage — the M14 host tier computing K-quant blocks natively
 
 ## The defect, as measured
 
@@ -73,10 +73,12 @@ lose, per the backlog row — not a pass/fail threshold themselves
 
 ## Entry criteria
 
-Not met; both block starting the kernel work. (1) `sub4bit-vram-kernel`'s
-resident-format measurement — it decides whether K-quant blocks are the
-format at all, or whether `u3` group-quant wins on the one expert layer
-that campaign measures; unrun there, so unmet here. (2) The `iq3xxs_grid`
+Not met. (1) The resident-format measurement — K-quant blocks vs `u3`
+group-quant on one expert layer, same f16 source, same calibration,
+against the int4 baseline — unrun. This is shared prework with
+`sub4bit-vram-kernel`'s cache-headroom lever but no longer gated on that
+campaign's completion: this campaign's own host kernel work can proceed
+once the format is decided by either campaign's measurement. (2) The `iq3xxs_grid`
 and sibling constants vendored under the `THIRD_PARTY.md` convention
 (MIT, ik_llama.cpp lineage credited, licenses unchanged) — checked: not
 present. `THIRD_PARTY.md` today lists only cpp-httplib, nlohmann/json and
@@ -92,8 +94,9 @@ the existing one; the host-pool byte count and decode measurement at the
 reference cell; vendoring the grid constants; re-verifying the corrected
 equivalence gate on the new path.
 
-Out: `sub4bit-vram-kernel`'s GPU kernel and VRAM claim — a different
-currency (disk/host-pool bytes here, VRAM there) and a different gate,
+Out: `sub4bit-vram-kernel`'s GPU kernel and routing-aware expert
+execution — a different scope (disk/host-pool bytes here, the per-expert
+kernel and GPU LRU cache there) and a different gate,
 separated by DESIGN §7.0.2ah on purpose; the static partition's prefill
 and cold-start costs (`static-partition-prefill`, `static-partition-cold-
 start`); the per-expert bpw map's artifact format (decided by the other

@@ -925,7 +925,7 @@ scope:
 | **IQ4_NL (measured artifact, WP2)** | **26.82 GiB** (51.2 G elems measured, not the 52.45 G estimate; 90 B/160-wide row) | fits alone | ~21.2 GiB left -- see the WP6 close below, where that is not enough |
 | Q4_0 (shipped) | 27.48 GiB (~29.5 GB decimal) | fits alone | ~20.5 GiB left for everything else |
 | Q4_1 | 30.53 GiB | fits alone | ~17.5 GiB left -- **the same RAM FIX E's host-resident expert pool wants** (HANDOFF-0.5.0.local.md's own framing) |
-| Q8_0 | 51.90 GiB | **does not fit** | refused outright, `host_ram_fit_must_refuse` is unconditionally true regardless of `expert_pool_bytes` |
+| Q8_0 | 51.90 GiB | **exceeds host RAM** | refused outright, `host_ram_fit_must_refuse` is unconditionally true regardless of `expert_pool_bytes` |
 
 (WP2 measured the real Unsloth UD-Q3_K_XL artifact: the PLE table ships as
 GGUF dtype 20 = `GGML_TYPE_IQ4_NL`, [160, 320001536] = 51.2 G elements,
@@ -970,17 +970,13 @@ Memory in scope: host **48 GiB**; the dev pair's two Intel cards give **≈37.7
 GiB usable** combined (a ~24 GiB and a ~16 GiB card; 22.71 + ~15). Combined
 device+host ≈ **85.7 GiB**.
 
-**It does not fit FULLY-RESIDENT.** (Reframed 2026-09-10 per the standing
-directive: a bare "does not fit" is banned — it was never established. What is
-measured below is a verdict against a *fully-resident serving plan*, and
-fully-resident is NOT the plan; it is the assumption this milestone exists to
-dissolve. A milestone that fit the conventional way would not need us.) The
-fully-resident numbers, which stay in the record as legitimate measured facts:
+**Fully-resident arithmetic (for the record; fully-resident is NOT the plan).**
+The streaming plan that serves this model is in WP6b below. The fully-resident
+numbers stay as measured facts about a plan nobody is pursuing:
 
 - *Total-memory view, fully resident.* Weights alone are 85.38 GiB against 85.7
   GiB of combined device+host memory — ~0.3 GiB of slack before a single byte
-  of KV pool, activation reservation, or allocator margin. So a plan that holds
-  every weight resident at once does not fit.
+  of KV pool, activation reservation, or allocator margin.
 - *Host-resident-pool view, fully resident (table host-resident + the entire
   expert pool host-resident).* Host needs the PLE table (26.82 GiB) + the full
   56.25 GiB expert pool = 83.07 GiB against 48 GiB — over by ~35 GiB; even an
@@ -1007,8 +1003,8 @@ pinned (above); table page locality and MTP acceptance are the amortizers.
 The answer is the **fit study** below, which operationalizes this:
 route-trace -> LRU replay -> hit-rate vs miss-tier cost vs MTP acceptance,
 ending with the smallest working configuration on a single A770 and what each
-knob is worth in GiB or t/s. "It does not fit the traditional way — therefore
-we operationalize the science" is the milestone's own sentence.
+knob is worth in GiB or t/s. The streaming plan is the milestone's own
+answer; the fully-resident plan was never the target.
 
 ### WP6b — streaming fit study (measured, 2026-09-10)
 
@@ -1079,9 +1075,9 @@ not need to be resident.
   VRAM expert LRU, but KV-4-bit/u8 needs its own KLD cell first.
 
 No capacity statement here is bare: each is a verdict against a named residency
-plan. The fully-resident plan does not fit (WP6); the **streaming plan fits one
-A770 at ~18 t/s as-shipped and ~30-40 t/s with an MTP head re-exported**, with
-a fast (NVMe) miss tier as the prerequisite.
+plan. The **streaming plan fits one A770 at ~18 t/s as-shipped and ~30-40 t/s
+with an MTP head re-exported**, with a fast (NVMe) miss tier as the
+prerequisite.
 
 ### Link 1: synthetic table generator (2026-09-10)
 

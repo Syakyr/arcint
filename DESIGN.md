@@ -4452,16 +4452,20 @@ check, and DP4A is the path. It says nothing about OpenVINO, and it does not
 make the A770 a control group for this question. A second card is only a
 contrast if it is measured on the same stack.
 
-#### 7.0.2ah M10 re-scoped: the gate is priced in VRAM, and only a new kernel pays in that currency (2026-09-05)
+#### 7.0.2ah M10 re-scoped: the per-expert kernel bypasses the MoE fusion for routing-aware expert execution (2026-09-05; reframed 2026-09-15)
 
-**The decision (operator, 2026-09-05).** 0.3.0 ships with M10 re-scoped as
-§7.0.2y proposed: the context claim the row was written to buy is
-discharged by M8's u8:i4 flag (+28.3% on the 24 GB card, +28.4% on the
-16 GiB card, §7.0.2y's table, measured); the VRAM-resident sub-4-bit
-expert path is a new GPU-kernel milestone and is backlogged to 0.3.1
-(`docs/milestone-0.3.0.md`, "Backlog for 0.3.1"); the host-side
+**The decision (operator, 2026-09-05; reframed 2026-09-15).** 0.3.0 ships
+with M10 re-scoped as §7.0.2y proposed: the context claim the row was
+written to buy is discharged by M8's u8:i4 flag (+28.3% on the 24 GB
+card, +28.4% on the 16 GiB card, §7.0.2y's table, measured); the
+per-expert GEMM kernel with in-kernel dequant — bypassing the MoE fusion
+for routing-aware expert execution (GPU LRU cache, compute only the
+routed experts, host miss tier; the FreeToken architecture on Intel's
+kernel library) — is a new GPU-kernel milestone and is backlogged to
+0.3.1 (`docs/milestone-0.3.0.md`, "Backlog for 0.3.1"); the host-side
 sub-4-bit storage question stays attached to M14 as a candidate
-extension, also 0.3.1. No M10 code was written for 0.3.0.
+extension, also 0.3.1. Sub-4-bit precision is one cache-headroom lever,
+not a gate. No M10 code was written for 0.3.0.
 
 **The recon that informed it** — a bounded read of the sources, no code,
 recorded here in its public-safe form (the working note is
@@ -4494,14 +4498,14 @@ operator-local):
   stands as the order of magnitude. Per-expert uniformity is structural:
   one element type per layer per tensor in the batched form, one byte
   count per expert in the offload provider's per-expert bin ranges.
-- *The gate, resolved.* Its currency is VRAM — "≥ 15% more max context"
-  is KV headroom after weights. Route 2 as written (K-quant import,
-  dequant to int4 at load) leaves int4 resident and is byte-identical to
-  the baseline on the gated axis; its real wins (disk, host pool bytes, a
-  host kernel computing the blocks natively) are M14's territory. Route 1
-  (NNCF `u3`) needs the same new kernel. The routes converge; what
-  remains is the resident format — `u3` group-quant or K-quant blocks —
-  decidable by measurement on one expert layer once a kernel path exists.
+- *The gate, resolved (reframed 2026-09-15).* The original M10 gate
+  ("≥ 15% more max context") is discharged by u8:i4. The remaining work
+  is the per-expert kernel that bypasses the MoE fusion — the mechanism
+  that makes routing-aware expert execution possible (compute only the
+  routed experts, GPU LRU cache, host miss tier). Both routes (NNCF `u3`
+  and K-quant import) need that kernel; what remains is the resident
+  format — `u3` group-quant or K-quant blocks — decidable by measurement
+  on one expert layer once a kernel path exists.
 - *Magnitude, bounded from the record (an estimate, not a measurement).*
   The coder's experts are ≈ 85% of its parameters (184 × 3 × 2048 × 512
   × 40 layers ≈ 23.2B of 27B), ≈ 10.9 GiB of the 12.8 GiB int4 weights;
@@ -4511,10 +4515,11 @@ operator-local):
   The byte count is not the obstacle; the kernel is the milestone. The
   dense 27B has no experts, so M10 never touched the 24 GB card's agent.
 
-**Carried to 0.3.1.** (1) The VRAM-resident sub-4-bit expert path: a
-matcher for the new element type, an oneDNN bypass, GEMV/GEMM with
-in-kernel dequant, judged by a fusion-impact profile (ground rule 2), with
-a decode regression of known sign (§7.0.3's u4-KV precedent). (2) The two
+**Carried to 0.3.1 (reframed 2026-09-15).** (1) The per-expert GEMM
+kernel with in-kernel dequant, bypassing the MoE fusion for routing-aware
+expert execution: an oneDNN bypass, GEMV/GEMM with in-kernel dequant,
+judged by a fusion-impact profile (ground rule 2), with a decode
+regression of known sign (§7.0.3's u4-KV precedent). (2) The two
 pre-work measurements: the `INT3_SYM` smoke test, and the routing
 histogram (patch 0013, `MOE_OTD_ROUTING_HIST`) over a longer corpus — the
 acceptance prompt alone left most of 7,360 experts at 0–2 routings, no

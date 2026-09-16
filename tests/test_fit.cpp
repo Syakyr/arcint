@@ -3197,3 +3197,131 @@ TEST(logits_slice_expected_rows_is_bounded_by_the_probe_tokens) {
     CHECK_EQ(logits_slice_rows_expected(1, 1), static_cast<size_t>(1));    // plain decode slice
     CHECK_EQ(logits_slice_rows_expected(1, 64), static_cast<size_t>(1));
 }
+
+
+// --------------------------------------------------------- FitLedger
+
+FitLedgerKey sample_key() {
+    FitLedgerKey k;
+    k.arch_hash      = "abc123def456";
+    k.weights_bytes  = 18600000000ull;
+    k.device         = "GPU.0";
+    k.plugin_build   = "2026.4.0-17504-p5";
+    k.offload_ratio  = 50;
+    k.paged_kv       = "u8";
+    k.moe_cpu_tier   = true;
+    k.lanes          = 1;
+    k.kv_block_size  = 32;
+    k.slice_logits   = true;
+    k.drafts_max     = 0;
+    k.fit_margin_mib = 256;
+    k.paged_attention_max_partitions = 0;
+    k.prefill_chunk  = 512;
+    k.cap_off        = false;
+    return k;
+}
+
+FitLedgerEntry sample_entry() {
+    FitLedgerEntry e;
+    e.key                       = sample_key();
+    e.slot_pool                 = 120 * kMiB;
+    e.slot_source               = "probe-static";
+    e.probe_priced_device       = true;
+    e.static_partition_reported = true;
+    e.chunk                     = 1024;
+    e.activation                = static_cast<int64_t>(650 * kMiB);
+    e.activation_total          = static_cast<int64_t>(650 * kMiB);
+    e.slope                     = 5120.0;
+    e.intercept                 = 500000000.0;
+    e.slope_extra               = 0.0;
+    e.slot_host_bytes           = 7 * kGiB;
+    e.slot_host_source          = "ir";
+    return e;
+}
+
+TEST(fit_ledger_key_json_round_trip) {
+    const FitLedgerKey k = sample_key();
+    const nlohmann::json j = fit_ledger_key_to_json(k);
+    const FitLedgerKey k2 = fit_ledger_key_from_json(j);
+    CHECK(k == k2);
+}
+
+TEST(fit_ledger_entry_json_round_trip) {
+    const FitLedgerEntry e = sample_entry();
+    const nlohmann::json j = fit_ledger_entry_to_json(e);
+    const FitLedgerEntry e2 = fit_ledger_entry_from_json(j);
+    CHECK(e.key == e2.key);
+    CHECK_EQ(e.slot_pool, e2.slot_pool);
+    CHECK_EQ(e.slot_source, e2.slot_source);
+    CHECK_EQ(e.probe_priced_device, e2.probe_priced_device);
+    CHECK_EQ(e.chunk, e2.chunk);
+    CHECK_EQ(e.activation, e2.activation);
+    CHECK_EQ(e.activation_total, e2.activation_total);
+    CHECK_NEAR(e.slope, e2.slope, 0.001);
+    CHECK_NEAR(e.intercept, e2.intercept, 0.001);
+    CHECK_NEAR(e.slope_extra, e2.slope_extra, 0.001);
+    CHECK_EQ(e.slot_host_bytes, e2.slot_host_bytes);
+    CHECK_EQ(e.slot_host_source, e2.slot_host_source);
+}
+
+TEST(fit_ledger_file_round_trip) {
+    const FitLedgerEntry e = sample_entry();
+    const std::string path = "/tmp/test_fit_ledger.json";
+    CHECK(fit_ledger_write(path, e));
+    const auto loaded = fit_ledger_read(path);
+    CHECK(loaded.has_value());
+    CHECK(loaded->key == e.key);
+    CHECK_EQ(loaded->slot_pool, e.slot_pool);
+    CHECK_EQ(loaded->chunk, e.chunk);
+    std::remove(path.c_str());
+}
+
+TEST(fit_ledger_read_missing_file_returns_nullopt) {
+    const auto loaded = fit_ledger_read("/tmp/nonexistent_fit_ledger_12345.json");
+    CHECK(!loaded.has_value());
+}
+
+TEST(fit_ledger_key_mismatch_detected) {
+    FitLedgerKey k1 = sample_key();
+    FitLedgerKey k2 = sample_key();
+    CHECK(k1 == k2);
+    k2.offload_ratio = 30;
+    CHECK(k1 != k2);
+}
+
+TEST(fit_ledger_key_prefill_chunk_mismatch) {
+    FitLedgerKey k1 = sample_key();
+    FitLedgerKey k2 = sample_key();
+    k2.prefill_chunk = 256;
+    CHECK(k1 != k2);
+}
+
+TEST(fit_ledger_key_cap_off_mismatch) {
+    FitLedgerKey k1 = sample_key();
+    FitLedgerKey k2 = sample_key();
+    k2.cap_off = true;
+    CHECK(k1 != k2);
+}
+
+TEST(fit_ledger_key_from_json_missing_new_fields_defaults) {
+    FitLedgerKey k = sample_key();
+    nlohmann::json j = fit_ledger_key_to_json(k);
+    j.erase("prefill_chunk");
+    j.erase("cap_off");
+    FitLedgerKey k2 = fit_ledger_key_from_json(j);
+    CHECK_EQ(k2.prefill_chunk, 0);
+    CHECK_EQ(k2.cap_off, false);
+}
+
+TEST(fit_ledger_path_uses_arch_hash_prefix) {
+    const std::string p = fit_ledger_path("/cache", "abc123def4567890abcdef");
+    CHECK_EQ(p, std::string("/cache/fit-abc123def4567890.json"));
+}
+
+TEST(fit_ledger_path_empty_dir_returns_empty) {
+    CHECK_EQ(fit_ledger_path("", "abc123"), std::string(""));
+}
+
+TEST(fit_ledger_path_empty_hash_returns_empty) {
+    CHECK_EQ(fit_ledger_path("/cache", ""), std::string(""));
+}
