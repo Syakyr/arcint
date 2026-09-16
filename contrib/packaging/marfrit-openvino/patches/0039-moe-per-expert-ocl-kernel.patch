@@ -56,7 +56,7 @@
 
 diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe_expert_swiglu.cl b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe_expert_swiglu.cl
 new file mode 100644
-index 0000000000..a1b2c3d4e5
+index 0000000..2a9b672
 --- /dev/null
 +++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe_expert_swiglu.cl
 @@ -0,0 +1,466 @@
@@ -526,32 +526,6 @@ index 0000000000..a1b2c3d4e5
 +                        (half*)x2, (float*)xg_sum);
 +#endif
 +}
-diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_perf.hpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_perf.hpp
-index b1c3a5d21..c2d4e6f32 100644
---- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_perf.hpp
-+++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_perf.hpp
-@@ -40,4 +40,9 @@ struct OtdPerfCounters {
-     // this equals zero while _per_expert_dispatch is on, nothing was routed.
-     std::atomic<uint64_t> per_expert_dispatches{0};
- 
-+    // arcint (patch 0039, campaign: sub4bit-vram-kernel). Counts per-expert
-+    // GPU kernel invocations (expert_gate_up + expert_down = 2 per expert).
-+    // Distinguishes GPU kernel use from CPU-tier fallback.
-+    std::atomic<uint64_t> per_expert_gpu_invocations{0};
-+
-     // arcint M9 (patches/0004, P0 counters).
-diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_runtime.cpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_runtime.cpp
-index c9e2d1a30..d3f4e2b41 100644
---- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_runtime.cpp
-+++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_runtime.cpp
-@@ -56,6 +56,7 @@ void OtdPerfCounters::dump() const {
-                    << ", grouped_fallbacks=" << grouped_fallbacks.load(std::memory_order_relaxed)
-                    << ", hybrid_prefill_layers=" << hybrid_prefill_layers.load(std::memory_order_relaxed)
-                    << ", per_expert_dispatches=" << per_expert_dispatches.load(std::memory_order_relaxed)
-+                   << ", per_expert_gpu_invocations=" << per_expert_gpu_invocations.load(std::memory_order_relaxed)
-                    << ", created_onednn_kernels=" << created_onednn_kernels.load(std::memory_order_relaxed)
-                    // arcint M9 (patches/0004-0006): eviction/acquisition accounting, the
-                    // compile-time device/host slot-tier split and its fallback count, and
 diff --git a/src/plugins/intel_gpu/tests/unit/test_cases/moe_3gemm_gpu_test.cpp b/src/plugins/intel_gpu/tests/unit/test_cases/moe_3gemm_gpu_test.cpp
 index d4e1c2a50..e5f3g4h56 100644
 --- a/src/plugins/intel_gpu/tests/unit/test_cases/moe_3gemm_gpu_test.cpp
