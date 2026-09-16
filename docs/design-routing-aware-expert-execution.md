@@ -1,0 +1,392 @@
+# Routing-aware expert execution — design note
+
+Campaign: `docs/campaigns/sub4bit-vram-kernel.md`.
+Gate: a model with ≥ 512 experts serves on one card with routing-aware expert
+execution — only the routed experts computed per token, a GPU LRU cache
+holding the hot set, misses fed from the host pool. Prüfstand 10/10;
+greedy output byte-identical across two cold starts (§3.4).
+
+---
+
+## §1 — what this replaces and why
+
+The plugin's MoE fusion (`moe_3gemm_swiglu_opt.cpp`, matcher
+`keep_moe_3gemm_const_precision.cpp`) stacks every expert's gate/up/down
+weights into one `[num_slots, …]` constant tensor per layer per kind and
+computes them all in one fused kernel. The fusion's own matcher requires u4
+Constants on all twelve weight and zero-point inputs (DESIGN §7.0.2ah,
+`measured-here`). A host-resident expert cannot be a Constant (the plugin
+stages every Constant in host memory at compile — 66 GiB for 48 layers,
+DESIGN §7.0.2 CORRECTION III). Leaving Constant-land for Parameters loses
+the fusion and with it the routing: every expert computes for every token
+(window-051 B.3: 7.06× device residency per layer, 623× warm forward,
+`measured-here`). At `num_experts_per_tok: 10` of 512, that is 51.2× the
+expert work the architecture requires.
+
+The per-expert kernel this design describes bypasses the fusion entirely.
+It takes one expert's packed u4 weights, dequantises in-kernel (in
+registers, never materialised), and computes the SwiGLU MLP
+`down(SiLU(gate(x)) · up(x))` for the routed tokens only. Combined with
+the GPU LRU cache (§3) and the host miss tier (§4), this is the mechanism
+FreeToken implements (`code`: `~/src/FreeToken-ref`,
+`docs/research-freetoken-code.md`) — ported to the OpenVINO GPU plugin's
+kernel infrastructure.
+
+The fusion stays for the fully-resident case (the 35B coder at ratio ≤ 75,
+where the slot pool fits in Constants). The per-expert kernel activates
+when the offload tier is live AND the expert count exceeds the resident slot
+capacity — the Flash-Next regime.
+
+---
+
+## §2 — the per-expert kernel contract
+
+### §2.1 — operation
+
+The MoE expert MLP is a SwiGLU block:
+
+    hidden_out = down_proj(SiLU(gate_proj(x)) * up_proj(x))
+
+where `x` is the hidden state of one token (or a batch of tokens) after the
+router has selected this expert, and `hidden_out` is accumulated into the
+layer output weighted by the router's gating coefficient.
+
+The shared expert (`shared_expert_intermediate_size: 640`, 0.31 GiB,
+always computed for every token) is NOT part of this kernel — it runs
+through the backbone's non-MoE path as a device-resident constant.
+
+Three weight matrices per routed expert per layer:
+- `gate_proj`: `[moe_intermediate_size, hidden_size]` — 640 × 2560 for
+  Flash-Next
+- `up_proj`: `[moe_intermediate_size, hidden_size]` — 640 × 2560
+- `down_proj`: `[hidden_size, moe_intermediate_size]` — 2560 × 640
+
+At int4 (0.5 B/element): 2,457,600 bytes per expert per layer
+(`measured-here`, `docs/design-qwen-flash-next.md` Fit table).
+
+### §2.2 — inputs and outputs
+
+**Inputs** to the kernel, per expert invocation:
+1. Packed u4 weight bytes for gate, up, down — from the GPU LRU slot or
+   the host pool (§4). Shape: the three matrices concatenated or addressed
+   separately. Group scales and zero-points in their existing format
+   (f16 scales, u4 zero-points, per the artifact's group-quantisation
+   layout).
+2. Hidden state `x` — the tokens routed to this expert. f16 on the plugin's
+   served path. For decode: one token, shape `[1, hidden_size]` (GEMV). For
+   prefill: a batch, shape `[n_tokens, hidden_size]` (GEMM).
+3. Router gating weight — f16 scalar per token, from the top-k softmax.
+
+**Output**: the weighted expert contribution, shape `[n_tokens, hidden_size]`,
+accumulated (index_add) into the layer's MoE output tensor. The accumulation
+is the same `scatter_reduce` / `index_add` path the existing grouped-GEMM
+and per-expert-onednn paths use (patch 0037's `host_only` path is the
+model).
+
+### §2.3 — in-kernel dequant
+
+The u4 weight bytes reach the kernel in their packed form (two elements per
+byte, low nibble = element 2j, high nibble = element 2j+1 — the same
+packing as `moe_3gemm_swiglu_mlp.cl`, derived in patch 0011's header from
+the generated kernel's lane pattern). Dequantisation happens inside the
+GEMV/GEMM K-loop:
+
+    w_f16 = (nibble - zero_point) * scale
+
+where `zero_point` and `scale` are per-group (the group size from the
+artifact, typically 128). The f16 multiplication with the hidden-state
+element and the partial-sum accumulation happen in the same register pass.
+No intermediate f16 or f32 weight tensor is ever written to memory.
+
+This is the same mechanism FreeToken uses for all three of its supported
+formats (`code`: `_BANK_SCHEMAS` comments in `offload_cache.py` — "dequantizes
+in the K-loop (no bf16 materialization)" for fp8_block, "dequantized inside the
+borrowed ggml MoE kernels" for q4_0, "Triton inline-dequant kernels" for nvfp4).
+
+### §2.4 — kernel technology
+
+The plugin's own OCL kernel infrastructure (`moe_3gemm_swiglu_mlp.cl` and
+its micro-GEMM path) is the implementation target. The per-expert kernel is
+a new `.cl` file (or an extension of the existing MLP kernel) that:
+
+- Takes a single expert's weight pointers instead of the stacked
+  `[num_slots, …]` tensor
+- Reads packed u4 bytes and dequants in the subgroup work-items
+- Uses the same subgroup size (32 on A770 Xe-HPG / B60 Xe2) and tiling
+  as the existing GEMV path
+- Handles both GEMV (decode, 1 token) and GEMM (prefill, batched) via a
+  token-count parameter
+
+The oneDNN GEMM path is not used for the per-expert kernel. oneDNN's type
+table includes `{u4, i4, u8, i8}` (DESIGN §7.0.2ah), but it has no
+packed-u4-with-group-dequant GEMV — the in-kernel dequant (per-group
+scale and zero-point applied inside the K-loop) requires a custom kernel,
+not an oneDNN matmul with a u4 descriptor. The kernel is a direct OCL
+dispatch through the plugin's `ocl::typed_primitive_impl` infrastructure.
+
+### §2.5 — dispatch logic
+
+At MoE layer execution time, when the per-expert kernel is active:
+
+1. Read the router's top-k output: `expert_ids[n_tokens, top_k]` and
+   `gating_weights[n_tokens, top_k]`.
+2. For each unique expert in the batch:
+   a. Look up the GPU LRU cache (§3). If resident → device kernel.
+   b. If not resident → host miss tier (§4).
+3. Device-resident experts: batch their tokens and dispatch the per-expert
+   OCL kernel. One kernel launch per expert (not per token) — the kernel
+   handles the token batch internally.
+4. Host-tier experts: dispatch to `moe_cpu_expert` (patch 0011), the
+   existing AVX2/scalar host GEMV. FreeToken's `q*` split (§4) caps the
+   per-step fetch count.
+5. Accumulate all expert outputs into the layer output tensor via the
+   existing `index_add` / `scatter_reduce` path.
+
+This replaces the fusion's path entirely for the offload case. The fusion
+still runs for the non-offload (fully-resident Constants) case.
+
+**The red-first cells the campaign requires:**
+- A cell proving the fused path is refused when the per-expert kernel is
+  available (the fusion matcher does not fire; the per-expert dispatch does).
+- A cell proving an unrouted expert is never computed (the kernel launch
+  count equals the number of unique routed experts, not `num_expert`).
+
+---
+
+## §3 — GPU LRU expert cache
+
+### §3.1 — what exists
+
+Patches 0005–0007 ship a device-resident slot pool with async upload:
+`expert_slot_bytes(num_expert, ratio_pct, per_expert_bytes, moe_layers)`
+(fit.h) sizes it, the plateau probe measures actual device residency, and
+the LRU cache (patch 0012) manages eviction. The slot pool holds expert
+weights in the plugin's own constant format — the stacked tensor the fusion
+consumes.
+
+For Flash-Next the slot pool must change shape:
+- 512 experts per layer, 48 layers
+- Per-expert slot: 2,457,600 bytes (int4)
+- Full pool: 56.25 GiB — no card holds it
+- At ~24 GiB resident (~42% of pool): ~217 slots/layer, 95.0% hit rate
+  (WP6b table, `measured-here` LRU replay; the per-layer replay tool
+  reproduces 94.4% on the same trace — within the ~1.4-point spread the
+  cache-model correction in `design-qwen-flash-next.md` records)
+
+### §3.2 — the extended cache
+
+The GPU LRU cache is a per-layer slot table indexed by `(layer, expert_id)`,
+keyed `l·E+e` as FreeToken does (`code`: `offload_cache.py`,
+`_BANK_SCHEMAS`). Each slot holds one expert's three weight matrices
+(gate/up/down) plus their group scales and zero-points, in packed u4 form.
+No widening: the bytes on disk are the bytes in the slot.
+
+**Eviction policy**: LRU by last-routing time, the same policy the existing
+`moe_lru_cache` (patch 0012) implements. The per-layer LRU model is
+retained (each layer manages its own slots independently) — the WP6b fit
+study's hit-rate table is calibrated against this model, and a global LRU
+reads a materially more optimistic hit rate on the same trace
+(`docs/serving-config-flash-next.md`).
+
+**Slot allocation**: the VRAM share of the resident pool is sized by the
+fit pass (the existing `expert_slot_bytes` arithmetic, unchanged). The DRAM
+share is host-mapped USM memory (`usm_host` on the plugin's allocator) that
+the per-expert kernel can read directly over PCIe — the same mechanism
+patch 0017's readback decomposition uses for the existing host tier.
+
+**Upload path**: on a cache miss, the expert's packed bytes are read from
+the host pool (DRAM-resident mmap of the GGUF expert shards, or NVMe-backed
+mmap with page faults) and uploaded to a VRAM slot via the existing async
+upload ring (patches 0005–0006). The upload is one contiguous copy of
+2,457,600 bytes — at the A770's measured H2D bandwidth (~1.8 GB/s, PCIe 3.0
+x4, `docs/design-qwen-flash-next.md` WP2 / `project-a770-chipset-link.md`)
+that is ~1.3 ms per expert. At 95% hit (24 misses per token across 48
+layers), uploading ALL misses costs ~31 ms — the ceiling when every miss
+is fetched to VRAM. Under the `q*` split (§4), some misses go to the
+host CPU tier instead of uploading, so the actual GPU stall is less. At
+the B60's PCIe 4.0 x8 (~14.3 GB/s): ~0.17 ms per expert.
+
+### §3.3 — §3.4 invariant: deterministic cache order
+
+DESIGN §3.4 requires history-independent greedy output: the served answer
+must not depend on which experts happen to be resident. FreeToken preserves
+this with a deterministic cache-fill order (`code`:
+`offload_cache.py:ensure_experts` fills in the router's own id order).
+
+arcint's mechanism: on a cold start, the cache is empty. The first
+forward's router selects its top-k; the cache fills in expert-id order
+within each layer (ascending id, breaking ties deterministically). Every
+subsequent forward evicts and fills in the same order. Because the router
+is a pure function of (hidden state, layer), and the hidden state depends
+only on (seed, prompt, prior tokens) — never on cache state — the set of
+experts routed at each step is identical across cold starts, and the fill
+order is deterministic from the routing order.
+
+The static partition's existing `splitmix64(seed, layer_key, expert)`
+ranking (patch 0018) is a separate mechanism for the partially-offloaded
+case and does not apply here — the LRU cache is the policy for the
+streaming case where no expert is guaranteed resident.
+
+---
+
+## §4 — host miss-tier integration
+
+### §4.1 — FreeToken's `q*` split, adapted
+
+FreeToken's `ensure_experts_hybrid` (`code`: `offload_cache.py:855`) caps
+the number of misses fetched to the GPU per decode step at
+`hybrid_max_fetch`. Overflow misses get slot id `−1` and are computed on
+the CPU. This bandwidth-adaptive split avoids stalling the GPU pipeline on
+slow uploads.
+
+arcint's adaptation uses the same structure:
+
+1. The router selects `top_k` experts per token (10 for Flash-Next).
+2. The GPU LRU cache is consulted. Resident experts → device kernel.
+3. Of the non-resident experts, up to `max_gpu_fetch` are uploaded to
+   newly-evicted slots and computed on the device after upload completes.
+4. The remainder (if any) are dispatched to the existing `moe_cpu_expert`
+   host kernel (patch 0011, AVX2/scalar GEMV on the host CPU).
+
+`max_gpu_fetch` is sized from the measured upload bandwidth and the decode
+latency budget. At the A770's ~1.8 GB/s and a 60 ms/token target:
+
+    budget_bytes = 1.8 GB/s × 0.060 s = 108 MB
+    max_experts  = 108 MB / 2.34 MB/expert ≈ 46
+
+At 95% hit (24 misses per token across 48 layers, ~0.5 per layer), all
+misses fit in the upload budget with room to spare. The cap matters at
+lower hit rates or during cache warm-up.
+
+### §4.2 — host kernel: the existing `moe_cpu_expert`
+
+Patch 0011 ships the host-side per-expert kernel:
+- Mmap weight accessor (`ParallelWeightReader::mapped()`)
+- AVX2 GEMV with the same u4 dequant (derived nibble order, patch 0011
+  header)
+- Scalar fallback for non-AVX2 hosts
+- Persistent worker pool (arcint's `--moe-cpu-tier-threads`, default =
+  physical cores)
+
+The host kernel already handles the "miss" case in the decode-time tier
+split (patch 0012). For Flash-Next, it handles the overflow from the `q*`
+split above: experts whose upload would exceed the per-step budget.
+
+### §4.3 — prefill path
+
+The hybrid prefill split (patch 0037, campaign: `static-partition-prefill`)
+already implements the device/host dispatch for prefill:
+- Resident experts → grouped-GEMM (the existing batched path)
+- Non-resident → `exec_prefill_onednn` in `host_only` mode
+
+For the per-expert kernel regime, the prefill path follows the same split
+but uses the per-expert OCL kernel instead of the grouped-GEMM for the
+resident subset. The host dispatch for non-resident experts is unchanged.
+
+---
+
+## §5 — Flash-Next specifics
+
+### §5.1 — dimensions (from the served artifact and config)
+
+| | value | source |
+|---|---|---|
+| `hidden_size` | 2560 | config |
+| `moe_intermediate_size` | 640 | config |
+| `num_experts` | 512 | config |
+| `num_experts_per_tok` | 10 | config |
+| MoE layers | 48 | config |
+| per-expert-layer bytes (int4) | 2,457,600 (2.34 MiB) | `3 × hidden × moe_intermediate × 0.5`, `measured-here` |
+| full expert pool | 56.25 GiB | `512 × 2,457,600 × 48` |
+| PLE table | 26.82 GiB | `measured-here`, must be DRAM-resident |
+
+### §5.2 — projected performance (from WP6b, all bandwidth-bound projections)
+
+| resident pool | % of 56.25 GiB | hit % | t/s (NVMe 1.68 GiB/s miss) |
+|---|---|---|---|
+| 16 GiB | 28% | 89.5% | 11 |
+| 24 GiB | 43% | 95.0% | 18 |
+| 32 GiB | 57% | 97.1% | 23 |
+| 40 GiB | 71% | 98.0% | 27 |
+
+These are WP6b's bandwidth-bound projections at MTP amortization 1× (the
+shipped GGUF has no MTP head). With MTP amortization (the acquired head,
+WP8b): 30–40 t/s projected at the 95% hit point.
+
+### §5.3 — per-token work
+
+Per token, per layer: 10 expert invocations (top-k = 10). Per expert:
+- gate GEMV: 640 × 2560 = 1,638,400 MACs
+- up GEMV: 640 × 2560 = 1,638,400 MACs
+- SiLU + elementwise multiply: 640 elements
+- down GEMV: 2560 × 640 = 1,638,400 MACs
+- Total: 4,915,200 MACs per expert per layer
+
+Per token: 10 × 48 × 4,915,200 = 2.36 GMACs — the work that replaces the
+fusion's 512 × 48 × 4,915,200 = 120.8 GMACs (51.2× reduction).
+
+---
+
+## §6 — integration checklist
+
+1. **New OCL kernel file** — the per-expert SwiGLU GEMV/GEMM with in-kernel
+   u4 dequant. Inputs: expert weight pointers (gate/up/down + scales/zp),
+   hidden state, token count. Output: expert contribution tensor.
+2. **Dispatch branch** in `moe_3gemm_swiglu_opt.cpp` — when
+   `is_offloaded()` and expert count exceeds resident slots: read top-k,
+   consult cache, dispatch per-expert kernel for residents, host tier for
+   misses.
+3. **Cache extension** — the slot pool (patches 0005–0007) extended for
+   packed u4 expert weights addressed per-expert (not per stacked constant).
+   The `OffloadExpertWeightProvider`'s `try_acquire_simultaneous` API
+   already returns per-expert slots; the cache manager needs the new
+   per-expert kernel as its consumer instead of the fusion.
+4. **Red-first tests** — (a) fusion refused when per-expert kernel active;
+   (b) unrouted expert never computed (kernel launch count assertion).
+5. **Perf counters** — per-expert kernel invocations, cache hits/misses per
+   layer, host-tier dispatches (extend `OtdPerfCounters`).
+6. **Fit pass** — `expert_slot_bytes` unchanged; the per-expert kernel
+   consumes the same byte budget as the fusion's slot pool.
+
+---
+
+## §7 — what is NOT designed here
+
+- **The MoE fusion matcher** — bypassed, not patched. The fusion still
+  exists and still works for the fully-resident case.
+- **NVMe direct expert fetch** — campaign `nvme-direct-expert-tier`,
+  blocked on an ext4 expert store. The miss tier here is DRAM (host pool)
+  or NVMe-backed mmap page faults.
+- **Host-side K-quant native compute** — campaign `kquant-host-storage`.
+  The host tier here uses the existing int4 dequant, not K-quant blocks.
+- **Sub-4-bit resident format** — the campaign measures int4 vs int3 as a
+  cache-headroom lever after the kernel works at u4. The kernel's dequant
+  logic is parameterised by group size and element width so int3 is a
+  format addition, not a kernel rewrite.
+- **Partition seeding** — campaign `partition-seeding`. The LRU cache here
+  does not seed from a histogram; it warms by demand on the first forward.
+
+---
+
+## §8 — evidence classes
+
+Every claim in this document carries its evidence class:
+
+| claim | class | source |
+|---|---|---|
+| MoE fusion computes all experts per token | `measured-here` | window-051 B.3 |
+| 7.06× device residency, 623× warm forward for ports | `measured-here` | window-051 B.3 |
+| 51.2× expert work at 10 of 512 | `measured-here` | config + B.3 |
+| FreeToken per-expert residency, in-kernel dequant, `q*` split | `code` | `~/src/FreeToken-ref` |
+| per-expert-layer slot = 2,457,600 B (Flash-Next int4) | `measured-here` | Fit table |
+| full pool = 56.25 GiB | `measured-here` | Fit table |
+| LRU hit rates at various resident capacities | `measured-here` | WP6b, `expert_lru_replay.py` |
+| DRAM bandwidth ~44.4 GiB/s | `measured-here` | WP2 |
+| NVMe ~1.68 GiB/s in-container | `measured-here` | WP6b |
+| A770 H2D ~1.8 GB/s (PCIe 3.0 x4) | `measured-here` | WP2 |
+| B60 H2D ~14.3 GB/s (PCIe 4.0 x8) | `measured-here` | WP2 |
+| oneDNN has no 4-bit type | `measured-here` | §7.0.2ah recon |
+| existing slot pool, CPU tier, static partition | `measured-here` | patches 0005–0019 |
+| projected t/s figures | `projection` | WP6b (not a served measurement) |
+| kernel size 800–1,500 lines | `HYPOTHESIS` | §7.0.2y |
+| decode regression sign from in-kernel dequant | `HYPOTHESIS` | §7.0.3 precedent (u4 KV +63%) |
