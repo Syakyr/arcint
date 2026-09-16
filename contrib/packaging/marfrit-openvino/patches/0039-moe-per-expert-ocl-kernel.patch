@@ -533,7 +533,7 @@ index b1c3a5d21..c2d4e6f32 100644
 @@ -40,4 +40,9 @@ struct OtdPerfCounters {
      // this equals zero while _per_expert_dispatch is on, nothing was routed.
      std::atomic<uint64_t> per_expert_dispatches{0};
-
+ 
 +    // arcint (patch 0039, campaign: sub4bit-vram-kernel). Counts per-expert
 +    // GPU kernel invocations (expert_gate_up + expert_down = 2 per expert).
 +    // Distinguishes GPU kernel use from CPU-tier fallback.

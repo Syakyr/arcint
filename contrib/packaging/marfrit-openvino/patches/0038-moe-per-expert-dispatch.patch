@@ -62,10 +62,10 @@ diff --git a/src/inference/include/openvino/runtime/intel_gpu/properties.hpp b/s
 index d2d79b5c..e3a8f1b0 100644
 --- a/src/inference/include/openvino/runtime/intel_gpu/properties.hpp
 +++ b/src/inference/include/openvino/runtime/intel_gpu/properties.hpp
-@@ -212,6 +212,17 @@ static constexpr Property<bool, PropertyMutability::RW> moe_cpu_tier{"MOE_CPU_TI
+@@ -212,6 +212,16 @@ static constexpr Property<bool, PropertyMutability::RW> moe_cpu_tier{"MOE_CPU_TI
   */
  static constexpr Property<size_t, PropertyMutability::RW> moe_cpu_tier_threads{"MOE_CPU_TIER_THREADS"};
-
+ 
 +/**
 + * @brief When true, ALL routed MoE experts bypass the fused GEMV path and
 + * are dispatched individually — initially through the CPU tier (patch 0011),
@@ -89,7 +89,7 @@ index 4609975a..c7d1a82f 100644
  OV_CONFIG_RELEASE_OPTION(ov::intel_gpu, moe_cpu_tier_threads, 0, "Worker threads for the MoE host compute tier. 0 (default) means hardware_concurrency()-1, leaving one core for the dispatch thread. Ignored when moe_cpu_tier is false.")
 +OV_CONFIG_RELEASE_OPTION(ov::intel_gpu, moe_per_expert_dispatch, false, "Bypass the fused MoE GEMV path entirely: all routed experts are dispatched individually (CPU tier initially, per-expert GPU kernel later). Implicitly enables moe_cpu_tier. Campaign: sub4bit-vram-kernel.")
  OV_CONFIG_RELEASE_OPTION(ov, enable_weightless, false, "Enable/Disable weightless blob")
-
+ 
  OV_CONFIG_RELEASE_INTERNAL_OPTION(ov::intel_gpu, enable_zero_copy_cache_load, false, "Enable/Disable zero-copy mode for model cache blob load")
 diff --git a/src/plugins/intel_gpu/src/plugin/compiled_model.cpp b/src/plugins/intel_gpu/src/plugin/compiled_model.cpp
 index cedd926a..f8a3c1e0 100644
@@ -114,15 +114,15 @@ index 96775874..a1c2e3d0 100644
 +        ov::PropertyName{ov::intel_gpu::moe_per_expert_dispatch.name(), PropertyMutability::RW},
          ov::PropertyName{ov::intel_gpu::config_file.name(), PropertyMutability::RW},
      };
-
+ 
 diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.hpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.hpp
 index 4a8c9e21..7b3d1f02 100644
 --- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.hpp
 +++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.hpp
-@@ -148,6 +148,14 @@ public:
+@@ -148,6 +148,13 @@ public:
      bool static_partition_active() const { return _static_partition_active; }
      uint64_t static_partition_checksum() const;
-
+ 
 +    // arcint (patch 0038, campaign: sub4bit-vram-kernel). When set,
 +    // try_acquire_simultaneous marks ALL routed experts as CPU-tier misses
 +    // (kCpuTierSentinelSlot), regardless of residency. The fused GEMV
@@ -139,13 +139,13 @@ index 4a8c9e21..7b3d1f02 100644
      std::vector<int> _static_partition_resident;
 +    bool _per_expert_dispatch = false;
  };
-
+ 
  }  // namespace ov::intel_gpu::ocl::moe
 diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.cpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.cpp
 index 654136e2..a1b2c3d4 100644
 --- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.cpp
 +++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.cpp
-@@ -81,6 +81,37 @@ std::optional<ExpertSlotLease> OffloadExpertWeightProvider::try_acquire_simultan
+@@ -81,2 +81,32 @@ std::optional<ExpertSlotLease> OffloadExpertWeightProvider::try_acquire_simultan
      std::vector<uint32_t> missed_experts;
 +
 +    // arcint (patch 0038, campaign: sub4bit-vram-kernel). Per-expert dispatch
@@ -185,14 +185,14 @@ index 53aaa28e21..f8c9d2a10 100644
 @@ -758,6 +758,9 @@ public:
      // use; empty when no misses exist.
      std::vector<CpuTierMiss> _hybrid_prefill_misses;
-
+ 
 +    // arcint (patch 0038). Per-expert dispatch: all experts bypass the fusion.
 +    bool _per_expert_dispatch = false;
 +
      // --- OTD helper methods (used when _weight_provider->is_offloaded()) ---
-
+ 
      void set_otd_weight_pointers(typed_primitive_inst<moe_3gemm_fused_compressed>& instance, scratch_buffers& scratch) {
-@@ -1050,6 +1053,18 @@ public:
+@@ -1050,6 +1053,20 @@ public:
                              "MOE_CPU_TIER supports u4/u8 expert zero points only; got ", zdt);
              _cpu_zp_is_u8 = (zdt == ov::element::u8);
          }
@@ -211,23 +211,23 @@ index 53aaa28e21..f8c9d2a10 100644
 +        }
 +
      }
-
+ 
  // ====== PREFILL =======
 diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp
 index f8c9d2a10..g3a8f1b01 100644
 --- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp
 +++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp
-@@ -1078,6 +1078,7 @@ public:
+@@ -1078,4 +1078,5 @@ public:
          cur_moe->_cpu_weight_signed = _cpu_weight_signed;
          cur_moe->_cpu_zp_is_u8 = _cpu_zp_is_u8;
          cur_moe->_cpu_gate_act = _cpu_gate_act;
 +        cur_moe->_per_expert_dispatch = _per_expert_dispatch;
-
+ 
 diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_perf.hpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_perf.hpp
 index e42d547960..b1c3a5d21 100644
 --- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_perf.hpp
 +++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_perf.hpp
-@@ -34,6 +34,12 @@ struct OtdPerfCounters {
+@@ -34,5 +34,11 @@ struct OtdPerfCounters {
      // per grouped-GEMM invocation with at least one non-resident miss.
      std::atomic<uint64_t> hybrid_prefill_layers{0};
      std::atomic<uint64_t> created_onednn_kernels{0};
@@ -237,7 +237,7 @@ index e42d547960..b1c3a5d21 100644
 +    // try_acquire_simultaneous call when per-expert dispatch is active. If
 +    // this equals zero while _per_expert_dispatch is on, nothing was routed.
 +    std::atomic<uint64_t> per_expert_dispatches{0};
-
+ 
      // arcint M9 (patches/0004, P0 counters).
 diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_runtime.cpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_runtime.cpp
 index 36a1d78b70..c9e2d1a30 100644
