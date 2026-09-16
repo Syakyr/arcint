@@ -1,3 +1,30 @@
+marfrit-openvino (2026.4.0~dev20260821+p16-1) bookworm trixie; urgency=medium
+
+  * One more patch applied on top of +p15, same upstream commit (71640275),
+    same smallest-sufficient-divergence numbering:
+    - patches/0037: under a static half-partition every MoE layer's routed
+      batch contains at least one non-resident expert, and the two
+      grouped-GEMM callers (on_before_prefill, build_grouped_mask_otd) called
+      try_acquire_simultaneous without a cpu_tier_misses destination -- so
+      the first non-resident entry returned nullopt and the WHOLE layer fell
+      back to exec_prefill_onednn's per-expert loop: ~5,520 kernel launches
+      where the grouped path needs ~120, on all 40 layers
+      (grouped_fallbacks=400 per process). The fix wires cpu_tier_misses into
+      both callers; non-resident entries take a sentinel slot id (num_expert)
+      that the mask-gen kernels already exclude and scatter_reduce's
+      UINT_MAX skip already handles, and the host tier runs them after the
+      grouped GEMM completes. New OTD perf counter: hybrid_prefill_layers
+      (arcint DESIGN 7.0.2bx).
+    - MEASURED: grouped_fallbacks 400 -> 0, decode 18.2 t/s against a gate of
+      14.8, 3.4 identity and E2 pass. The campaign's prefill gate (tier ON
+      within 25 % of tier OFF) is NOT met -- the host dispatch for the
+      non-resident experts serialises through ~128 experts per layer and
+      dominates prefill -- and static-partition-prefill stays open. This
+      level ships because the coding defect is gone, not because the
+      campaign closed.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Wed, 16 Sep 2026 13:00:00 +0200
+
 marfrit-openvino (2026.4.0~dev20260821+p15-1) bookworm trixie; urgency=medium
 
   * One more patch applied on top of +p14, same upstream commit (71640275),
