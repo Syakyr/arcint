@@ -142,3 +142,10 @@ fusion-impact profile, not a kernel micro-benchmark) applies.
   its purpose is to bypass the fusion and compute only the routed
   experts. Sub-4-bit is one cache-headroom lever, not the gate. Prior
   art after the 2026-09-05 survey exists and is not yet on the record.
+- 2026-09-16 — design note committed (169d350); per-expert dispatch framework
+  committed (patch 0038, 7dbcadb). Pipeline steps 1 (design note) and 3
+  (red-first cells + dispatch) done. The dispatch routes all routed experts
+  through the existing CPU tier (patch 0011) with the fused GEMV bypassed
+  entirely — proves the dispatch mechanism before the per-expert OCL kernel
+  exists. Fable-reviewed: 3 findings fixed (clone field list, offload guard,
+  entry assert). Next: the per-expert OCL kernel (pipeline step 4).
