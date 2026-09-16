@@ -776,6 +776,35 @@ unverified" verdict for 0010/0020/0032/0033 at Flash-Next's shape becomes
 the 0035 suite (original geometry, "reverse" page order) are the known
 block-size gate from 0034, not flash-next related.
 
+### 0037-moe-hybrid-prefill-split.patch
+
+Hybrid grouped-GEMM/host prefill for the MoE static partition. Under a
+static half-partition every MoE layer's routed batch contains at least one
+non-resident expert, so the grouped-GEMM prefill path refused every batch and
+fell back to the serial per-expert loop (`grouped_fallbacks=40×layers`,
+§7.0.2ai). The fix wires `cpu_tier_misses` into both grouped-GEMM callers
+(`on_before_prefill` for the micro-GEMM path, `build_grouped_mask_otd` for
+the grouped oneDNN path). Non-resident experts receive `kCpuTierSentinelSlot`
+in the lease; the grouped-GEMM proceeds over the resident subset, and the
+non-resident subset is dispatched to `moe_cpu_expert` on the host after the
+GEMM completes. `get_expert_mask_from_gpu` skips the exact sentinel instead
+of throwing; any other out-of-range value still throws (the shape-predictor
+overflow guard). The scatter-reduce kernel's pre-existing UINT_MAX sentinel
+handling covers the new slot; no GPU kernel change.
+
+New OTD perf counter: `hybrid_prefill_layers` — the number of grouped-GEMM
+invocations that took the hybrid path instead of the full per-expert fallback.
+
+Design note: `docs/design-static-partition-prefill.md`. Campaign:
+`docs/campaigns/static-partition-prefill.md`.
+
+**MEASURED:** see DESIGN §7.0.2bx. The coding defect is eliminated
+(`grouped_fallbacks` 400→0), §3.4 identity and E2 pass, decode improves
+(18.2 t/s, above gate of 14.8). The campaign's prefill gate (within 25% of
+OFF) is **not met** — the host dispatch for non-resident experts serialises
+through ~128 experts per layer and dominates prefill time. The campaign
+remains open.
+
 ## Deliberately NOT applied
 
 These live in the arcint repository's `patches/` as records of measurements.

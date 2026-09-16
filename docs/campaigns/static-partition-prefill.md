@@ -130,3 +130,14 @@ keep passing throughout.
   "one per layer" reading above came from §7.0.2ai's single reading of
   40. The reference is report-only until this campaign's recon reads the
   counter's unit off the plugin.
+- 2026-09-16 — patch 0037 built and reviewed (Fable review: 3 findings
+  fixed, 2 noted). Card window on the 16 GiB card: `grouped_fallbacks`
+  400→0 (defect eliminated), §3.4 identity 4/4 PASS, E2 PASS, decode
+  18.2 t/s (above gate of 14.8), ratio 1.46 (above 1.17). **Prefill gate
+  NOT MET**: 27.9 t/s ON vs 87.2 OFF (need ≥65.4). The hybrid path IS
+  taken but the serial host dispatch for ~128 non-resident experts per
+  layer dominates. Coder offload regression 1lane PASS. Design note §6/§7
+  describe a batched `exec_prefill_host_misses` that was not built — the
+  patch calls the existing `exec_prefill_onednn(host_only)` loop instead.
+  Campaign remains open; the next lever is parallelising or batching the
+  host dispatch. DESIGN §7.0.2bx records the window.

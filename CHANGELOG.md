@@ -39,6 +39,18 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
   (paged)"` instead of `"paged model ready"`, matching the stateful path's
   grep pattern.
 
+### Hybrid prefill split (campaign: static-partition-prefill)
+
+- **Plugin patch 0037**: under the static half-partition, the grouped-GEMM
+  prefill path refused every MoE layer's batch (at least one non-resident
+  expert per batch), falling back to the serial per-expert loop on all 40
+  layers (`grouped_fallbacks=400` per process). The fix wires
+  `cpu_tier_misses` into both grouped-GEMM callers; resident experts run
+  through the batched grouped-GEMM, non-resident experts are dispatched to
+  the host after the GEMM completes. New OTD perf counter:
+  `hybrid_prefill_layers`.
+- Requires `marfrit-openvino 2026.4.0~dev20260821+p16` (patches 0003–0037).
+
 ## 0.5.0 — 2026-09-13
 
 Requires `marfrit-openvino 2026.4.0~dev20260821+p15` (patches 0003–0033) —

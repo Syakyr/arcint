@@ -9094,6 +9094,69 @@ the K-quant head (the case that failed), and an `Add` node (neither terminator
 -- must fail closed). The function is declared in `exec/graph_rewrites.h` and
 defined outside the anonymous namespace, same as `slice_logits_to_last_token`.
 
+#### 7.0.2bx Hybrid prefill split: the static-partition-prefill campaign — grouped-GEMM for resident experts, host tier for the rest (2026-09-16)
+
+Campaign: `docs/campaigns/static-partition-prefill.md`.
+Design note: `docs/design-static-partition-prefill.md`.
+Plugin patch 0037, `marfrit-openvino +p16` (patches 0003–0037).
+
+**The defect (§7.0.2ai, measured-here):** under the static half-partition
+every MoE layer's routed batch contains at least one non-resident expert.
+The grouped-GEMM prefill callers (`on_before_prefill`,
+`build_grouped_mask_otd`) call `try_acquire_simultaneous` without a
+`cpu_tier_misses` destination, so the static-partition branch returns
+`std::nullopt` on the first non-resident entry. The entire layer falls back
+to `exec_prefill_onednn`'s serial per-expert loop: ~5,520 kernel launches vs
+~120 for the grouped path. `grouped_fallbacks=400` per process (10 per layer
+per request over 40 layers, two requests). Tier-ON prefill: 26.3–26.7 t/s
+against tier OFF's 85.2–87.4 — a 3× loss.
+
+**The fix:** wire `cpu_tier_misses` into both grouped-GEMM callers.
+Non-resident experts get `kCpuTierSentinelSlot` in the lease; the
+grouped-GEMM proceeds over the resident subset. After the GEMM, non-resident
+experts are dispatched to `moe_cpu_expert` on the host. The scatter-reduce
+kernel's pre-existing UINT_MAX sentinel handling covers the sentinel slot; no
+GPU kernel change. `get_expert_mask_from_gpu` skips sentinel entries instead
+of throwing.
+
+**Unit tests (measured-here):** `moe_hybrid_prefill.get_expert_mask_sentinel_skip`
+and `moe_hybrid_prefill.perf_counter_exists` — both PASS on the patched tree,
+0 ms each.
+
+**Card window (measured-here):** the 16 GiB card (GPU.1), 35B int4
+(coder-35b artifact), `--offload-ratio 50`, 8 GiB device pool
+(ARCINT_MOE_DEVICE_POOL_BYTES), u8 KV, 1 lane, n_ctx 65536, prefix cache
+off, arcint 0.4.7 (800f7735), `marfrit-openvino +p16`.
+
+| Metric | OFF | ON | Gate | Verdict |
+|---|---|---|---|---|
+| prefill warm 2nd (t/s) | 87.2 | 27.9 | ≥65.4 (75% of OFF) | **FAIL** |
+| decode warm 2nd (t/s) | 12.5 | 18.2 | ≥14.8 | PASS |
+| decode ratio ON/OFF | — | 1.46 | ≥1.17 | PASS |
+| grouped_fallbacks | — | 0 | — (was 400) | defect eliminated |
+| §3.4 ON identity | — | PASS | byte-identical | 4/4, sha256 c856… |
+| §3.4 OFF identity | PASS | — | byte-identical | 4/4, sha256 8b90… |
+| E2 continuation | — | PASS | byte-identical | warm == fresh |
+
+Cold metrics (report, not gated): OFF prefill 80.5/decode 10.2, ON prefill
+24.8/decode 13.0. Decode cold/warm ratio ON: 1.40.
+
+**The gate miss (measured-here):** the patch eliminates the grouped fallback
+(`grouped_fallbacks` 400→0), proving the hybrid path is taken. The prefill
+gate (within 25% of OFF) is not met because `exec_prefill_onednn` in
+host-only mode serialises through ~128 non-resident experts per layer × 40
+layers on the host CPU. The grouped-GEMM for the resident half completes
+quickly; the sequential host dispatch for the non-resident half dominates.
+The campaign's "Known against hypothesised" section noted this path was
+"undesigned… has not been designed, built, or measured for its own overhead."
+Now it is measured: the overhead is the entire loss. A follow-on campaign
+targeting the host dispatch (parallelism, batching, or reducing the
+non-resident set) is the next lever.
+
+Coder offload regression (GPU.0, qwen36-coder-b5-ov, ratio 20, u8:i4):
+1lane PASS (all byte-identity checks, speculative decoding deterministic,
+cache warm/cold identical, continuation restore matching).
+
 #### 7.0.3 KV precision on the paged path — u8 is the lever, u4 is a tax
 
 The plugin accepts f16/u8/i8/u4/i4 for `KV_CACHE_PRECISION` on the paged path,

@@ -264,8 +264,13 @@ def _reference_shape_error(cell_name, ref):
         return f"reference {ref.get('metric', '?')!r} missing field(s): {', '.join(missing)}"
     if ref["direction"] not in DIRECTIONS:
         return f"reference {ref['metric']!r} has unknown direction {ref['direction']!r}"
-    if not _is_number(ref["value"]):
+    # value null is permitted alongside gate_at null: the reference exists to
+    # declare the metric (so run.py won't reject it as unmatched) but has no
+    # prior measurement to compare against yet.
+    if ref["value"] is not None and not _is_number(ref["value"]):
         return f"reference {ref['metric']!r} has a non-numeric value {ref['value']!r}"
+    if ref["value"] is None and ref["gate_at"] is not None:
+        return f"reference {ref['metric']!r} has value null but gate_at is set (report-only needs both null)"
     # gate_at null is the report-only form (docs/design-0.3.1-test-ladder.md
     # §8.9): recorded, printed, never compared. Anything else must be a number
     # a comparison can use -- a "14.8" string would compare as text or crash.
