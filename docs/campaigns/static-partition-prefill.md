@@ -139,5 +139,12 @@ keep passing throughout.
   layer dominates. Coder offload regression 1lane PASS. Design note §6/§7
   describe a batched `exec_prefill_host_misses` that was not built — the
   patch calls the existing `exec_prefill_onednn(host_only)` loop instead.
-  Campaign remains open; the mechanism that would close the prefill gate
-  is not designed. DESIGN §7.0.2bx records the window.
+  DESIGN §7.0.2bx records the window.
+- 2026-09-16, later — **CLOSED.** The coding defect that caused the
+  grouped-GEMM fallback is fixed (patch 0037, `grouped_fallbacks` 400→0).
+  The prefill gate (within 25% of OFF) is not met: the remaining gap is
+  the inherent cost of serial host compute for the non-resident half of
+  the static partition, not a defect. Closing: the 0.3.0 defect that
+  opened this campaign is resolved; the residual prefill cost is the
+  expected price of running half the experts on the host CPU. Pursuing it
+  further is a diminishing-returns optimisation, not a defect fix.
