@@ -149,3 +149,11 @@ fusion-impact profile, not a kernel micro-benchmark) applies.
   entirely — proves the dispatch mechanism before the per-expert OCL kernel
   exists. Fable-reviewed: 3 findings fixed (clone field list, offload guard,
   entry assert). Next: the per-expert OCL kernel (pipeline step 4).
+- 2026-09-16 — per-expert kernel dispatch integration committed (patch 0040).
+  Wires 0039's moe_expert_swiglu.cl into the live dispatch: GPU-resident
+  experts launch per-expert kernels (expert_gate_up, expert_down) with slot
+  pool weight pointers; non-residents go to CPU tier (patch 0011); fused GEMV
+  bypassed via sentinels for all routed experts. Removes 0038's blanket
+  sentinel (the proof-of-concept all-CPU-tier redirect). Fable-reviewed:
+  clean (0 findings; prior round's 6 findings C1-C4/M1-M2 all addressed).
+  Pipeline step 4 (the kernel work) done. Next: one-card window measurement.
