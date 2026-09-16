@@ -527,14 +527,13 @@ index 0000000..2a9b672
 +#endif
 +}
 diff --git a/src/plugins/intel_gpu/tests/unit/test_cases/moe_3gemm_gpu_test.cpp b/src/plugins/intel_gpu/tests/unit/test_cases/moe_3gemm_gpu_test.cpp
-index d4e1c2a50..e5f3g4h56 100644
+index d1a5a6eee8..b3c6efa760 100644
 --- a/src/plugins/intel_gpu/tests/unit/test_cases/moe_3gemm_gpu_test.cpp
 +++ b/src/plugins/intel_gpu/tests/unit/test_cases/moe_3gemm_gpu_test.cpp
-@@ -1669,3 +1669,24 @@ TEST(moe_per_expert_dispatch, perf_counter_exists_and_increments) {
-     perf.per_expert_dispatches.fetch_add(5, std::memory_order_relaxed);
+@@ -1665,6 +1665,27 @@ TEST(moe_per_expert_dispatch, perf_counter_exists_and_increments) {
      ASSERT_EQ(perf.per_expert_dispatches.load(), 15u);
  }
-+
+ 
 +// ----- arcint (patch 0039). Per-expert GPU kernel counter -----
 +// Campaign: sub4bit-vram-kernel. The per_expert_gpu_invocations counter tracks
 +// GPU kernel launches (expert_gate_up + expert_down) for per-expert dispatch.
@@ -555,3 +554,7 @@ index d4e1c2a50..e5f3g4h56 100644
 +    perf.per_expert_gpu_invocations.fetch_add(20, std::memory_order_relaxed);
 +    ASSERT_EQ(perf.per_expert_gpu_invocations.load(), 22u);
 +}
++
+ // arcint M14 (patches/0012, §8 T2). The kernel sentinel skip, tested in
+ // isolation from the redirect policy (§2) and the CPU compute tier (§4/§5):
+ // no OTD/LRU provider is involved here at all. The provider is RESIDENT
