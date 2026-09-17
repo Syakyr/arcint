@@ -72,13 +72,37 @@ def _find_blocks(model):
             break
 
 
+def _strip_swish_beta(model):
+    """Swish(x, beta=Constant 1.0) -> Swish(x). The binding's `op.swish`
+    appends the beta input; the matcher declares Swish with one input and
+    the C++ Matcher rejects an argument-count mismatch (measured 2026-09-17:
+    Reshapes in place, Swish in=2, census 0 MoE primitives). Returns the
+    number of nodes changed."""
+    n = 0
+    for sw in model.get_ordered_ops():
+        if _type(sw) != "Swish" or sw.get_input_size() != 2:
+            continue
+        beta = sw.input_value(1).get_node()
+        if _type(beta) != "Constant":
+            continue
+        val = np.asarray(beta.get_data()).reshape(-1)
+        if val.size != 1 or float(val[0]) != 1.0:
+            continue                                  # a real beta: not ours
+        sw.set_arguments([sw.input_value(0)])
+        sw.validate_and_infer_types()
+        n += 1
+    return n
+
+
 def rewrite_tiled_moe(model):
-    """Insert the two matcher-anchoring Reshapes into every old-style block.
-    Returns the number of blocks rewritten (0 on an already-conformant
-    model). Validates the model afterwards so downstream shapes follow."""
+    """Insert the two matcher-anchoring Reshapes into every old-style block
+    and strip the beta input off every Swish(x, 1.0). Returns the number of
+    blocks rewritten (0 on an already-conformant model). Validates the model
+    afterwards so downstream shapes follow."""
     from openvino import opset13 as op
 
     n = 0
+    n_sw = _strip_swish_beta(model)
     for mul3, outs, uns in list(_find_blocks(model)):
         ps = outs.get_partial_shape()
         E, H = ps[0], ps[2]
@@ -104,9 +128,9 @@ def rewrite_tiled_moe(model):
             elif src is uns:
                 mul3.input(i).replace_source_output(wu.output(0))
         n += 1
-    if n:
+    if n or n_sw:
         model.validate_nodes_and_infer_types()
-    return n
+    return max(n, n_sw)
 
 
 def walk(model):

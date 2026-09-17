@@ -123,6 +123,13 @@ def test_a_cut_builds_and_compiles_device_free_up_to_the_request():
     assert re.search(r"key_cache\.\d+\[-1, -1, -1, -1\]:dynamic", out), out[-1500:]
 
 
+@pytest.mark.xfail(strict=True, reason=(
+    "since the emitter matches the tiled MoE pattern (2026-09-17) the CPU "
+    "plugin's own ConvertTiledMoeBlockToGatherMatmuls fires on the ported "
+    "build too (it accepts any weight producer) and its GatherMatmul refuses "
+    "Parameter weights: 'Only constant weights are supported for GatherMatmul "
+    "operation'. The ported route is dead since window-051 B.3; the cell is "
+    "kept as the record of what it proved and of why it no longer runs."))
 def test_expert_ports_bind_every_body_and_the_forward_repeats_bit_identically():
     """`--expert-ports` (the segmented route's expert bodies as u8 PORTS with
     the in-graph unpack): every body the sink declares is bound by name --

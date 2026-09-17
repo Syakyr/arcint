@@ -502,7 +502,11 @@ def moe_block_tiled(y, w, p, topk, norm_topk):
     up_w = compressed_weight(up_np, "experts_up_proj")                   # [E,I,H]
     down_w = compressed_weight(dn, "experts_down_proj")                  # [E,H,I]
 
-    g = op.swish(op.matmul(m_h3, gate_w, transpose_a=False, transpose_b=True))
+    # ONE-input Swish: the binding's op.swish() appends a beta Constant and
+    # the fusing pass declares Swish with one input; the C++ Matcher rejects
+    # an argument-count mismatch (q4e.serving_shape.swish1, 2026-09-17).
+    from q4e.serving_shape import swish1
+    g = swish1(op.matmul(m_h3, gate_w, transpose_a=False, transpose_b=True))
     u = op.matmul(m_h3, up_w, transpose_a=False, transpose_b=True)
     outs = op.matmul(op.multiply(g, u), down_w, transpose_a=False, transpose_b=True)  # [E,M,H]
 

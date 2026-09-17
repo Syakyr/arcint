@@ -792,6 +792,18 @@ def _compressed_expert(arena, e, out, inn, name, filler=None,
     return x
 
 
+def swish1(x):
+    """Swish with ONE input. The Python binding's `op.swish(x)` appends a
+    beta Constant (1.0) as a second input; the plugin's tiled MoE matcher
+    declares `Swish({gate_matmul})` with one input and the C++ Matcher
+    rejects a node whose argument count differs (measured 2026-09-17: the
+    fusing 35B control carries Swish/opset4 in=1, this emitter carried in=2,
+    and the census stayed at 0 MoE primitives with the Reshapes in place)."""
+    from openvino.opset4.ops import _get_node_factory_opset4
+    from openvino.utils.types import as_nodes
+    return _get_node_factory_opset4().create("Swish", as_nodes(x), {})
+
+
 def emit_moe_tiled(hidden_bth, config, state, arena, T, tag, filler=None,
                    layer=None, port_sink=None):
     """The MoE layer in the shape the GPU plugin's
@@ -850,7 +862,7 @@ def emit_moe_tiled(hidden_bth, config, state, arena, T, tag, filler=None,
     down_w = _compressed_expert(arena, E, H, I, f"{tag}/experts_down",
                                 filler, layer, "down", port_sink)
 
-    g = op.swish(op.matmul(m_h3, gate_w, transpose_a=False, transpose_b=True))
+    g = swish1(op.matmul(m_h3, gate_w, transpose_a=False, transpose_b=True))
     u = op.matmul(m_h3, up_w, transpose_a=False, transpose_b=True)
     outs = op.matmul(op.multiply(g, u), down_w,
                      transpose_a=False, transpose_b=True)              # [E,M,H]

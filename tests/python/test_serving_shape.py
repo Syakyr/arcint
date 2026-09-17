@@ -2400,8 +2400,15 @@ def test_every_moe_layer_walks_the_plugins_tiled_3gemm_pattern(tmp_path):
         ov.save_model(model, str(xml), compress_to_fp16=False)
         back = ov.Core().read_model(str(xml))
         back_ok, back_fail = _walk_tiled_moe_pattern(back)
+        # the device-free fusion oracle (see the rewrite cell): the CPU plugin
+        # runs the same tiled pass, three GatherMatmul primitives per block
+        from openvino._offline_transformations import paged_attention_transformation
+        paged_attention_transformation(back)
+        gm = _cpu_gather_matmuls(_compile_cpu(back))
     finally:
         arena.close()
+    print(f"\n[fusion-contract] CPU exec graph GatherMatmul primitives {gm} for {n_moe} MoE layers")
+    assert gm == 3 * n_moe, (gm, n_moe)
     first_live = sorted(set(v[0] for v in live_fail.values()))
     first_back = sorted(set(v[0] for v in back_fail.values()))
     print(f"\n[fusion-contract] {n_moe} MoE layers: live {len(live_ok)} matched, "
@@ -2503,14 +2510,26 @@ def test_the_tiled_rewrite_makes_an_old_artifact_match_and_keeps_its_values(tmp_
         ok2, fail2 = mtr.walk(back)
         assert len(ok2) == 1, (ok2, fail2)
         assert mtr.rewrite_tiled_moe(back) == 0                       # idempotent
-        rq = _compile_cpu(back).create_infer_request()
+        cm = _compile_cpu(back)
+        rq = cm.create_infer_request()
         rq.set_tensor("hidden", ov.Tensor(x))
         rq.infer()
         got = np.array(rq.get_output_tensor(0).data, dtype=np.float32, copy=True)
         diff = float(np.abs(want - got).max())
+        gm_old, gm_new = _cpu_gather_matmuls(_compile_cpu(_old_style_tiled_moe(small, arena)[0])), _cpu_gather_matmuls(cm)
         print(f"\n[tiled-rewrite] old block: walker 0 -> {len(ok1)} live, {len(ok2)} after "
-              f"round-trip; forward max |diff| {diff:.3e} over {want.size} elements")
-        assert got.shape == want.shape and np.array_equal(want, got), diff
+              f"round-trip; CPU exec graph GatherMatmul old {gm_old} -> rewritten {gm_new}; "
+              f"forward max |diff| {diff:.3e} over {want.size} elements")
+        # THE DEVICE-FREE FUSION ORACLE: the CPU plugin runs the same
+        # ConvertTiledMoeBlockToGatherMatmuls pass (with any weight producer
+        # accepted), so a matched block compiles to GatherMatmul primitives
+        # there -- three per block (gate, up, down) -- and an unmatched one
+        # to none. The GPU's second stage (MoeOpFusion -> MOECompressed) is
+        # not exercised here; the card census is.
+        assert gm_old == 0 and gm_new == 3, (gm_old, gm_new)
+        # fused, the routed experts are summed in a different order: not bit
+        # for bit against the unfused all-experts block, but the same values
+        assert got.shape == want.shape and np.allclose(want, got, rtol=1e-4, atol=1e-5), diff
 
         fixed, rep = ss.build_serving_shape_ir(config=small, arena=arena, n_layers=4,
                                                rope_span=64)
@@ -2519,3 +2538,14 @@ def test_the_tiled_rewrite_makes_an_old_artifact_match_and_keeps_its_values(tmp_
         assert len(ok3) == rep["n_layers"]
     finally:
         arena.close()
+
+
+def _cpu_gather_matmuls(compiled):
+    """GatherMatmul-typed primitives in a CPU-compiled model's runtime graph."""
+    n = 0
+    for node in compiled.get_runtime_model().get_ops():
+        ri = node.get_rt_info()
+        lt = ri["layerType"].astype(str) if "layerType" in ri else ""
+        if "gathermatmul" in lt.lower():
+            n += 1
+    return n
