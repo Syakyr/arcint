@@ -19,6 +19,35 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
 
 ## Unreleased (qfndev)
 
+### The serving-shape MoE block fuses (campaign: sub4bit-vram-kernel)
+
+- **Emitter** (`tools/q4e/serving_shape.py`): the MoE block now carries the
+  three anchors the GPU plugin's tiled matcher requires and the fusing
+  35B export has — the two Reshapes around the router-weight Multiply, a
+  one-input Swish (the Python binding's `op.swish` adds a beta input the
+  C++ matcher rejects), and an f16 dequant chain with a trailing Convert
+  so the scale reaches the fused op as a direct Constant. Before this no
+  Flash-Next serving-shape artifact ever compiled to a MoE primitive: the
+  expert layers ran as batched FullyConnected, every expert for every
+  token, at full residency, and the whole offload series was inert.
+- **Measured** (B60, depth-12 artifact, KV u8, f16): 0 → 12
+  `moe_3gemm_fused_compressed`; device residency 17.73 → 3.00 GiB at
+  `--offload-ratio 99 --moe-cpu-tier`; served decode 18.3 → 80.5 t/s at
+  full residency; 26.6 t/s warm at ratio 99 with the tier on the A770.
+  The tier's first forward page-faults on the B60 (a card/driver-side
+  fault, 30-second reproducer with the 35B); it serves on the A770.
+- **Tools**: `tools/moe_tiled_rewrite.py` makes a pre-fix artifact
+  conformant in memory or on disk; `tools/check_tiled_pattern.py` checks
+  argument counts; the boot driver gained `--rewrite-tiled-moe` and
+  `--census` (the runtime graph's primitive types, the loud check for a
+  fusion that silently did not happen); the CPU plugin runs the same
+  tiled pass and serves as a device-free oracle in the suite.
+- **Registry**: `qwen3.8-flash-next-d12r`, the fused-MoE rewrite of the
+  depth-12 rung (a measurement artifact).
+- Runtime dependency unchanged (`+p17`); patch 0041 measured inert on the
+  fused offload route at compile.
+
+
 ### Fit ledger and pre-warm lever (campaign: static-partition-cold-start)
 
 - **Fit ledger** (`--fit-ledger-dir`): persists the plateau-probe and
