@@ -433,3 +433,14 @@ fusion-impact profile, not a kernel micro-benchmark) applies.
   byte. (3) The reference is the llama.cpp logits capture at full depth,
   replayed through the served d48f from the NVMe — running as this entry
   is written.
+- 2026-09-18, 00:50 — **the reference speaks: the served full-depth
+  logits are noise.** The llama.cpp capture replayed through the served
+  d48f from the NVMe (2 × 2,735 tokens, 1,046 s and 1,230 s of prefill):
+  mean KL 12.42/12.16 and 12.40/12.34 nats, argmax agreement 0.0007 and
+  0.0000 (`measured-here`, B60, ratio 99 + tier, KV u8, f16). ln(248320) =
+  12.42: the uniform floor. The depth-12 and depth-4 rungs read the same
+  on 09-13, and their "missing layers" reading is RETRACTED: the artifact
+  family is wrong at every depth. This campaign's work stands — the
+  fused route, the tier on both cards, full depth at 8.06 GiB, the NVMe
+  — and its gate now waits on `serving-shape-logits.md`: the emitter or
+  the fill loses the model before any expert is computed.
