@@ -305,3 +305,35 @@ fusion-impact profile, not a kernel micro-benchmark) applies.
   compile-time question at 48 layers and the per-expert kernel's build
   log. A re-export from the GGUF shards replaces the rewritten artifact
   once the shards are back on the dev host.
+- 2026-09-17, late — **the fused path served, on both cards, and the
+  offload tier faults on the 24 GiB card.** Served binary at 0b66c43
+  (registry entry for the rewritten depth-12 artifact, e384c05), the
+  +p17 plugin, n-gram shard bound, `measured-here`:
+  | card | artifact | offload | first forward | warm decode 64 tok |
+  |---|---|---|---|---|
+  | B60 | d12r fused | none (17.62 GiB) | OK, deterministic | **80.5 t/s** (unfused rung 09-13: 18.3) |
+  | B60 | d12r fused | ratio 99 or 50 + CPU tier | **xe page fault** at the slot-pool probe | — |
+  | B60 | d12r fused | ratio 99, no tier | probe OK; requests: "allocated output memory is necessary to set kernel arguments" | — |
+  | B60 | 35B control | ratio 99 + tier, +p17 AND +p16 | the same page fault | — |
+  | A770 | 35B control | ratio 99 + tier, +p17 | OK, Paris | 16.1 t/s |
+  | A770 | d12r fused | ratio 99 + tier | OK, deterministic | **26.6 t/s** (7.7 cold) |
+  Dispositions: (1) the fused MoE kernel runs this family and is 4.4× the
+  unfused decode at full residency (`measured-here`); (2) the CPU tier's
+  first forward faults on the B60 with everything else equal — plugin
+  (+p16 without the per-expert series faults too, so 0038–0040 are not
+  the cause), binary, artifact, flags — and serves on the A770: a
+  card/driver-side fault, `xe … Faulted Address 0x1f0f5e000, Fault
+  response: Unsuccessful -ENOENT`, device coredump; the tier had never
+  served on the B60 on the record (the 08-30 B60 figures are full
+  residency); 30-second reproducer: the 35B at ratio 99 + tier on GPU.0;
+  (3) routing-aware execution with 99 % of the experts on the host runs
+  the fused depth-12 rung at 26.6 t/s warm on the A770 behind its 1.8
+  GB/s link — the campaign's first offload number on a card, and a
+  lower bound for the B60 once its tier fault is fixed; (4) the no-tier
+  request failure is a runtime binding defect on the served request
+  path (the probe path allocates the output the request path does not)
+  — open. Values at depth 12 are not the model's; the served France
+  prefix matches the unfused record's first four tokens. Next: the B60
+  tier fault (driver-side, needs the coredump and a plugin-level
+  reproducer), the no-tier binding defect, then the ratio sweep and the
+  gate's Prüfstand at full depth once a 48-layer fused artifact exists.
