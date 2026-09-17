@@ -2418,3 +2418,104 @@ def test_every_moe_layer_walks_the_plugins_tiled_3gemm_pattern(tmp_path):
         f"{back_fail}. A Reshape the optimiser can prove redundant is folded "
         f"at save (export_mtp.py:515-531 records the mechanism); the target "
         f"shape must carry a runtime -1.")
+
+
+def _old_style_tiled_moe(small, arena, seed=3):
+    """One MoE block as `emit_moe_tiled` wrote it BEFORE 2026-09-17 (e50148f):
+    the down MatMul feeding the router-weight Multiply directly, the router
+    side Transpose -> Unsqueeze. Real-valued experts through `ExpertFiller`
+    so a forward through it is not all zeros. Returns (model, E, H)."""
+    from openvino import opset13 as op
+    from q4e import expert_fill as ef
+    E, H, I = small.num_experts, small.hidden_size, small.moe_intermediate_size
+    k = small.num_experts_per_tok
+    i32 = lambda v: op.constant(np.array(v, np.int32))
+    i32v = lambda v: op.constant(np.array([v], np.int32))
+    rng = np.random.default_rng(seed)
+    filler = ef.ExpertFiller(_RowsSource(small, seed=seed), ss.EXPERT_GROUP_SIZE)
+    hidden = op.parameter([1, -1, H], ov.Type.f32)
+    hidden.set_friendly_name("hidden")
+    y_flat = op.reshape(hidden, op.constant(np.array([-1, H], np.int32)), special_zero=False)
+    logits = op.matmul(y_flat, op.constant(rng.standard_normal((E, H)).astype(np.float32) * 0.1),
+                       transpose_a=False, transpose_b=True)
+    probs = op.softmax(logits, axis=-1)
+    tk = op.topk(probs, i32(k), axis=-1, mode="max", sort="value", index_element_type="i32")
+    vals, idx = tk.output(0), tk.output(1)
+    vals = op.divide(vals, op.reduce_sum(vals, i32v(-1), keep_dims=True))
+    vals = op.slice(vals, op.constant(np.array([0, 0], np.int32)),
+                    op.shape_of(vals, output_type="i32"),
+                    op.constant(np.array([1, 1], np.int32)), op.constant(np.array([0, 1], np.int32)))
+    zeros = op.multiply(probs, op.constant(np.array([0.0], np.float32)))
+    weights = op.scatter_elements_update(zeros, idx, vals, i32(-1))
+    tiled = op.tile(y_flat, op.constant(np.array([E, 1], np.int32)))
+    m_h3 = op.reshape(tiled, op.constant(np.array([E, -1, H], np.int32)), special_zero=False)
+    with ss.shared_constants():
+        gate_w = ss._compressed_expert(arena, E, I, H, "old/experts_gate", filler, 0, "gate")
+        up_w = ss._compressed_expert(arena, E, I, H, "old/experts_up", filler, 0, "up")
+        down_w = ss._compressed_expert(arena, E, H, I, "old/experts_down", filler, 0, "down")
+    g = op.swish(op.matmul(m_h3, gate_w, transpose_a=False, transpose_b=True))
+    u = op.matmul(m_h3, up_w, transpose_a=False, transpose_b=True)
+    outs = op.matmul(op.multiply(g, u), down_w, transpose_a=False, transpose_b=True)
+    wt = op.transpose(weights, op.constant(np.array([1, 0], np.int32)))
+    wt = op.unsqueeze(wt, i32(-1))                                       # the OLD tail
+    mixed = op.reduce_sum(op.multiply(outs, wt), i32v(0), keep_dims=False)
+    out = op.reshape(mixed, op.constant(np.array([1, -1, H], np.int64)), special_zero=False)
+    res = op.result(out)
+    res.set_friendly_name("out")
+    return ov.Model([res], [hidden], "old_style_tiled_moe"), E, H
+
+
+def test_the_tiled_rewrite_makes_an_old_artifact_match_and_keeps_its_values(tmp_path):
+    """`tools/moe_tiled_rewrite.py`: an artifact exported BEFORE the emitter
+    fix is made matcher-conformant in memory, so the compile-time census can
+    run on the measured depth-12 artifact without re-exporting it (the GGUF
+    shards it would need are not on the dev host, 2026-09-17).
+
+    Red first, on the old-style block: walker 0 matched. After the rewrite:
+    1 block rewritten, walker 1 matched, live and after save -> read_model.
+    Idempotent on the fixed emitter's 4-layer build (0 rewritten, 4/4 stay).
+    Values: the CPU plugin's forward through the old and the rewritten graph
+    agree bit for bit at T=5 -- the two Reshapes are relabelings of the same
+    [E,M,H] x [E,M,1] product, and the CPU plugin folds them.
+    """
+    import moe_tiled_rewrite as mtr
+    small = _tiny_config(4)
+    arena = ss.SparseArena(capacity_bytes=1 << 32)
+    try:
+        old, E, H = _old_style_tiled_moe(small, arena)
+        ok0, fail0 = mtr.walk(old)
+        # the router renorm's ReduceSum(keep_dims=true) is a candidate too and
+        # fails at R1 by design; the MoE root fails at the router Reshape
+        assert ok0 == [] and "R4.router_reshape.type" in set(fail0.values()), (ok0, fail0)
+        x = np.random.default_rng(9).standard_normal((1, 5, H)).astype(np.float32)
+        rq = _compile_cpu(old).create_infer_request()
+        rq.set_tensor("hidden", ov.Tensor(x))
+        rq.infer()
+        want = np.array(rq.get_output_tensor(0).data, dtype=np.float32, copy=True)
+        assert want.shape == (1, 5, H) and np.abs(want).max() > 0
+
+        n = mtr.rewrite_tiled_moe(old)
+        ok1, fail1 = mtr.walk(old)
+        assert n == 1 and len(ok1) == 1, (n, ok1, fail1)
+        xml = tmp_path / "old_rewritten.xml"
+        ov.save_model(old, str(xml), compress_to_fp16=False)
+        back = ov.Core().read_model(str(xml))
+        ok2, fail2 = mtr.walk(back)
+        assert len(ok2) == 1, (ok2, fail2)
+        assert mtr.rewrite_tiled_moe(back) == 0                       # idempotent
+        rq = _compile_cpu(back).create_infer_request()
+        rq.set_tensor("hidden", ov.Tensor(x))
+        rq.infer()
+        got = np.array(rq.get_output_tensor(0).data, dtype=np.float32, copy=True)
+        diff = float(np.abs(want - got).max())
+        print(f"\n[tiled-rewrite] old block: walker 0 -> {len(ok1)} live, {len(ok2)} after "
+              f"round-trip; forward max |diff| {diff:.3e} over {want.size} elements")
+        assert got.shape == want.shape and np.array_equal(want, got), diff
+
+        fixed, rep = ss.build_serving_shape_ir(config=small, arena=arena, n_layers=4,
+                                               rope_span=64)
+        assert mtr.rewrite_tiled_moe(fixed) == 0
+        ok3, _ = mtr.walk(fixed)
+        assert len(ok3) == rep["n_layers"]
+    finally:
+        arena.close()
