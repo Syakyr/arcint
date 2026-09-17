@@ -411,3 +411,25 @@ fusion-impact profile, not a kernel micro-benchmark) applies.
   replay against the reference capture at full depth (needs the page
   cache warm or the residency stream; 21 s/token is the disk), and the
   A770 for the same cell as a second witness.
+- 2026-09-18, after midnight — **the artifact on the NVMe, and the
+  depth-12 ladder.** (1) The 48-layer fused artifact copied to the ext4
+  NVMe volume (83 GB, 4.4 min off ZFS): the tier's expert reads are
+  then NVMe-bound — the slot-pool probe 9.5 min instead of 44, decode
+  64 tokens at 1.5–1.9 t/s cold instead of 0.05, 9.8 t/s with the routed
+  experts in the page cache; the France token is byte-identical across
+  two cold starts and both storage paths (`measured-here`, B60, ratio
+  99 + tier, KV u8, f16, one lane). The residency stream's first half is
+  a copy, not a mechanism. (2) The correctness ladder at depth 12, the
+  same France prompt, logits dumped and diffed on the request's own
+  prefill (`tools/logits_dump_diff.py --from-n 5`; the load ladder's
+  records come first and must be skipped): unfused d12 against fused
+  d12r at full residency — argmax 3/5, mean KL 0.147, max |logit diff|
+  4.6 — far beyond f16 scale rounding; fused with the tier against
+  fused without — argmax 4/5, KL 0.020, decode steps on the same history
+  within 0.4 logits and KL ≤ 3e-3. The tier is exonerated at depth 12;
+  the fused route (its own f16 GEMV) and the unfused route (dynamic int8
+  activations into FullyConnected) disagree, and neither is the
+  reference. The unfused d12 token reproduces the 09-13 record byte for
+  byte. (3) The reference is the llama.cpp logits capture at full depth,
+  replayed through the served d48f from the NVMe — running as this entry
+  is written.
