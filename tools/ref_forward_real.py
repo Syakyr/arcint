@@ -59,6 +59,9 @@ def main(argv=None):
                     help="feed linear_attn.A_log as log(-ssm_a): the experiment for a "
                          "converter that stored A = -exp(A_log) under ssm_a while the "
                          "pin computes -exp(A_log) itself")
+    ap.add_argument("--gate-act", default=None,
+                    help="experiment: override the activation of layer 0's GDN gated "
+                         "norm (the pin's `norm.activation`, e.g. sigmoid or silu)")
     args = ap.parse_args(argv)
 
     import torch
@@ -141,6 +144,13 @@ def main(argv=None):
     # norm -> final_output (the gated norm, before out_proj), out_proj ->
     # linear_attn_out
     gdn0 = ref.layers[0].linear_attn
+    if args.gate_act:
+        print(f"[gate-act] layer 0 GDN norm activation {gdn0.norm.activation!r} -> {args.gate_act!r}",
+              flush=True)
+        gdn0.norm.activation = args.gate_act
+    # the gated norm's INPUT is the delta-rule core's output (llama: attn_output-i)
+    gdn0.norm.register_forward_pre_hook(
+        lambda m, inp: tap("L0/gdn/core_out", inp[0]))
     for sub in ("in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b", "conv1d", "norm", "out_proj"):
         mod = getattr(gdn0, sub, None)
         if mod is None:
