@@ -268,3 +268,40 @@ fusion-impact profile, not a kernel micro-benchmark) applies.
     after is bit-identical. The census window can therefore run on the
     measured artifact; a servable on-disk artifact still needs the
     shards (or a full `save_model` of the rewritten graph).
+- 2026-09-17, evening — **the Flash-Next serving-shape artifact fuses, and
+  the offload series applies to it.** Three anchors were missing, each
+  invisible to the previous check: (1) the two Reshapes (above);
+  (2) a ONE-input Swish — the Python binding's `op.swish(x)` appends a
+  beta Constant, the pattern declares `Swish({gate_matmul})` with one
+  input and the C++ Matcher rejects an argument-count mismatch (`code`:
+  `Matcher::match_arguments`; `measured-here`: census 2 with the
+  Reshapes alone still 0 MoE primitives; the fusing 35B control carries
+  `Swish/opset4 in=1`); (3) for the offload series, the dequant chain in
+  f16 with a trailing Convert → f32 — the control's shape — because under
+  f16 inference the plugin puts a Convert on an f32 scale Constant
+  feeding the fused op and the OTD resolver demands a direct,
+  FILE-BACKED Constant (`moe.cpp`: mmap source, weight-sharing buffer or
+  an `otd_bin_offset`); an in-memory rewrite therefore fuses on the
+  stock plugin (census 2/3) and not with `OFFLOAD_RATIO` (census 3), the
+  rewritten graph saved to disk does both (census 4).
+  Census ladder (`measured-here`, B60 = GPU.0, depth-12 artifact, KV u8,
+  f16, primitive types off `get_runtime_model()`):
+  | cell | plugin | props | MoE-typed | FullyConnected | usm_device |
+  |---|---|---|---|---|---|
+  | unfused (control) | p17+0041 | ratio 99, CPU tier | 0 | 230 | 17.73 GiB |
+  | rewrite (Reshapes only) | both | — | 0 | 230 | 17.73 GiB |
+  | rewrite (+Swish) | stock | — | 12 + 12 router | 194 | 17.62 GiB |
+  | rewrite (+f16 chain), in memory | p17+0041 | ratio 99, CPU tier | compile refused (bin offset) | | |
+  | rewritten artifact ON DISK | p17+0041 | ratio 99, CPU tier | **12 + 12 router** | 194 | **3.00 GiB** |
+  Host peak ≤ 4.6 GiB in every cell; no watchdog. Tools: `tools/
+  moe_tiled_rewrite.py` (pre-fix artifacts), `tools/check_tiled_pattern.py`
+  (input counts now checked, matches the 35B control 40/40), the boot
+  driver's `--rewrite-tiled-moe` / `--census`, and a device-free oracle:
+  the CPU plugin runs the same tiled pass and compiles a matched block
+  to three `GatherMatmul` primitives (in the suite). Commits b5946e1,
+  481387b, 09daece, 763f044, 0b66c43. Open, in order: a forward on the
+  fused offload path (values will differ from the unfused record: other
+  kernels, f16 scales), decode at ratio 99, the ratio sweep, then 0041's
+  compile-time question at 48 layers and the per-expert kernel's build
+  log. A re-export from the GGUF shards replaces the rewritten artifact
+  once the shards are back on the dev host.
