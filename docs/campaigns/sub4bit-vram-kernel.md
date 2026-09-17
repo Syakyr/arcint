@@ -392,3 +392,22 @@ fusion-impact profile, not a kernel micro-benchmark) applies.
   35B (record in `static-partition-prefill.md`). What the full-depth fused
   artifact's forward on the B60 now needs is the residency stream alone;
   the tier serves on that card.
+- 2026-09-17, midnight — **the first full-depth forward.** With `+p18`
+  the 48-layer fused artifact serves on the 24 GiB card at ratio 99 with
+  the CPU tier: compile 82.8 s at 8.06 GiB device, the n-gram table
+  bound, the slot-pool probe through 48 layers in 44 min, then France
+  raw, greedy, 8 tokens: prefill 5 tokens 113.6 s, decode 8 tokens
+  171 s (21 s/token) — the tier reading routed experts from the
+  artifact file on demand (`measured-here`, B60, KV u8, f16, one lane;
+  anonymous memory ≤ 1.5 GiB, file-backed pages up to 30.7 GiB: the
+  tier's host pool is page cache, not a copy — patch 0011's mapped
+  accessor, `code` — so the 58 GiB "host pool" of the residency
+  arithmetic never existed). The token is not the model's answer
+  (`REDPalette convudir…`): the Paris line at depth 48 is NOT obtained,
+  and the cause is not localised — no serving-shape artifact has produced
+  a meaningful token at any depth on the record, so the emitter's dense
+  parts and the table binding are suspects alongside the MoE route,
+  which itself answers Paris on the HF-exported 35B. Next: the KLD
+  replay against the reference capture at full depth (needs the page
+  cache warm or the residency stream; 21 s/token is the disk), and the
+  A770 for the same cell as a second witness.
