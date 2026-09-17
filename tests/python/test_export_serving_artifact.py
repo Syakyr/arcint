@@ -49,6 +49,7 @@ def test_the_config_carries_every_key_the_loader_reads_at_depth_4():
     # it for the architecture; the pin defaults to hidden_act = silu when the
     # key is absent, which is how the first artifacts were exported)
     assert cfg["output_gate_type"] == "sigmoid"
+    assert cfg["gdn_key_head_map"] == "tiled"
     json.dumps(cfg)                                    # serialisable as written
 
 

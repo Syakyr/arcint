@@ -165,9 +165,11 @@ def main(argv=None):
         tap("L0/gdn/conv_silu", o[0] if isinstance(o, tuple) else o)
         return o
     _pin.causal_conv1d_fn = _conv_tap
+    khm = args.k_head_map or getattr(cfg, "gdn_key_head_map", None) or "interleave"
+    print(f"[k-head-map] {khm} ({'flag' if args.k_head_map else 'the real config'})", flush=True)
     _orig_chunk = _pin.torch_chunk_gated_delta_rule
     def _chunk_tap(query, key, value, g, beta, *a, **kw):
-        if args.k_head_map == "tiled" and query.shape[2] == value.shape[2]:
+        if khm == "tiled" and query.shape[2] == value.shape[2]:
             r = value.shape[2] // 16 if value.shape[2] % 16 == 0 else 1
             hk = value.shape[2] // r
             # undo the pin's interleave (head 3h <- key head h), then tile

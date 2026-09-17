@@ -154,6 +154,9 @@ REAL_GEOMETRY = {
     # the GDN's output gate: SIGMOID for this checkpoint (llama.cpp hard-codes
     # it for qwen4exp; the GGUF carries no key; the pin's default is silu)
     "output_gate_type": "sigmoid",
+    # the GDN's key-head pairing: value head h <- key head h % 16, as llama.cpp
+    # computes this GGUF (measured against its whole tensors; q4e.gdn._key_head_map)
+    "gdn_key_head_map": "tiled",
     # full-attention / sparse: 12 QSA layers at layer_idx % 4 == 3, from
     # `qwen4exp.attention.compress_ratios` = 4 at exactly blk 3,7,...,47.
     # The indexer: `qwen4exp.attention.indexer.head_count` = 4 QUERY heads
@@ -189,7 +192,7 @@ def real_config(transformers_config_cls=None):
         "qwen_sparse_attention" if i % 4 == 3 else "linear_attention"
         for i in range(g["num_hidden_layers"])
     ]
-    return transformers_config_cls(
+    cfg = transformers_config_cls(
         vocab_size=g["vocab_size"],
         hidden_size=g["hidden_size"],
         num_hidden_layers=g["num_hidden_layers"],
@@ -232,6 +235,8 @@ def real_config(transformers_config_cls=None):
             "mrope_section": g["mrope_section"],
         },
     )
+    cfg.gdn_key_head_map = g["gdn_key_head_map"]   # not a pin field; the emitter reads it
+    return cfg
 
 
 # ---------------------------------------------------------------------------

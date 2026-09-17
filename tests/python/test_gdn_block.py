@@ -318,6 +318,38 @@ def test_the_emitter_follows_the_configured_output_gate(device="CPU", T=64):
         gdn.build_gdn_model(config, state, seq_len=T)
 
 
+def test_the_emitter_follows_the_configured_key_head_pairing(device="CPU", T=64):
+    """`gdn_key_head_map` (2026-09-18, campaign serving-shape-logits): how the
+    HK key heads serve the HV value heads. The pin interleaves (value head h
+    <- key head h // r); the shipped GGUF is computed TILED by llama.cpp
+    (h <- h % HK), and only tiled does the real model's layer 0 agree with
+    llama.cpp's whole tensors (48/48 core heads; interleaved, 4/48). The
+    transcription carries the option as a documented deviation; the emitter
+    must follow it. Red first: the emitter interleaved regardless, so a
+    tiled reference differed from it by O(1)."""
+    config = _make_config()
+    config.gdn_key_head_map = "tiled"
+    ref, pin = _ref_and_pin(config)
+    state = _state_np(ref)
+    x = torch.randn(1, T, config.hidden_size)
+    mask = torch.ones(1, T, dtype=torch.long)
+    with torch.no_grad():
+        y_ref = ref(x, mask).float().numpy()
+        y_pin = pin(x, cache_params=None, attention_mask=mask.float()).float().numpy()
+    # the option changes the computation (r = 2 at this geometry)
+    assert float(np.max(np.abs(y_ref - y_pin))) > 1e-3, "tiled == interleaved: the option is inert"
+    model = gdn.build_gdn_model(config, state, seq_len=T)
+    compiled = compile_for(ov.Core(), model, device)
+    y_ov = compiled({"hidden_states": x.float().numpy(),
+                     "attention_mask": mask.float().numpy()})[compiled.output(0)]
+    max_abs = float(np.max(np.abs(y_ref - y_ov)))
+    print(f"\n[key-head-map tiled] T={T} |ov-ref|={max_abs:.3e} |ref-pin|={float(np.max(np.abs(y_ref - y_pin))):.3e}")
+    assert max_abs < 1e-5, f"emitter vs tiled reference: {max_abs:.3e}"
+    config.gdn_key_head_map = "shuffled"
+    with pytest.raises(ValueError):
+        gdn.build_gdn_model(config, state, seq_len=T)
+
+
 # ---------------------------------------------------------------------------
 # THE CHUNK-AXIS EMISSION MODES (the de-batch spike, 2026-09-12)
 # ---------------------------------------------------------------------------

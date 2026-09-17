@@ -183,6 +183,7 @@ def serving_config(n_layers, ple_eos_token_id, geometry=None):
         "full_attention_interval": 4,
         "layer_types": layer_types,
         "output_gate_type": g["output_gate_type"],
+        "gdn_key_head_map": g["gdn_key_head_map"],
         # the n-gram table declaration artifact.cpp reads (FIX D)
         "ngram_size": g["ngram_size"],
         "heads_per_ngram": g["heads_per_ngram"],
