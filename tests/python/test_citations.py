@@ -112,9 +112,9 @@ _ANCHORED = [
      "src/exec/flash_next_offload.h", "kFlashNextSliceBytes  = 2'457'600"),
     ("tools/q4e/serving_shape.py", "exec/flash_next_offload.h:45",
      "src/exec/flash_next_offload.h", "kFlashNextSliceBytes  = 2'457'600"),
-    ("tests/python/test_serving_shape.py", "fit.h:95",
+    ("tests/python/test_serving_shape.py", "fit.h:96",
      "src/exec/fit.h", "inline uint64_t expert_slot_bytes("),
-    ("tools/q4e/serving_shape.py", "src/exec/fit.h:95",
+    ("tools/q4e/serving_shape.py", "src/exec/fit.h:96",
      "src/exec/fit.h", "inline uint64_t expert_slot_bytes("),
     # -- the port names the serving path declares and feeds -----------------
     ("tests/python/test_serving_shape.py", "backend_ov.cpp:99",
