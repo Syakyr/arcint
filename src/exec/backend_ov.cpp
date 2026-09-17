@@ -898,6 +898,7 @@ public:
         pin_dispatch_         = cfg.pin_dispatch;
         moe_cpu_tier_         = cfg.moe_cpu_tier;
         moe_cpu_tier_threads_ = cfg.moe_cpu_tier_threads;
+        moe_per_expert_dispatch_ = cfg.moe_per_expert_dispatch;
         if (cfg.draft_tokens > 0) {
             drafter_     = std::make_unique<NgramDrafter>(static_cast<size_t>(cfg.draft_ngram),
                                                           static_cast<size_t>(cfg.draft_tokens));
@@ -3006,6 +3007,10 @@ private:
                     props["MOE_CPU_TIER_THREADS"] = static_cast<size_t>(moe_cpu_tier_threads_);
                 log::info("load", "MoE host compute tier enabled (threads=%s)",
                           moe_cpu_tier_threads_ > 0 ? std::to_string(moe_cpu_tier_threads_).c_str() : "auto");
+            }
+            if (moe_per_expert_dispatch_) {
+                props["MOE_PER_EXPERT_DISPATCH"] = true;
+                log::info("load", "per-expert GPU kernel dispatch enabled");
             }
         }
         // The blob cache is off for the paged graph: its import path is
@@ -7838,6 +7843,7 @@ private:
     int                            pin_dispatch_ = -1;  // --pin-dispatch; -1 = off
     bool                           moe_cpu_tier_ = false;         // --moe-cpu-tier
     int                            moe_cpu_tier_threads_ = 0;     // --moe-cpu-tier-threads
+    bool                           moe_per_expert_dispatch_ = false; // --moe-per-expert-dispatch
     // --- lanes (§4.1). One per --parallel slot; the stateful reference path
     // uses lane 0 for its embeddings and MTP requests and serialises on
     // mutex_, because it has one graph state and cannot do better.
