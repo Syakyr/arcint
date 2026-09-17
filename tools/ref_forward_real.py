@@ -148,6 +148,25 @@ def main(argv=None):
         print(f"[gate-act] layer 0 GDN norm activation {gdn0.norm.activation!r} -> {args.gate_act!r}",
               flush=True)
         gdn0.norm.activation = args.gate_act
+    # the conv's output and the core's inputs, through the pin's module-level
+    # functions (the forward calls them by global name, so a wrapper installed
+    # on the module is what it calls): conv_silu -> llama conv_output_silu-i;
+    # the core's q/k/v/g/beta after the head expansion, before the kernel's
+    # own L2 norm -> llama's q/k/v_conv_predelta-i, gate-i, beta_sigmoid-i
+    import q4e.ref_backbone as _rb
+    _pin = _rb._pin
+    _orig_conv = _pin.causal_conv1d_fn
+    def _conv_tap(*a, **kw):
+        o = _orig_conv(*a, **kw)
+        tap("L0/gdn/conv_silu", o[0] if isinstance(o, tuple) else o)
+        return o
+    _pin.causal_conv1d_fn = _conv_tap
+    _orig_chunk = _pin.torch_chunk_gated_delta_rule
+    def _chunk_tap(query, key, value, g, beta, *a, **kw):
+        tap("L0/gdn/q_in", query); tap("L0/gdn/k_in", key); tap("L0/gdn/v_in", value)
+        tap("L0/gdn/g_in", g); tap("L0/gdn/beta_in", beta)
+        return _orig_chunk(query, key, value, g, beta, *a, **kw)
+    _pin.torch_chunk_gated_delta_rule = _chunk_tap
     # the gated norm's INPUT is the delta-rule core's output (llama: attn_output-i)
     gdn0.norm.register_forward_pre_hook(
         lambda m, inp: tap("L0/gdn/core_out", inp[0]))
