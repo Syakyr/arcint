@@ -309,6 +309,46 @@ std::vector<ModelEntry> build_registry() {
     }
 
     {
+        // THE FUSED-MoE REWRITE OF THE DEPTH-12 RUNG (2026-09-17): the d12
+        // artifact above, rewritten in memory by tools/moe_tiled_rewrite.py
+        // at tree 0b66c43 and written back with ov.save_model. Not an
+        // export: the same u4 codes and zero-points, the scales rounded to
+        // f16, the MoE block in the shape the GPU plugin's tiled matcher
+        // accepts (two Reshapes, a one-input Swish, an f16 dequant chain with
+        // a trailing Convert). The first Flash-Next serving-shape artifact
+        // that compiles to moe_3gemm_fused_compressed; at --offload-ratio 99
+        // with the CPU tier it is 3.00 GiB device-resident on the 24 GiB
+        // card against 17.73 GiB unfused (campaign sub4bit-vram-kernel,
+        // status 2026-09-17). Hashes read off the artifact with
+        // --inspect-artifact. Superseded by a re-export from the shards.
+        ModelEntry e;
+        e.id                      = "qwen3.8-flash-next-d12r";
+        e.family                  = "qwen3.8";
+        e.artifact_aliases        = {"qwen38-flash-next-d12r-ov"};
+        e.ov_arch                 = "Qwen4ExpForConditionalGeneration";
+        e.model_type              = "qwen4_exp";
+        e.moe                     = true;
+        e.has_mtp_head            = false;
+        e.mtp_head_pinned         = true;   // the export writes none
+        e.mtp_in_checkpoint       = true;
+        e.n_embd                  = 2560;
+        e.n_expert                = 512;
+        e.full_attention_interval = 4;
+        e.n_layer                 = 12;     // of 48: layers 3, 7, 11 are attention
+        e.n_ctx_train             = 262144;
+        e.quants                  = {Quant::Q4};
+        e.arch_hash               = "d1d1005332c96fbc";
+        e.template_hash           = "12827f24b742ea4e";  // the GGUF's own chat template
+        e.tokenizer_hash          = "87a7830d63fcf43b";  // passthrough; vocab == the GGUF's
+        e.weights_bytes           = 22141633733ull;
+        e.status                  = "measurement artifact: depth 12 of 48, the fused-MoE "
+                                    "rewrite of the first rung; not the model's answers";
+        e.sampler = qwen_card_defaults();
+        split_layers(e);
+        r.push_back(std::move(e));
+    }
+
+    {
         // SEGMENTED (2026-09-14): ALL 48 layers as a chain of four 12-layer
         // compiled models (tools/export_serving_artifact.py --layers 48
         // --segment-layers 12, tree c00500f): segment0/..segment3/ each hold

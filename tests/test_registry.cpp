@@ -17,8 +17,13 @@ TEST(registry_holds_exactly_the_target_models) {
     // measured step between 4 and 48).
     // Ten with the segmented 48-layer chain (0.5.1 B.1) -- admitted by its
     // CHAIN hash, because it has no single language-model file to hash.
+    // Eleven with the fused-MoE rewrite of the 12-layer rung (2026-09-17,
+    // campaign sub4bit-vram-kernel): the same rung in the shape the GPU
+    // plugin's tiled MoE matcher accepts, pinned by its own xml hash.
     const auto ids = model_ids();
-    CHECK_EQ(ids.size(), 10u);
+    CHECK_EQ(ids.size(), 11u);
+    CHECK(find_model("qwen3.8-flash-next-d12r") != nullptr);
+    CHECK(find_by_artifact("qwen38-flash-next-d12r-ov") == find_model("qwen3.8-flash-next-d12r"));
     CHECK(find_model("qwen3.8-flash-next-d12") != nullptr);
     CHECK(find_model("qwen3.8-flash-next-seg12") != nullptr);
     CHECK(find_model("qwen3.8-flash-next") != nullptr);
