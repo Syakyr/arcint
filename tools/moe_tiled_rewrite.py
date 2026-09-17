@@ -94,6 +94,47 @@ def _strip_swish_beta(model):
     return n
 
 
+def _chain_to_f16(model):
+    """Constant(u4) -> Convert(f32) -> Subtract(Convert(u4 zp -> f32)) ->
+    Multiply(f32 scale Constant) -> Reshape  ==>  the same chain in f16 with
+    a trailing Convert -> f32 before the MatMul: the fusing 35B control's
+    shape. Not cosmetic: under f16 inference the plugin inserts a Convert on
+    an f32 scale Constant feeding MOECompressed and the offload series' OTD
+    resolver demands a direct Constant there ("Expected constant input for
+    MOE3GemmFusedCompressed, got: Convert", B60 census 2, 2026-09-17).
+    Returns the number of chains converted."""
+    from openvino import Type, opset13 as op
+
+    n = 0
+    for mm in model.get_ordered_ops():
+        if _type(mm) != "MatMul":
+            continue
+        rs = mm.input_value(1).get_node()
+        if _type(rs) != "Reshape" or rs.get_output_element_type(0) != Type.f32:
+            continue
+        mul = rs.input_value(0).get_node()
+        if _type(mul) != "Multiply":
+            continue
+        sub, scale = mul.input_value(0).get_node(), mul.input_value(1).get_node()
+        if _type(sub) != "Subtract" or _type(scale) != "Constant":
+            continue
+        cw, cz = sub.input_value(0).get_node(), sub.input_value(1).get_node()
+        if _type(cw) != "Convert" or _type(cz) != "Convert":
+            continue
+        w, zp = cw.input_value(0).get_node(), cz.input_value(0).get_node()
+        if _type(w) != "Constant" or _type(zp) != "Constant" or w.get_output_element_type(0) != Type.u4:
+            continue
+        sc16 = op.constant(np.asarray(scale.get_data(), dtype=np.float32).astype(np.float16))
+        sc16.set_friendly_name(scale.get_friendly_name())
+        x = op.multiply(op.subtract(op.convert(w, Type.f16), op.convert(zp, Type.f16)), sc16)
+        x = op.reshape(x, rs.input_value(1), special_zero=False)
+        x.set_friendly_name(rs.get_friendly_name())
+        x = op.convert(x, Type.f32)
+        mm.input(1).replace_source_output(x.output(0))
+        n += 1
+    return n
+
+
 def rewrite_tiled_moe(model):
     """Insert the two matcher-anchoring Reshapes into every old-style block
     and strip the beta input off every Swish(x, 1.0). Returns the number of
@@ -103,6 +144,7 @@ def rewrite_tiled_moe(model):
 
     n = 0
     n_sw = _strip_swish_beta(model)
+    n_16 = _chain_to_f16(model)
     for mul3, outs, uns in list(_find_blocks(model)):
         ps = outs.get_partial_shape()
         E, H = ps[0], ps[2]
@@ -128,9 +170,9 @@ def rewrite_tiled_moe(model):
             elif src is uns:
                 mul3.input(i).replace_source_output(wu.output(0))
         n += 1
-    if n or n_sw:
+    if n or n_sw or n_16:
         model.validate_nodes_and_infer_types()
-    return max(n, n_sw)
+    return max(n, n_sw, (n_16 + 2) // 3)
 
 
 def walk(model):

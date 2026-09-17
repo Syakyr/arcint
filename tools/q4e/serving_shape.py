@@ -760,6 +760,17 @@ def _compressed_expert(arena, e, out, inn, name, filler=None,
         assert sc.shape == (e, out, groups, 1), (
             f"{name}: filler returned scales {sc.shape}, the constant is "
             f"{(e, out, groups, 1)}")
+    # THE DEQUANT CHAIN'S TYPE IS f16 WITH A TRAILING Convert TO f32 -- the
+    # fusing 35B control's exact shape (walked node by node 2026-09-17), and
+    # not a cosmetic choice: under the plugin's f16 inference precision an
+    # f32 scale Constant feeding the fused MOECompressed gets a Convert
+    # inserted by KeepConstantsPrecisionAndAddConverts, and the offload
+    # series' OTD resolver (moe.cpp, patch 0005 on) demands direct Constants:
+    # "Expected constant input for MOE3GemmFusedCompressed, got: Convert"
+    # (census 2, B60, 2026-09-17). An f16 scale needs no Convert. The PORTED
+    # chain (dead route) keeps its f32 arithmetic; the unpack cell compares
+    # each against its own reference.
+    ct = Type.f32 if port_sink is not None else Type.f16
     if port_sink is not None:
         # SEGMENTED: the codes are a u8 PORT, bound by the runtime; only the
         # zero-points and scales are constants of this segment's graph
@@ -768,27 +779,37 @@ def _compressed_expert(arena, e, out, inn, name, filler=None,
     elif filler is None:
         w = arena.constant([e, out, groups, gs], EXPERT_DECLARED_TYPE)
         w.set_friendly_name(name + "/weight_u4")
-        x = op.convert(w, Type.f32)
+        x = op.convert(w, ct)
     else:
         w = arena.constant([e, out, groups, gs], EXPERT_DECLARED_TYPE,
                            fill=pw, name=name + "/weight_u4")
         w.set_friendly_name(name + "/weight_u4")
-        x = op.convert(w, Type.f32)
+        x = op.convert(w, ct)
     if filler is None:
         zp = arena.constant([e, out, groups, 1], EXPERT_DECLARED_TYPE)
-        scale = op.constant(np.ones((e, out, groups, 1), np.float32))
+        scale = op.constant(np.ones((e, out, groups, 1),
+                                    np.float32 if ct == Type.f32 else np.float16))
     else:
         zp = arena.constant([e, out, groups, 1], EXPERT_DECLARED_TYPE,
                             fill=pzp, name=name + "/zero_point")
-        scale = arena.f32_filled(sc)
-        arena.scales[name + "/scale"] = sc
+        if ct == Type.f32:
+            scale = arena.f32_filled(sc)
+            arena.scales[name + "/scale"] = sc
+        else:
+            sc16 = np.ascontiguousarray(sc, dtype=np.float16)
+            scale = arena.constant(list(sc16.shape), Type.f16, fill=sc16,
+                                   name=name + "/scale")
+            arena.scales[name + "/scale"] = sc16.astype(np.float32)   # as carried
     zp.set_friendly_name(name + "/zero_point")
     scale.set_friendly_name(name + "/scale")
-    x = op.subtract(x, op.convert(zp, Type.f32))
+    x = op.subtract(x, op.convert(zp, ct))
     x = op.multiply(x, scale)
     x = op.reshape(x, op.constant(np.array([e, out, inn], np.int64)),
                    special_zero=False)
     x.set_friendly_name(name + "/dequant_reshape")
+    if ct != Type.f32:
+        x = op.convert(x, Type.f32)
+        x.set_friendly_name(name + "/dequant_f32")
     return x
 
 

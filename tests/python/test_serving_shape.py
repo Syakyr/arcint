@@ -2279,7 +2279,24 @@ def test_expert_port_bodies_unpack_bit_exact_against_the_shipped_codes(tmp_path)
         rq.infer()
         assert not np.array_equal(want_codes, np.array(rq.get_output_tensor(0).data))
 
-        # (2) the dequant: port vs constant, one ulp, counted
+        # (2) the dequant, each path against ITS OWN reference (2026-09-17:
+        # the Constant chain is f16 with a trailing Convert -- the fusing
+        # control's shape -- while the ported chain stays f32 arithmetic)
+        _, pzp, sc32 = ef.ExpertFiller(_RowsSource(small, seed=11), gs).body(0, "gate", E, I, H)
+        zp_codes = ef.unpack_u4(pzp, E * I * (H // gs)).reshape(E, I, H // gs, 1).astype(np.float32)
+        q = want_codes.reshape(E, I, H // gs, gs)
+        ref32 = ((q - zp_codes) * sc32.astype(np.float32)).reshape(E, I, H)
+        # f16 chain: (q - zp) * f16(s) is exact in f32 (4 + 11 bits). Measured
+        # 2026-09-17 on the CPU plugin: the folded chain, trailing Convert
+        # included, returns exactly that f32 product (0 of 262,144 differ);
+        # rounding the reference to f16 first made 42,280 differ. The bound
+        # stays one f16 ulp of the larger product so that a plugin folding
+        # the chain in f16 arithmetic (two roundings, a cancellation) is still
+        # inside it, and the count is printed.
+        sc16 = sc32.astype(np.float16)
+        ref16 = ((q - zp_codes) * sc16.astype(np.float32)).reshape(E, I, H)
+        bound16 = np.broadcast_to(np.spacing(np.float16(16) * np.abs(sc16)).astype(np.float32),
+                                  (E, I, H // gs, gs)).reshape(E, I, H)
         ref = _compile_cpu(const_model).create_infer_request()
         ref.infer()
         want = np.array(ref.get_output_tensor(0).data, dtype=np.float32, copy=True)
@@ -2288,18 +2305,22 @@ def test_expert_port_bodies_unpack_bit_exact_against_the_shipped_codes(tmp_path)
         req.infer()
         got = np.array(req.get_output_tensor(0).data, dtype=np.float32, copy=True)
         assert want.shape == got.shape == (E, I, H) and np.abs(want).max() > 0
-        diff = np.abs(want - got)
+        diff16 = np.abs(want - ref16)
+        n16 = int((diff16 > 0).sum())
+        diff = np.abs(ref32 - got)
         # the bound is one ulp of the PRODUCTS (q * s, zp * s, |q|, |zp| <= 15),
         # not of the result: the fused runtime eltwise evaluates x * s - zp * s
         # (two roundings, then a cancellation), so the absolute error is an
         # ulp of the larger product and can be many ulps of a small result
-        sc = arena.scales["cell/experts_gate/scale"]                  # [E, I, groups, 1]
-        bound = np.broadcast_to(np.spacing(np.float32(16) * np.abs(sc)).astype(np.float32),
+        bound = np.broadcast_to(np.spacing(np.float32(16) * np.abs(sc32)).astype(np.float32),
                                 (E, I, H // gs, gs)).reshape(E, I, H)
         n_diff = int((diff > 0).sum())
-        print(f"[unpack-cell] dequant: port vs constant max |diff| {diff.max():.3e}, "
-              f"{n_diff} of {diff.size} elements differ, all within one ulp of the "
-              f"products: {bool((diff <= bound).all())}")
+        print(f"[unpack-cell] dequant: Constant (f16) chain vs f16 reference max |diff| "
+              f"{diff16.max():.3e}, {n16} of {want.size} differ, within one f16 ulp of the "
+              f"products: {bool((diff16 <= bound16).all())}; port (f32) chain vs f32 "
+              f"reference max |diff| {diff.max():.3e}, {n_diff} differ, within one ulp of "
+              f"the products: {bool((diff <= bound).all())}")
+        assert (diff16 <= bound16).all()
         assert (diff <= bound).all()
     finally:
         arena.close()
