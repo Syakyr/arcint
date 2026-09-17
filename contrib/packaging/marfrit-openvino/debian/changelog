@@ -18,7 +18,7 @@ marfrit-openvino (2026.4.0~dev20260821+p18-1) bookworm trixie; urgency=medium
       gather and the stages it sizes now run over the filled count, and a
       batch with no resident expert takes the per-expert path as before
       0037. Bisected and measured 2026-09-17: the 35B at --offload-ratio 99
-      --moe-cpu-tier serves on the B60, 23.6 t/s decode.
+      --moe-cpu-tier serves on the B60, 23.6 t/s decode (KV u8, f16).
 
  -- Markus Fritsche <mfritsche@reauktion.de>  Thu, 17 Sep 2026 20:05:00 +0200
 

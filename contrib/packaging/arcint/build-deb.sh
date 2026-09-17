@@ -26,7 +26,10 @@ OV_PREFIX=/usr/lib/marfrit-openvino
 # The ABI is the nightly, not the patch level: floor the patch level, cap at
 # the next nightly. An exact pin (Depends: = +p1-1) made apt REMOVE arcint when
 # the runtime was upgraded to +p3 on 2026-09-04; never render "=" here again.
-OV_DEP_VERSION="2026.4.0~dev20260821+p15-1"
+OV_DEP_VERSION="2026.4.0~dev20260821+p18-1"
+# The +p18 floor is the unreleased tip's (patch 0042: patch 0037's hybrid prefill
+# launched its gather over every token-expert pair while the tables held only the
+# resident ones — a page fault on Xe2; +p16 and +p17 carry 0037 without the fix).
 # The +p15 floor is 0.4.4's (patch 0033: with four-bit values the verify pass read the
 # value rows through the f16 row's alignment, the agent configuration's alternating
 # text; DESIGN §7.0.2bu -- every +p14 runtime serves that configuration wrong, so the

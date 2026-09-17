@@ -9156,6 +9156,59 @@ Coder offload regression (GPU.0, qwen36-coder-b5-ov, ratio 20, u8:i4):
 1lane PASS (all byte-identity checks, speculative decoding deterministic,
 cache warm/cold identical, continuation restore matching).
 
+#### 7.0.2by Patch 0037's page fault on Xe2, bisected and fixed: the hybrid prefill's gather ran past its tables (2026-09-17)
+
+Campaign: `docs/campaigns/static-partition-prefill.md` (the patch's own),
+`docs/campaigns/sub4bit-vram-kernel.md` (where it was found).
+Plugin patch 0042, `marfrit-openvino +p18` (patches 0003–0042).
+
+**Correction to §7.0.2bx.** Its "no GPU kernel change" is true and was the
+wrong reassurance: the change that matters is in what the unchanged gather
+kernel is launched over. Under the hybrid split the grouped-GEMM tables hold
+only the resident (token, k) pairs — the non-resident pairs carry the
+sentinel and are skipped — while `total_gathered_tokens` stayed
+`token_num * max_topk` and the gather ran over every pair. A work-group past
+the fill computed `token_index = -1 * HIDDEN_SIZE` from the table's -1
+initialiser and added it to the kernel's `uint` offset: ~2^32 elements,
+~8 GiB past the activation buffer. On the Arc Pro B60 that address is
+unmapped: an xe page fault (`Fault response: Unsuccessful -ENOENT`, the
+faulted address ~8.2 GiB), a device coredump (`Timedout job` on the compute
+engine), `CL_OUT_OF_RESOURCES` from the runtime at the CPU tier's first
+prefill — the expert slot-pool plateau probe. Before 0037 the static
+partition returned nullopt for any non-resident pair, so the fill was always
+complete and the launch size right by accident.
+
+**Measured-here, the bisect (B60, the 35B at `--offload-ratio 99
+--moe-cpu-tier`, one fresh served process per cell):** +p13 (through 0031)
+serves; +p16 (through 0037) faults; +p16 rebuilt without 0037 serves; +p17
+with `MOE_CPU_TIER_PARTITION=lru` (0037's branch is static-partition-only)
+serves; the A770 serves with 0037 in place — its silence on the same
+wrapped read is not explained on the record. Inside 0037: the post-GEMM host
+dispatch disabled still faults; the micro-GEMM remap disabled still faults;
+the grouped-GEMM remap disabled serves; a zero-resident guard alone still
+faults; a `stream.finish()` after every stage of the grouped path shows the
+first synchronisation, right after the gather, already throwing.
+
+**The fix (0042):** the gather and the stages it sizes run over the filled
+count (the last slot's exclusive end offset); the token tables are
+zero-initialised on both prefill paths and the GPU mask-gen's device table
+is zeroed before the kernel, so any over-sized launch names row 0, never a
+wrapped index; a batch with no resident expert takes the per-expert path and
+counts as a grouped fallback. Measured-here: the 35B serves on the B60 with
+the tier at ratio 99, Paris, warm repeat identical, decode 23.6 t/s, KV u8,
+f16 inference, the hybrid path active, no fault.
+
+**Known and not fixed here:** `total_gathered_tokens` is also the key of the
+per-layer oneDNN grouped-primitive cache and the M of its descriptors; as the
+filled count it is routing-dependent, so under the static-partition hybrid a
+new prompt can rebuild three grouped primitives per MoE layer. Not observed
+by the same-prompt validation above; a red case needs two prompts of equal
+length. Mitigation designed, owed: bucket the descriptor M and cache key to
+a multiple of 64 with the last group padded and the padding rows never
+scattered. Also owed: the unit-ladder cell that builds the tables with
+sentinel entries and asserts the filled count against the launch size; the
+served reproducer is this patch's only red-first cell.
+
 #### 7.0.3 KV precision on the paged path — u8 is the lever, u4 is a tax
 
 The plugin accepts f16/u8/i8/u4/i4 for `KV_CACHE_PRECISION` on the paged path,
