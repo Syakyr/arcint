@@ -141,7 +141,7 @@ def test_a_pruned_cut_declares_only_the_ports_the_cut_graph_reaches():
     assert m and int(m.group(1)) > 0, out[-2000:]
     ports = re.search(r"BOOT \[compile\] ports: (.*)", out)
     assert ports, out[-2000:]
-    names = [p.split("[")[0] for p in ports.group(1).split(", ")]
+    names = re.findall(r"([A-Za-z_][\w.]*)\[", ports.group(1))   # shapes carry ", " too
     assert "inputs_embeds" in names and "conv_mask" in names, names
     assert not [n for n in names if n.startswith(("ngram_table.", "key_cache.", "value_cache."))], names
     assert len(names) == int(m.group(2)), (names, m.group(2))
