@@ -50,6 +50,11 @@ def main(argv=None):
     ap.add_argument("--ids", required=True, help="comma-separated token ids")
     ap.add_argument("--layers", type=int, default=1)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--unfold-norms", default="",
+                    help="comma-separated pin-key suffixes whose fed vector gets 1.0 "
+                         "subtracted after the feed -- the experiment for a norm gamma "
+                         "the GGUF converter stored folded as (1 + w) while the pin "
+                         "applies (1 + w) itself")
     args = ap.parse_args(argv)
 
     import torch
@@ -87,6 +92,12 @@ def main(argv=None):
         arr = feed.fitted(k, tuple(sd[k].shape))
         sd[k] = torch.from_numpy(np.ascontiguousarray(arr)).to(sd[k].dtype)
         fed += 1
+    unfold = tuple(x for x in args.unfold_norms.split(",") if x)
+    if unfold:
+        hit = [k for k in sd if k.endswith(unfold)]
+        for k in hit:
+            sd[k] = sd[k] - 1.0
+        print(f"[unfold] 1.0 subtracted from {len(hit)} fed vector(s): {hit}", flush=True)
     ref.load_state_dict(sd)
     del sd
     print(f"[feed] {fed} keys fed at the real geometry in {time.time() - t0:.1f}s "
