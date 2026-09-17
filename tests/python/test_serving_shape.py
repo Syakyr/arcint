@@ -588,7 +588,7 @@ def slot_pool_from_tiled_ir(model, num_expert, ratio_pct):
     `num_expert` that feed a dequant chain, grouped per MoE layer.
 
     Same per-expert arithmetic as backend_ov.cpp:601-605 (product of dims[1:]
-    times the CEILED element size) and the same slot ceiling as fit.h:95.
+    times the CEILED element size) and the same slot ceiling as fit.h:96.
     """
     per_layer = {}
     for node in model.get_ordered_ops():
@@ -733,7 +733,7 @@ def test_the_pattern_matcher_prices_the_expert_pool_and_lands_on_the_cpp_constan
 
 
 def test_the_slot_arithmetic_transcription_matches_the_cpp_ceiling():
-    """fit.h:95, `ceil(num_expert * (100 - ratio) / 100)` slots per layer.
+    """fit.h:96, `ceil(num_expert * (100 - ratio) / 100)` slots per layer.
     Checked at the boundaries a ceiling gets wrong."""
     cases = [(512, 0, 512), (512, 50, 256), (512, 100, 0),
              (512, 1, 507), (512, 99, 6), (10, 33, 7), (3, 50, 2)]
@@ -2329,3 +2329,92 @@ def test_expert_ports_are_declared_per_body_of_the_segment_and_the_constants_are
         assert all(n.endswith("/zero_point") for n in u4_consts) and len(u4_consts) == 12
     finally:
         arena.close()
+
+
+# ---------------------------------------------------------------------------
+# THE FUSION CONTRACT (sub4bit-vram-kernel, 2026-09-17): the emitted MoE block
+# must be the shape the GPU plugin's ConvertTiledMoeBlockTo3GatherMatmuls
+# matcher accepts, or nothing downstream of it -- MOECompressed, the slot
+# pool, the CPU tier, per-expert dispatch -- ever exists in the compiled graph
+# ---------------------------------------------------------------------------
+
+def _walk_tiled_moe_pattern(model):
+    """Every ReduceSum of `model`, walked backward against the plugin's
+    3-GEMM tiled-MoE constraint list by `tools/check_tiled_pattern.py` (a
+    Python re-implementation of the C++ matcher, transcribed from the plugin
+    source). Returns (matched names, {reduce_sum name: (constraint, observed,
+    expected)} for the rest). A walker PASS is not a compile: its docstring
+    lists the blind spots. A walker FAIL on a named constraint is a real
+    non-match at the serialised stage."""
+    import check_tiled_pattern as ctp
+    matched, failures = [], {}
+    for rs in model.get_ordered_ops():
+        if rs.get_type_name() != "ReduceSum":
+            continue
+        try:
+            ctp.check_3gemm_from_reduce_sum(rs, lambda s: None)
+            matched.append(rs.get_friendly_name())
+        except ctp.Fail as f:
+            failures[rs.get_friendly_name()] = (f.constraint, f.observed, f.expected)
+    return matched, failures
+
+
+def test_every_moe_layer_walks_the_plugins_tiled_3gemm_pattern(tmp_path):
+    """One full walker match per MoE layer, on the LIVE model and on the
+    save -> read_model round trip (the stage the plugin reads).
+
+    RED FIRST, measured 2026-09-17 on the real depth-12 artifact (12 MoE
+    layers, 43 ReduceSum candidates, 0 matched): every MoE candidate failed
+    at R4.router_reshape.type, observed Transpose, expected Reshape -- and the
+    same walk on this emitter's output fails identically. The compiled graph
+    of that artifact carried 0 MoE-typed primitives and 230 FullyConnected,
+    17.73 GiB device-resident (B60, stock 2026.4.0 + p17), against
+    moe_3gemm_fused_compressed x40 at 1.2 GiB for the HF-exported 35B control
+    on the same plugin and props.
+
+    The cause is in `emit_moe_tiled`: it names `export_mtp.py:401
+    moe_block_tiled` as its source and drops the two Reshapes that function
+    carries and the matcher anchors on -- `end_reshape` (the down-projection
+    output split back to [E,B,-1,H] BEFORE the router-weight Multiply) and
+    `router_reshape` (Transpose -> Reshape [E,B,-1] -> Unsqueeze). Pattern:
+    build_3gemm_pattern() in the plugin's
+    convert_tiled_moe_block_to_gather_matmuls.cpp (`code`).
+
+    Scope: the Constant build only. A ported build (`expert_ports`) carries
+    the bodies as Parameters and the matcher's CompressedWeightsBlock anchors
+    on a Constant, so it cannot match by construction; that route is priced
+    out anyway (window-051 B.3). And a walker PASS is the serialised stage:
+    the plugin's own passes run before the matcher, so the compile's
+    primitive census is the proof, not this cell.
+    """
+    small = _tiny_config(4)
+    arena = ss.SparseArena(capacity_bytes=1 << 32)
+    try:
+        # rope_span=64: the shared rope tables are the bulk of the .bin this
+        # cell writes and no node the walker inspects depends on them
+        model, rep = ss.build_serving_shape_ir(config=small, arena=arena, n_layers=4,
+                                               rope_span=64)
+        n_moe = rep["n_layers"]
+        live_ok, live_fail = _walk_tiled_moe_pattern(model)
+        xml = tmp_path / "tiled.xml"
+        ov.save_model(model, str(xml), compress_to_fp16=False)
+        back = ov.Core().read_model(str(xml))
+        back_ok, back_fail = _walk_tiled_moe_pattern(back)
+    finally:
+        arena.close()
+    first_live = sorted(set(v[0] for v in live_fail.values()))
+    first_back = sorted(set(v[0] for v in back_fail.values()))
+    print(f"\n[fusion-contract] {n_moe} MoE layers: live {len(live_ok)} matched, "
+          f"round-trip {len(back_ok)} matched; failing constraints live "
+          f"{first_live}, round-trip {first_back}")
+    # the MoE roots are named `layer<i>/moe/mix`; every other ReduceSum (the
+    # router renorm, the norms) is auto-named and fails at R1 by design
+    moe_fail = {k: v for k, v in live_fail.items() if k.endswith("/moe/mix")}
+    assert len(live_ok) == n_moe, (
+        f"{len(live_ok)} of {n_moe} MoE blocks walk the tiled 3-GEMM pattern on "
+        f"the live model. MoE roots failing: {moe_fail or live_fail}")
+    assert len(back_ok) == n_moe, (
+        f"{len(back_ok)} of {n_moe} MoE blocks survive save -> read_model: "
+        f"{back_fail}. A Reshape the optimiser can prove redundant is folded "
+        f"at save (export_mtp.py:515-531 records the mechanism); the target "
+        f"shape must carry a runtime -1.")

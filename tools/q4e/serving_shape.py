@@ -794,9 +794,22 @@ def _compressed_expert(arena, e, out, inn, name, filler=None,
 
 def emit_moe_tiled(hidden_bth, config, state, arena, T, tag, filler=None,
                    layer=None, port_sink=None):
-    """The MoE layer in the shape measured to fuse on the card
-    (export_mtp.py:401 moe_block_tiled), at real geometry, expert bodies
-    slot-referenced. Returns a [1,T,H] node."""
+    """The MoE layer in the shape the GPU plugin's
+    ConvertTiledMoeBlockTo3GatherMatmuls matcher accepts (export_mtp.py:401
+    moe_block_tiled, walked node by node against the pattern source), at real
+    geometry, expert bodies slot-referenced. Returns a [1,T,H] node.
+
+    "Measured to fuse" was inherited from the MTP exporter, not re-measured
+    here, and until 2026-09-17 this function deviated from it in the two
+    Reshapes the matcher anchors on (see the comment at the mixing stage).
+    The contract cell is `test_every_moe_layer_walks_the_plugins_tiled_3gemm_pattern`;
+    the compile that proves it is a card window.
+
+    Contract: `hidden_bth` is rank 3 with dim 0 the batch, statically 1 (the
+    mixing stage reads B off its ShapeOf and the shared-expert Add relies on
+    it). With a `port_sink` the expert bodies are Parameters, and the matcher's
+    CompressedWeightsBlock anchors on a Constant: a ported build cannot fuse
+    by construction, and the contract cell covers the Constant build only."""
     H = config.hidden_size
     E = config.num_experts
     I = config.moe_intermediate_size
@@ -842,9 +855,34 @@ def emit_moe_tiled(hidden_bth, config, state, arena, T, tag, filler=None,
     outs = op.matmul(op.multiply(g, u), down_w,
                      transpose_a=False, transpose_b=True)              # [E,M,H]
 
+    # THE TWO RESHAPES THE MATCHER ANCHORS ON. build_3gemm_pattern() in the
+    # plugin's convert_tiled_moe_block_to_gather_matmuls.cpp wants
+    # `end_reshape` = Reshape(down_matmul) and `router_reshape` =
+    # Reshape(Transpose(scatter)) -> optional Unsqueeze, both feeding the
+    # router-weight Multiply. This emitter dropped both until 2026-09-17: the
+    # constraint walker (tools/check_tiled_pattern.py) failed every MoE
+    # candidate of the depth-12 artifact at R4.router_reshape.type and its
+    # compiled graph carried 0 MoE-typed primitives, 230 FullyConnected, every
+    # expert computed for every token. Construction as export_mtp.py:532-537:
+    # B read from ShapeOf, S a runtime -1 -- a target whose every dim is known
+    # is folded away at validate/save on 2026.4.0 (export_mtp.py:515-531).
+    # Here B is statically 1, so the ShapeOf folds to a literal and the -1
+    # alone keeps the Reshape alive (M stays dynamic); export_mtp's B is a
+    # genuine runtime value. Whether a mid-pipeline pass drops a static-1
+    # rank insertion is what the card compile's primitive census answers.
+    ps = hidden_bth.output(0).get_partial_shape()
+    assert (ps.rank.get_length() == 3 and ps[0].is_static and ps[0].get_length() == 1), (
+        f"{tag}: emit_moe_tiled wants [1,T,H], got {ps}")
+    b_dim = op.slice(op.shape_of(hidden_bth, output_type="i32"),
+                     i32v(0), i32v(1), i32v(1), i32v(0))                  # [B]
+    outs4 = op.reshape(outs, op.concat([i32v(E), b_dim, i32v(-1), i32v(H)], axis=0),
+                       special_zero=False)                               # [E,B,S,H]
     wt = op.transpose(weights, op.constant(np.array([1, 0], np.int32)))  # [E,M]
-    wt = op.unsqueeze(wt, i32(-1))                                       # [E,M,1]
-    mixed = op.reduce_sum(op.multiply(outs, wt), i32v(0), keep_dims=False)  # [M,H]
+    wr = op.reshape(wt, op.concat([i32v(E), b_dim, i32v(-1)], axis=0),
+                    special_zero=False)                                  # [E,B,S]
+    wu = op.unsqueeze(wr, i32v(-1))                                      # [E,B,S,1]
+    mixed = op.reduce_sum(op.multiply(outs4, wu), i32v(0), keep_dims=False)  # [B,S,H]
+    mixed.set_friendly_name(f"{tag}/mix")      # the matcher's root, addressable
 
     # the shared expert (pin 986-996) stays dense f32 -- it is one MLP per
     # layer, 0.0183 GiB, and it is CARD tier in the size ledger
@@ -1853,7 +1891,7 @@ def slot_pool_from_ir(model, num_expert, ratio_pct):
 
 
 def _expert_slot_bytes(num_expert, ratio_pct, per_expert_bytes, moe_layers):
-    """src/exec/fit.h:95 -- ceil(num_expert * (100 - ratio) / 100) slots per
+    """src/exec/fit.h:96 -- ceil(num_expert * (100 - ratio) / 100) slots per
     layer, times per-expert bytes, times layers."""
     slots = -((-num_expert * (100 - ratio_pct)) // 100)
     return slots * per_expert_bytes * moe_layers
