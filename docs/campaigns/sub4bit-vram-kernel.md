@@ -340,3 +340,22 @@ fusion-impact profile, not a kernel micro-benchmark) applies.
   tier fault (driver-side, needs the coredump and a plugin-level
   reproducer), the no-tier binding defect, then the ratio sweep and the
   gate's Prüfstand at full depth once a 48-layer fused artifact exists.
+- 2026-09-17, later still — **compile-time staging on the fused offload
+  route, and 0041's question.** `measured-here` (B60, the rewritten
+  depth-12 artifact, ratio 99 + CPU tier, compile only, driver-side gtt
+  off the host sampler at 2 s): the genuine +p17 package plugin stages
+  6.4 GiB through the driver for 12 layers (~0.53 GiB/layer) against
+  20.9 GiB unfused (~1.7 GiB/layer, the 09-13 linear probe's ~1.4); with
+  patch 0041 on top, the same 6.4 GiB. The fused offload route already
+  avoids uploading the offloaded expert bodies at compile; 0041 adds
+  nothing measurable there and its question closes for this route. The
+  48-layer fused compile at ratio 99 is therefore forecast at ~26 GiB of
+  driver memory (`measured-here` extrapolation, linear in layers as the
+  09-13 probe found), inside this host's physical budget — the 48-layer
+  fused export was started on that forecast. Not forecast to fit: the CPU
+  tier's host pool at 48 layers (~58 GiB of expert bodies), the residency
+  stream's problem, unchanged. Process note: the "+p17 package plugin" of
+  this day's served legs was a hand build (p17 + 0041) copied over the
+  package file — found by `dpkg -V` before this A/B; the served results
+  stand (0041 is inert without its flag, and this cell shows it inert at
+  compile), the labels were wrong.
