@@ -121,12 +121,32 @@ def main(argv=None):
     taps = {}
 
     def tap(name, t):
-        a = np.ascontiguousarray(t.detach().float().numpy().reshape(T, *t.shape[2:]) if t.dim() > 2
-                                 else t.detach().float().numpy().reshape(T, -1), dtype=np.float32)
+        x = t.detach().float().numpy()
+        if x.ndim >= 3 and x.shape[0] == 1 and x.shape[1] == T:
+            a = x.reshape(T, *x.shape[2:])
+        elif x.ndim == 2 and x.shape[0] == T:
+            a = x
+        else:
+            a = x                                   # e.g. a conv output [C, T'] or [1, C, T']
+        a = np.ascontiguousarray(a, dtype=np.float32)
         taps[name] = a
         np.save(out / (name.replace("/", "__") + ".npy"), a)
         print(f"[tap] {name:<20} {str(a.shape):<16} sum {a.sum():+.6f} absmax {np.abs(a).max():.4f}",
               flush=True)
+
+    # inner taps of layer 0's GDN, by forward hooks on the pin's submodules --
+    # llama.cpp's names beside each: in_proj_qkv -> linear_attn_qkv_mixed,
+    # in_proj_z -> z, in_proj_a -> alpha, in_proj_b -> beta (pre-sigmoid),
+    # conv1d -> conv_output_raw (before the silu, over the padded sequence),
+    # norm -> final_output (the gated norm, before out_proj), out_proj ->
+    # linear_attn_out
+    gdn0 = ref.layers[0].linear_attn
+    for sub in ("in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b", "conv1d", "norm", "out_proj"):
+        mod = getattr(gdn0, sub, None)
+        if mod is None:
+            continue
+        mod.register_forward_hook(
+            lambda m, inp, o, sub=sub: tap(f"L0/gdn/{sub}", o[0] if isinstance(o, tuple) else o))
 
     hc = cfg.hc_count
     H = cfg.hidden_size
