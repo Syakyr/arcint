@@ -35,8 +35,17 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("a"); ap.add_argument("b")
     ap.add_argument("--records", type=int, default=0, help="compare only the first N records (0 = all shared)")
+    ap.add_argument("--from-n", type=int, default=0,
+                    help="align on the first record with this many new tokens in EACH file (the request's prefill; the load ladder and the slot-pool probe come first and differ per configuration), then compare it and the records after it")
     a = ap.parse_args()
     ra, rb = read_dump(a.a), read_dump(a.b)
+    if a.from_n:
+        ia = next((i for i, r in enumerate(ra) if r[2] == a.from_n), None)
+        ib = next((i for i, r in enumerate(rb) if r[2] == a.from_n), None)
+        if ia is None or ib is None:
+            print(f"no record with n={a.from_n} in A ({ia}) or B ({ib})"); return 1
+        print(f"aligned: A record {ia}, B record {ib} (first with n={a.from_n})")
+        ra, rb = ra[ia:], rb[ib:]
     n = min(len(ra), len(rb))
     if a.records:
         n = min(n, a.records)

@@ -9,13 +9,15 @@ f16 inference, one lane, from the NVMe: the llama.cpp logits capture of
 the same GGUF (`qwen4exp-c2735-chunks2`, two windows of 2,735 tokens)
 replayed through the server — mean KL(reference ‖ served) **12.42 / 12.16
 nats** (window 0, below / above the midpoint) and **12.40 / 12.34**
-(window 1), max 26–35, argmax agreement **0.0007 and 0.0000**. The uniform
-distribution over the 248,320-token vocabulary sits at ln(248320) = 12.42
-nats: the served logits are indistinguishable from noise against the
-model's own. The depth-12 rung read 11.93 / 11.63 on 2026-09-13
-(`docs/window-051.md`) and the depth-4 rung about the same; those were
-read as "44 (36) layers missing". They were not: the artifact family is
-wrong at every depth, and full depth changed nothing.
+(window 1), max 26–35, argmax agreement **0.0007 and 0.0000**. For scale, ln(248320) = 12.42 nats is
+the KL a reference of zero entropy would score against a uniform served
+distribution; with an argmax agreement of zero the served logits carry no
+information about the model's own. The depth-12 rung read 11.93 / 11.63 on
+2026-09-13 (`docs/window-051.md`) and the depth-4 rung about the same;
+those were read as "44 (36) layers missing". A truncated prefix of a deep
+model scores like that too, so those rungs could not decide between
+"missing layers" and "a broken artifact"; the full-depth rung decides:
+the artifact is broken, and nothing says at which depth.
 
 The served output is deterministic: France raw, greedy, 8 tokens is
 byte-identical across two cold starts and across two storage paths, and
@@ -118,7 +120,7 @@ it is mechanism, not an answer.
 ## Status
 
 - 2026-09-18 — opened from the full-depth KLD of the night before: the
-  served logits sit at the uniform floor (12.4 nats) at depth 48 as they
-  did at depth 12 and 4; the "missing layers" reading is retracted here
-  and in the campaign that produced the full-depth serve. Nothing
+  served logits carry no information at depth 48 (KL 12.4 nats, argmax
+  agreement 0); the depth-12 and depth-4 rungs read the same and could not
+  distinguish "missing layers" from "broken" — full depth does. Nothing
   localised yet.
