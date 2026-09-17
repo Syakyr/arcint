@@ -157,3 +157,104 @@ fusion-impact profile, not a kernel micro-benchmark) applies.
   sentinel (the proof-of-concept all-CPU-tier redirect). Fable-reviewed:
   clean (0 findings; prior round's 6 findings C1-C4/M1-M2 all addressed).
   Pipeline step 4 (the kernel work) done. Next: one-card window measurement.
+- 2026-09-16 — one-card window blocked: host OOM during compile_model,
+  all three attempts. (1) --offload-ratio 100 disables partial upload
+  entirely (moe_offload_constant.cpp:62, `otd_ratio < 100` boundary),
+  every expert constant gets full allocate_memory + memcpy → 152 GiB
+  virtual, OOM-killed. (2-3) --offload-ratio 99 enables partial upload
+  (~602 MiB expert slot buffers instead of 64.6 GiB), but read_model
+  (backend_ov.cpp:2570) still mmaps the full 77 GiB .bin; graph
+  construction walks all 17,354 nodes, paging in mmap regions; the
+  host (62 GiB RAM, 20 GiB swap) exhausts both → global OOM at 23:17
+  (dmesg: pid 637454, total-vm 36 GiB, 610k swap entries, roundhouse
+  killed first). The model cannot be compiled on this host at full
+  depth without a plugin change to avoid mmapping expert weight regions.
+  arcint CLI flag (--moe-per-expert-dispatch) in working tree, not
+  tagged. Services restored.
+- 2026-09-17 — **the per-expert series is inert on the Flash-Next
+  artifact family: the plugin's MoE fusion never matches the
+  serving-shape emitter's MoE subgraph** (`measured-here`, B60 = GPU.0,
+  22.71 GiB, stock core 2026.4.0-22849 + the p17 plugin series with
+  patch 0041 hand-applied, plugin sha 4f881fff…, tools tree = e50148f).
+  Instrument: `compile_model` then `get_runtime_model()`, primitive
+  types counted off `layerType`, residency off `GPU_MEMORY_STATISTICS`.
+  - `qwen38-flash-next-d12-ov` (12 layers, 4,565 IR nodes, expert bodies
+    as 36 u4 `Const`), props `OFFLOAD_RATIO=99 MOE_CPU_TIER=YES`:
+    1,201 exec nodes, **0 MoE-typed primitives**, 230 `FullyConnected`,
+    `usm_device` **17.73 GiB** — the 09-13 stock-plugin figure (c05) to
+    the digit. Adding `MOE_PER_EXPERT_DISPATCH=YES`: identical residency
+    (17.73 GiB; fdinfo vram0 18.2 GiB, GTT plateau 20.9 GiB), compile
+    133 s → 9.6 s (no kernel cache on the host; the speed-up is real and
+    unexplained). Partial upload, slot pool, CPU tier, per-expert
+    dispatch and 0041 are all keyed on a `MOECompressed` consumer
+    (`get_moe_constant_role`, `moe_offload_constant.cpp`) that this IR
+    never produces; the 09-16 line "~602 MiB expert slot buffers instead
+    of 64.6 GiB" was arithmetic, not a measurement, and is false for this
+    family.
+  - Control, `qwen36-35b-a3b-int4-ov` (HF export, 40 MoE layers), same
+    props without per-expert: `moe_3gemm_fused_compressed` ×40,
+    `moe_router_fused` ×40, `usm_device` **1.2 GiB** (from ~17) — the
+    fusion and the offload path work where the pattern matches.
+  - Control with `MOE_PER_EXPERT_DISPATCH=YES`: `compile_model` fails,
+    `clBuildProgram CL_BUILD_PROGRAM_FAILURE` (program_builder.cpp:168) —
+    the per-expert OpenCL kernel (0039/0040) has never built on a card;
+    "pipeline step 4 done" rested on review, not on a compile.
+  - Earlier the same day, two launches of the segmented port-route
+    artifact (`…-seg12-ov`, dead since window-051 B.3) took the physical
+    host down twice (host thrash, plug pulled); the 115 GiB compile
+    footprint was on the record two days before. Host fence changed by
+    the operator afterwards: ARC 16 GiB persistent, container 44 GiB.
+  - Process slip on the record: the host sampler's watchdog arms only
+    on a matched driver pid; the three scratch-script compiles (runtime
+    graph dumps) ran without it. MemAvailable never fell below 23 GiB in
+    any cell.
+  Consequence: before any kernel or residency work continues, the
+  artifact has to carry a MoE pattern the plugin fuses — either the
+  emitter writes `ov::op::internal::MOE` (or the HF pattern) so the
+  whole series applies, or the dispatch hook moves to the
+  `FullyConnected` path. That is a design decision, not a window.
+  Segmented port-route runtime (306 lines in backend_ov.cpp,
+  `load_paged_segmented`) stays uncommitted: its route is dead.
+- 2026-09-17, later — **the non-match has a cause, and it is the emitter,
+  not the plugin; the (a)/(b) fork above is dissolved.** Dispositions:
+  - `code` (plugin source, `convert_tiled_moe_block_to_gather_matmuls.cpp`
+    `build_3gemm_pattern`, pinned build 2026.4.0-22849): the tiled matcher
+    anchors on `end_reshape` = Reshape(down MatMul) and on `router_reshape`
+    = Reshape(Transpose(ScatterElementsUpdate)) → optional Unsqueeze, both
+    feeding the router-weight Multiply before the ReduceSum root. The pass
+    is registered only under `supports_immad && use_onednn &&
+    !moe_disable_fusion` (`transformations_pipeline.cpp`); both cards
+    qualify, the 35B control proved it the same day.
+  - `code` (this repo): `export_mtp.py:401 moe_block_tiled` carries both
+    Reshapes and records (lines 515–531) that 2026.4.0 folds a rank-4
+    Reshape whose target dims are all known, so B comes from ShapeOf and S
+    is a runtime −1. `serving_shape.py:795 emit_moe_tiled` named that
+    function as its source and emitted neither Reshape: down MatMul →
+    Multiply, Transpose → Unsqueeze. "Measured to fuse" in its docstring
+    was inherited, never re-measured on this emitter.
+  - `measured-here` (dev host, CPU only, no card): the constraint walker
+    `tools/check_tiled_pattern.py` on the depth-12 artifact's IR — 43
+    ReduceSum candidates, 0 matched, all 12 MoE candidates
+    `R4.router_reshape.type: observed Transpose, expected Reshape`
+    (0.2 s, read_model only). The same walk on the reduced 4-layer
+    geometry: 0/4 before the fix, 4/4 after, live and after
+    save → read_model.
+  - Correction to this document's opening line: "the MoE fusion computes
+    every expert for every token" described the UNFUSED graph — the Tile
+    over E makes the batched MatMul compute every expert — never the fused
+    op. `GatherMatmul` takes the router's `active_indices` (`code`, the
+    pass's callback), and the fused kernel's weight provider, slot pool and
+    CPU tier all work on the routed set (patches 0005–0012, 0038). Every
+    Flash-Next residency and forward figure to date (window-051 B.3's
+    7.06×/623×, c05's 17.73 GiB) is the unfused path. The design note's
+    §1 already says this; the charter line here did not.
+  - Fix: `emit_moe_tiled` now emits both Reshapes exactly as
+    `export_mtp.py:532–537` (B from ShapeOf, S = −1). Red-first cell
+    `test_every_moe_layer_walks_the_plugins_tiled_3gemm_pattern`
+    (tests/python/test_serving_shape.py). A walker PASS is not a compile;
+    its docstring lists the blind spots. What proves it is one compile with
+    the runtime-graph dump: `moe_3gemm_fused_compressed` ×12 on a
+    re-exported depth-12 artifact, residency read off
+    `GPU_MEMORY_STATISTICS` — the campaign's next card window, after the
+    artifact is re-exported. Until then patch 0041's question and the
+    per-expert kernel's build failure stay open behind it.
