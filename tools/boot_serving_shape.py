@@ -137,6 +137,13 @@ def main(argv=None):
     # logits of a 2,735-token window are not run-to-run deterministic; these
     # four options turn the driver into the bisect that finds the first node
     # whose output differs between two identical forwards.
+    ap.add_argument("--cut-prune", action="store_true",
+                    help="with --cut: keep only the Parameters the cut node "
+                         "reaches (a layer-0 cut then declares no n-gram "
+                         "table, no KV pool and no later layer's state rows, "
+                         "so nothing is bound for a graph that never reads "
+                         "it); the default keeps every port declared, as the "
+                         "reviewed instrument does")
     ap.add_argument("--capture", default=None,
                     help="prompt = the first --take ids of window --window of "
                          "this llama.cpp --kl-divergence-base capture (the KLD "
@@ -350,10 +357,28 @@ def main(argv=None):
             arena.close()
             return 0
         res = ov.opset13.result(hits[0].output(0))
-        model = ov.Model([res], model.get_parameters(), f"cut_at_{args.cut}")
+        params = model.get_parameters()
+        pruned = ""
+        if args.cut_prune:
+            # the Parameters upstream of the cut node, by node identity
+            seen, reach, stack = set(), set(), [hits[0]]
+            while stack:
+                nd = stack.pop()
+                if nd.get_name() in seen:
+                    continue
+                seen.add(nd.get_name())
+                if nd.get_type_name() == "Parameter":
+                    reach.add(nd.get_name())
+                for inp in nd.inputs():
+                    stack.append(inp.get_source_output().get_node())
+            keep = [p for p in params if p.get_name() in reach]
+            pruned = (f"; {len(params) - len(keep)} unreachable parameter(s) pruned, "
+                      f"{len(keep)} kept")
+            params = keep
+        model = ov.Model([res], params, f"cut_at_{args.cut}")
         say("cut", f"LOCALISER: graph cut after {args.cut!r} "
                    f"({hits[0].get_type_name()}, {dims(hits[0].output(0))}); "
-                   f"{len(model.get_ordered_ops())} ops remain; NOT the served path")
+                   f"{len(model.get_ordered_ops())} ops remain; NOT the served path{pruned}")
     if args.stage == "pass" or args.device is None:
         arena.close()
         return 0
