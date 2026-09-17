@@ -55,6 +55,10 @@ def main(argv=None):
                          "subtracted after the feed -- the experiment for a norm gamma "
                          "the GGUF converter stored folded as (1 + w) while the pin "
                          "applies (1 + w) itself")
+    ap.add_argument("--alog-from-neg-a", action="store_true",
+                    help="feed linear_attn.A_log as log(-ssm_a): the experiment for a "
+                         "converter that stored A = -exp(A_log) under ssm_a while the "
+                         "pin computes -exp(A_log) itself")
     args = ap.parse_args(argv)
 
     import torch
@@ -98,6 +102,15 @@ def main(argv=None):
         for k in hit:
             sd[k] = sd[k] - 1.0
         print(f"[unfold] 1.0 subtracted from {len(hit)} fed vector(s): {hit}", flush=True)
+    if args.alog_from_neg_a:
+        hit = [k for k in sd if k.endswith("linear_attn.A_log")]
+        for k in hit:
+            v = sd[k]
+            if bool((v >= 0).any()):
+                raise SystemExit(f"{k}: fed values are not all negative (min {float(v.min())}, "
+                                 f"max {float(v.max())}); not a -exp(A_log) fold")
+            sd[k] = torch.log(-v)
+        print(f"[alog] A_log = log(-ssm_a) for {len(hit)} vector(s): {hit}", flush=True)
     ref.load_state_dict(sd)
     del sd
     print(f"[feed] {fed} keys fed at the real geometry in {time.time() - t0:.1f}s "
