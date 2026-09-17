@@ -805,6 +805,32 @@ OFF) is **not met** — the host dispatch for non-resident experts serialises
 through ~128 experts per layer and dominates prefill time. The campaign
 remains open.
 
+### 0042-moe-hybrid-prefill-gather-filled-count.patch
+
+The fix for patch 0037's page fault on the Arc Pro B60 (Xe2). Under the
+hybrid prefill split the grouped-GEMM tables hold only the resident
+(token, k) pairs and the rest of `tokens_per_expert_cpu` stays -1, but the
+gather kernel was still launched over `token_num * max_topk` work-groups;
+every work-group past the fill read `input[-HIDDEN_SIZE]`, one row before
+the activation buffer — unmapped on the B60 (xe page fault, device
+coredump, `CL_OUT_OF_RESOURCES`), mapped by luck on the A770. The gather
+(and the stages it sizes) now runs over the filled count, and a batch with
+no resident expert takes the per-expert path as it did before 0037.
+
+Bisected on the served binary (2026-09-17): +p13 serves, +p16 faults,
++p16 without 0037 serves, the LRU partition serves, and within 0037 a
+`stream.finish()` after every grouped-path stage showed the first
+synchronisation after the gather already throwing. Campaigns:
+`docs/campaigns/static-partition-prefill.md`,
+`docs/campaigns/sub4bit-vram-kernel.md` (status 2026-09-17).
+
+**MEASURED:** the 35B at `--offload-ratio 99 --moe-cpu-tier` on the B60
+serves Paris, warm repeat identical, decode 23.6 t/s, the hybrid path
+active; no fault. Owed: the unit-ladder cell (tables with sentinel entries,
+filled count against launch size).
+
+Package: `+p18`.
+
 ## Deliberately NOT applied
 
 These live in the arcint repository's `patches/` as records of measurements.
