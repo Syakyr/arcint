@@ -148,3 +148,23 @@ keep passing throughout.
   opened this campaign is resolved; the residual prefill cost is the
   expected price of running half the experts on the host CPU. Pursuing it
   further is a diminishing-returns optimisation, not a defect fix.
+- 2026-09-17 — **patch 0037 page-faults the CPU tier's first forward on
+  the Arc Pro B60** (`measured-here`, bisected on the served binary with
+  the 35B at `--offload-ratio 99 --moe-cpu-tier`, static partition): the
+  +p13 plugin (through 0031) serves; +p16 (through 0037) faults at the
+  slot-pool plateau probe with `CL_OUT_OF_RESOURCES`, the host kernel log
+  showing an xe page fault (`Fault response: Unsuccessful -ENOENT`) and a
+  device coredump (`Timedout job`, compute engine); +p16 rebuilt without
+  0037 serves; +p17 with `MOE_CPU_TIER_PARTITION=lru` (0037's branch is
+  static-partition-only) serves; the A770 serves with 0037 in place.
+  Mechanism (`code`, 0037's own header — to be confirmed in the kernel):
+  non-resident experts are remapped to the sentinel slot index
+  `num_expert`, one past the last valid slot, in the per-token expert
+  index buffer, and the GPU mask-gen kernel is trusted to have "no
+  work-item at that index"; a table indexed with it is read or written
+  one entry past its allocation, which faults where the allocation ends
+  on a page (Xe2) and is silent elsewhere (Xe-HPG). Reproducer: 30 s on
+  the B60. Fix: patch 0042 — size the per-expert tables `num_expert + 1`
+  or clamp the sentinel in the consumer, red-first unit test with the
+  sentinel at the last index, then +p18. Until then the tier on the B60
+  needs the LRU partition or a plugin without 0037.

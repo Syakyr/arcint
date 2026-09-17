@@ -374,3 +374,11 @@ fusion-impact profile, not a kernel micro-benchmark) applies.
   card/driver-side), and a host pool that does not hold all 58 GiB of
   offloaded bodies in RSS — the residency stream, 0.5.1's other half.
   Artifact pinned: `qwen3.8-flash-next-d48f`.
+- 2026-09-17, night — **the B60 tier fault is patch 0037**, bisected in
+  one window (record in `static-partition-prefill.md`, the patch's own
+  campaign): +p13 serves, +p16 faults, +p16 without 0037 serves, the LRU
+  partition avoids it, the A770 never showed it. Not the driver, not the
+  geometry, not 0038–0040. With a plugin without 0037 the 35B serves on
+  the B60 with the tier at ratio 99 at 23.5 t/s (`measured-here`). The
+  full-depth fused artifact's forward on the B60 is therefore gated on
+  patch 0042 plus the residency stream, no longer on an unknown.
