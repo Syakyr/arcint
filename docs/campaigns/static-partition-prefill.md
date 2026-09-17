@@ -168,3 +168,18 @@ keep passing throughout.
   or clamp the sentinel in the consumer, red-first unit test with the
   sentinel at the last index, then +p18. Until then the tier on the B60
   needs the LRU partition or a plugin without 0037.
+- 2026-09-17, night — **fixed: patch 0042.** The reader was the grouped
+  prefill's gather: `tokens_per_expert_cpu` is created as
+  `token_num * max_topk` entries of -1, 0037 fills only the resident
+  (token, k) pairs, and the gather kernel was still launched over every
+  pair — each work-group past the fill read `input[-HIDDEN_SIZE]`, one
+  row before the activation buffer (`code`, and `measured-here`: a
+  `stream.finish()` after every stage of the grouped path showed the
+  first synchronisation, after the gather, already throwing; the host
+  dispatch and the micro-GEMM remap eliminated one at a time). The fix
+  sizes the gather and the stages after it by the filled count and hands
+  a zero-resident batch to the per-expert path. `measured-here` (B60,
+  pin + 0003–0037 + 0042): the 35B serves at ratio 99 with the tier,
+  Paris, warm repeat identical, decode 23.6 t/s, the hybrid path active.
+  Ships as `+p18`. Owed: the unit-ladder cell (tables with sentinel
+  entries, filled count against launch size).

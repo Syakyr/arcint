@@ -382,3 +382,9 @@ fusion-impact profile, not a kernel micro-benchmark) applies.
   the B60 with the tier at ratio 99 at 23.5 t/s (`measured-here`). The
   full-depth fused artifact's forward on the B60 is therefore gated on
   patch 0042 plus the residency stream, no longer on an unknown.
+- 2026-09-17, night, later — patch 0042 fixes the B60 tier fault (record
+  in `static-partition-prefill.md`): the grouped prefill's gather ran
+  over every token-expert pair while 0037's tables held only the
+  resident ones. `measured-here` (B60): the 35B serves with the tier at
+  ratio 99, 23.6 t/s. Ships as `+p18`. The full-depth fused artifact's
+  forward on the B60 is now gated on the residency stream alone.
