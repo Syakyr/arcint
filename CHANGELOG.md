@@ -46,6 +46,11 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
   depth-12 rung (a measurement artifact).
 - Runtime dependency unchanged (`+p17`); patch 0041 measured inert on the
   fused offload route at compile.
+- **Full depth compiles**: the 48-layer artifact in the fused shape
+  (`qwen3.8-flash-next-d48f`) compiles on the 24 GiB card at
+  `--offload-ratio 99 --moe-cpu-tier` with 8.06 GiB device-resident and a
+  2.5 GiB host peak; no forward at full depth yet (the tier faults on that
+  card and its host pool exceeds RAM at 48 layers).
 
 
 ### Fit ledger and pre-warm lever (campaign: static-partition-cold-start)

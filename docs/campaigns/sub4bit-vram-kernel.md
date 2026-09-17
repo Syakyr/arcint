@@ -359,3 +359,18 @@ fusion-impact profile, not a kernel micro-benchmark) applies.
   package file — found by `dpkg -V` before this A/B; the served results
   stand (0041 is inert without its flag, and this cell shows it inert at
   compile), the labels were wrong.
+- 2026-09-17, evening — **the full-depth model compiles on one card.** The
+  48-layer artifact exported with the fixed emitter (tree da52858,
+  74.6 GiB `.bin`, 144 expert bodies, 78 min, host peak 41 GiB under a
+  fence) walks 48/48 and compiles on the 24 GiB card with the genuine
+  +p17 package plugin at `OFFLOAD_RATIO=99` with the CPU tier:
+  `moe_3gemm_fused_compressed` ×48, `moe_router_fused` ×48, **8.06 GiB
+  device-resident**, 119 s, host RSS 2.5 GiB, driver-side peak 15.6 GiB
+  (forecast 26), no watchdog (`measured-here`, B60, KV u8, f16, compile
+  only). The residency refusal of window-050 §4.10 and the 66 GiB
+  compile-time staging that killed every full-depth attempt are gone on
+  the fused route. What a full-depth forward still needs: the CPU tier
+  on the B60 (its first forward page-faults there, works on the A770,
+  card/driver-side), and a host pool that does not hold all 58 GiB of
+  offloaded bodies in RSS — the residency stream, 0.5.1's other half.
+  Artifact pinned: `qwen3.8-flash-next-d48f`.

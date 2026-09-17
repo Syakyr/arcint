@@ -147,6 +147,25 @@
     "mtp_num_hidden_layers": 1,
     "mtp_head_exported": false
   },
+  "qwen38-flash-next-d48f-ov": {
+    "_note": "2026-09-17: the serving-shape IR at ALL 48 layers in the shape the GPU plugin's tiled MoE matcher accepts (tools/export_serving_artifact.py --layers 48, tree da52858; two Reshapes, a one-input Swish, an f16 dequant chain with a trailing Convert), real weights from the UD-Q3_K_XL shards. The first full-depth artifact that compiles to moe_3gemm_fused_compressed (x48): on the 24 GiB card at --offload-ratio 99 with the CPU tier, 8.06 GiB device-resident, 119 s, host 2.5 GiB (campaign sub4bit-vram-kernel, status 2026-09-17). Hashes read off the export log and --inspect-artifact. A forward at full depth still waits for the residency stream (the tier's host pool exceeds RAM) and for the B60 tier fault; its answers are not on the record.",
+    "arch": [
+      "Qwen4ExpForConditionalGeneration"
+    ],
+    "model_type": "qwen4_exp",
+    "hidden": 2560,
+    "layers": 48,
+    "experts": 512,
+    "ctx": 262144,
+    "full_attention_interval": 4,
+    "template_sha": "12827f24b742ea4e",
+    "tokenizer_sha": "87a7830d63fcf43b",
+    "lm_xml_sha": "f89a162348b13d18",
+    "lm_bin_bytes": 80061287237,
+    "status": "full-depth fused-MoE artifact: compiles on one card at 8.06 GiB device (ratio 99 + tier); no forward on the record yet",
+    "mtp_num_hidden_layers": 1,
+    "mtp_head_exported": false
+  },
   "qwen38-flash-next-d12-ov": {
     "_note": "2026-09-13: the serving-shape IR of Qwen3.8 Flash-Next (qwen4exp) at DEPTH 12 of 48 -- the depth ladder's first rung (docs/window-051.md row (b)), real weights from the UD-Q3_K_XL shards (tools/export_serving_artifact.py --layers 12, tree d93508c, serving-shape.json beside it). Hashes read off /models/ov/qwen38-flash-next-d12-ov on the dev host (build 1,450.9 s, peak host 30.39 GiB). A measurement artifact: 36 layers are missing, its answers are not the model's.",
     "arch": [
