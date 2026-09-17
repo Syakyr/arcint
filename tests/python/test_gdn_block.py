@@ -284,6 +284,40 @@ def test_gdn_ov_parity(device, T):
         f"that forced the doctrine")
 
 
+def test_the_emitter_follows_the_configured_output_gate(device="CPU", T=64):
+    """The output gate's activation is the config's `output_gate_type` (the
+    pin: `output_gate_type or hidden_act`, RMSNormGated line 14). The shipped
+    Flash-Next checkpoint gates with a SIGMOID -- llama.cpp hard-codes it for
+    this architecture ("the one numerical difference from Qwen3.5's GDN:
+    sigmoid output gate, not silu", `src/models/qwen4exp.cpp`, `code`) and
+    the HF config carries no `output_gate_type` in the GGUF's metadata, so our
+    real-geometry config had defaulted to silu. Measured on the dev host
+    (France ids, depth 1, campaign serving-shape-logits): with the silu gate
+    the pin's gated-norm output correlates 0.81 with llama.cpp's; see the
+    campaign record for the sigmoid reading. Red first: the emitter emitted
+    silu unconditionally, so a sigmoid-configured reference differs from it."""
+    config = _make_config()
+    config.output_gate_type = "sigmoid"
+    ref, pin = _ref_and_pin(config)
+    state = _state_np(ref)
+    x = torch.randn(1, T, config.hidden_size)
+    mask = torch.ones(1, T, dtype=torch.long)
+    with torch.no_grad():
+        y_ref = ref(x, mask).float().numpy()
+        y_pin = pin(x, cache_params=None, attention_mask=mask.float()).float().numpy()
+    assert float(np.max(np.abs(y_ref - y_pin))) == 0.0, "transcription != pin under sigmoid"
+    model = gdn.build_gdn_model(config, state, seq_len=T)
+    compiled = compile_for(ov.Core(), model, device)
+    y_ov = compiled({"hidden_states": x.float().numpy(),
+                     "attention_mask": mask.float().numpy()})[compiled.output(0)]
+    max_abs = float(np.max(np.abs(y_ref - y_ov)))
+    print(f"\n[gate-sigmoid] T={T} |ov-ref|={max_abs:.3e}")
+    assert max_abs < 1e-5, f"emitter vs sigmoid-gated reference: {max_abs:.3e}"
+    config.output_gate_type = "swish"
+    with pytest.raises(ValueError):
+        gdn.build_gdn_model(config, state, seq_len=T)
+
+
 # ---------------------------------------------------------------------------
 # THE CHUNK-AXIS EMISSION MODES (the de-batch spike, 2026-09-12)
 # ---------------------------------------------------------------------------

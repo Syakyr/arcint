@@ -268,11 +268,26 @@ def _ut_inverse(ut_orig, chunk, lead):
     return _add(acc, eye)                   # pin 365
 
 
-def _rmsnorm_gated(core, z, weight_vec, eps, last_axis):
-    """Qwen4ExpTextRMSNormGated over the last axis (reference lines 31-47)."""
+def _gate_activation(config):
+    """The output gate's activation, the pin's rule (`output_gate_type or
+    hidden_act`). The shipped Flash-Next checkpoint gates with a SIGMOID --
+    llama.cpp hard-codes it for the architecture (qwen4exp.cpp: "sigmoid
+    output gate, not silu") and the GGUF carries no key for it; the pin's
+    default is hidden_act = silu, which is what every artifact before
+    2026-09-18 was exported with (campaign serving-shape-logits)."""
+    act = getattr(config, "output_gate_type", None) or config.hidden_act
+    if act not in ("sigmoid", "silu"):
+        raise ValueError(f"unsupported GDN output gate activation {act!r} "
+                         "(sigmoid or silu)")
+    return act
+
+
+def _rmsnorm_gated(core, z, weight_vec, eps, last_axis, gate_act="silu"):
+    """Qwen4ExpTextRMSNormGated over the last axis (reference lines 31-47):
+    norm, weight, then the gate `ACT2FN[activation](z)`."""
     h = _mul(core, _rsqrt_eps(_rmean(_mul(core, core), last_axis), eps))
     h = _mul(_c(weight_vec.reshape([1] * last_axis + [-1])), h)
-    return _mul(h, _silu(z))
+    return _mul(h, op.sigmoid(z) if gate_act == "sigmoid" else _silu(z))
 
 
 # --- top-level emitter -----------------------------------------------------
@@ -377,7 +392,8 @@ def _gdn_subgraph(hidden, amask, config, state, T, ut_mode=None,
         with the same operands, and the node-count assertions in
         `test_the_chunk_emission_modes_agree_on_cpu_and_differ_in_node_count`
         would move if they were not."""
-        normed = _rmsnorm_gated(core_bthd, z, w("norm.weight"), eps, 3)
+        normed = _rmsnorm_gated(core_bthd, z, w("norm.weight"), eps, 3,
+                                _gate_activation(config))
         return _mm(_reshape(normed, [1, T, value_dim]),
                    _c(w("out_proj.weight")), tb=True)      # [1,T,H]
 
