@@ -837,7 +837,7 @@ serves Paris, warm repeat identical, decode 23.6 t/s (B60, KV u8, f16 inference,
 hybrid path active; no fault. Owed: the unit-ladder cell (tables with sentinel entries,
 filled count against launch size).
 
-Package: `+p18`.
+Package: `+p18` (built 2026-09-17 20:31–20:43 local on the dev host from tree 83701d6; the packaged plugin's own cell on the B60 — the 35B at ratio 99 with the tier, KV u8, f16 — serves Paris at 23.3 t/s; not installed on any host by the seat that built it).
 
 ## Deliberately NOT applied
 

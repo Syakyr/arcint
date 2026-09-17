@@ -388,3 +388,7 @@ fusion-impact profile, not a kernel micro-benchmark) applies.
   resident ones, reading ~8 GiB past the buffer through a wrapped offset. `measured-here` (B60): the 35B serves with the tier at
   ratio 99, 23.6 t/s (KV u8, f16). Ships as `+p18`. The full-depth fused artifact's
   forward on the B60 is now gated on the residency stream alone.
+- 2026-09-17, night, last — `+p18` built and accepted on the B60 with the
+  35B (record in `static-partition-prefill.md`). What the full-depth fused
+  artifact's forward on the B60 now needs is the residency stream alone;
+  the tier serves on that card.

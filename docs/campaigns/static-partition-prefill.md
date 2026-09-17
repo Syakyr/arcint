@@ -193,3 +193,9 @@ keep passing throughout.
   prefill chunk 512, one lane), the hybrid path active.
   Ships as `+p18`. Owed: the unit-ladder cell (tables with sentinel
   entries, filled count against launch size).
+- 2026-09-17, night — **`+p18` built and accepted.** The packaged plugin
+  (the recipe on tree 83701d6, version string `…-marfrit-p18`) serves the
+  35B at ratio 99 with the tier on the B60: Paris, warm repeat identical,
+  decode 23.3 t/s (KV u8, f16 inference, prefill chunk 512, one lane), no
+  fault (`measured-here`). Not installed anywhere by the seat that built
+  it. Owed on this patch: the unit-ladder cell and the cache-key bucketing.
