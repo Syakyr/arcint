@@ -340,9 +340,14 @@ def test_a_every_expert_body_is_written_exactly_once(filled):
     assert c["filled_bytes"] == want, (
         f"the filler produced {c['filled_bytes']:,} B, the declared shapes "
         f"imply {want:,} B")
-    assert report["arena_written_bytes"] == want, (
+    # the ARENA carries the scales as f16 Constants (2026-09-17, the fusing
+    # control's dequant chain), so it is written half the scale bytes less
+    # than the filler produced; codes and zero-points are byte-identical
+    scale_bytes = len(_FILL_LAYERS) * (2 * E * I * (H // gs) + E * H * (I // gs)) * 4
+    want_written = want - scale_bytes // 2
+    assert report["arena_written_bytes"] == want_written, (
         f"the arena was written {report['arena_written_bytes']:,} B for "
-        f"{want:,} B of bodies")
+        f"{want:,} B of bodies ({want_written:,} expected with f16 scales)")
 
     # ZERO UNWRITTEN BODIES: every u4 expert Constant in the graph must have a
     # placement, and no placement may still be all zeros.
@@ -560,8 +565,13 @@ def test_c_a_filled_expert_piece_executes_and_the_two_distances_separate(feed):
             q = ef.unpack_u4(buf, E * out * groups * gs).reshape(
                 E, out, groups, gs)
             z = ef.unpack_u4(bz, E * out * groups).reshape(E, out, groups, 1)
-            deq[k] = ef.dequantise_affine(
-                q, z, arena.scales[name + "/scale"]).reshape(E, out, inn)
+            # the graph carries the scale as an f16 Constant (since 2026-09-17,
+            # the fusing control's chain); `arena.scales` keeps the exact f32
+            # the filler quantised with -- the executed piece is compared
+            # against what its own constants REPRESENT, so round here
+            sc_carried = (np.asarray(arena.scales[name + "/scale"], np.float32)
+                          .astype(np.float16).astype(np.float32))
+            deq[k] = ef.dequantise_affine(q, z, sc_carried).reshape(E, out, inn)
 
         y_deq = _numpy_expert_piece(x, deq["gate"], deq["up"], deq["down"])
         y_raw = _numpy_expert_piece(x, raw["gate"], raw["up"], raw["down"])

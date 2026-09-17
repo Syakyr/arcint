@@ -2322,6 +2322,9 @@ def test_expert_port_bodies_unpack_bit_exact_against_the_shipped_codes(tmp_path)
               f"the products: {bool((diff <= bound).all())}")
         assert (diff16 <= bound16).all()
         assert (diff <= bound).all()
+        # and the two COMPILED chains against each other, directly: within
+        # the f16 product ulp on both sides (the f32 ulp is 2^13 smaller)
+        assert (np.abs(want - got) <= 2 * bound16).all(), float(np.abs(want - got).max())
     finally:
         arena.close()
 
@@ -2477,10 +2480,23 @@ def _old_style_tiled_moe(small, arena, seed=3):
     weights = op.scatter_elements_update(zeros, idx, vals, i32(-1))
     tiled = op.tile(y_flat, op.constant(np.array([E, 1], np.int32)))
     m_h3 = op.reshape(tiled, op.constant(np.array([E, -1, H], np.int32)), special_zero=False)
-    with ss.shared_constants():
-        gate_w = ss._compressed_expert(arena, E, I, H, "old/experts_gate", filler, 0, "gate")
-        up_w = ss._compressed_expert(arena, E, I, H, "old/experts_up", filler, 0, "up")
-        down_w = ss._compressed_expert(arena, E, H, I, "old/experts_down", filler, 0, "down")
+    gs = ss.EXPERT_GROUP_SIZE
+
+    def old_chain(out, inn, kind):
+        # the PRE-FIX dequant chain, f32 throughout, no trailing Convert:
+        # built here from the filler's own outputs, not through the emitter
+        pw, pzp, sc = filler.body(0, kind, E, out, inn)
+        groups = inn // gs
+        with ss.shared_constants():
+            w = arena.constant([E, out, groups, gs], ss.EXPERT_DECLARED_TYPE, fill=pw,
+                               name=f"old/experts_{kind}/weight_u4")
+            zp = arena.constant([E, out, groups, 1], ss.EXPERT_DECLARED_TYPE, fill=pzp,
+                                name=f"old/experts_{kind}/zero_point")
+        x = op.subtract(op.convert(w, ov.Type.f32), op.convert(zp, ov.Type.f32))
+        x = op.multiply(x, op.constant(np.ascontiguousarray(sc, dtype=np.float32)))
+        return op.reshape(x, op.constant(np.array([E, out, inn], np.int64)), special_zero=False)
+
+    gate_w, up_w, down_w = old_chain(I, H, "gate"), old_chain(I, H, "up"), old_chain(H, I, "down")
     g = op.swish(op.matmul(m_h3, gate_w, transpose_a=False, transpose_b=True))
     u = op.matmul(m_h3, up_w, transpose_a=False, transpose_b=True)
     outs = op.matmul(op.multiply(g, u), down_w, transpose_a=False, transpose_b=True)
@@ -2499,12 +2515,16 @@ def test_the_tiled_rewrite_makes_an_old_artifact_match_and_keeps_its_values(tmp_
     run on the measured depth-12 artifact without re-exporting it (the GGUF
     shards it would need are not on the dev host, 2026-09-17).
 
-    Red first, on the old-style block: walker 0 matched. After the rewrite:
-    1 block rewritten, walker 1 matched, live and after save -> read_model.
-    Idempotent on the fixed emitter's 4-layer build (0 rewritten, 4/4 stay).
-    Values: the CPU plugin's forward through the old and the rewritten graph
-    agree bit for bit at T=5 -- the two Reshapes are relabelings of the same
-    [E,M,H] x [E,M,1] product, and the CPU plugin folds them.
+    Red first, on the old-style block (its own f32 chain, two-input Swish,
+    no Reshapes -- built here, not through the emitter): walker 0 matched.
+    After the rewrite: 1 block, 1 Swish, 3 chains rewritten, walker 1
+    matched, live and after save -> read_model, and the CPU plugin compiles
+    it to three GatherMatmul primitives. Idempotent on the fixed emitter's
+    4-layer build (0/0/0, 4/4 stay). Values: the CPU plugin's forward through
+    the old and the rewritten graph agree to allclose(rtol 1e-4, atol 1e-5)
+    at T=5 -- fused, the routed experts are summed in another order, and the
+    rewritten chain's scales are f16 against the old chain's exact f32 --
+    not bit for bit (measured 4.3e-4 max).
     """
     import moe_tiled_rewrite as mtr
     small = _tiny_config(4)
@@ -2522,15 +2542,17 @@ def test_the_tiled_rewrite_makes_an_old_artifact_match_and_keeps_its_values(tmp_
         want = np.array(rq.get_output_tensor(0).data, dtype=np.float32, copy=True)
         assert want.shape == (1, 5, H) and np.abs(want).max() > 0
 
-        n = mtr.rewrite_tiled_moe(old)
+        r = mtr.rewrite_tiled_moe(old)
         ok1, fail1 = mtr.walk(old)
-        assert n == 1 and len(ok1) == 1, (n, ok1, fail1)
+        # one block: its Reshapes, its two-input Swish, its three f32 chains
+        assert (r["blocks"], r["swish"], r["chains"]) == (1, 1, 3), (r, ok1, fail1)
+        assert len(ok1) == 1, (ok1, fail1)
         xml = tmp_path / "old_rewritten.xml"
         ov.save_model(old, str(xml), compress_to_fp16=False)
         back = ov.Core().read_model(str(xml))
         ok2, fail2 = mtr.walk(back)
         assert len(ok2) == 1, (ok2, fail2)
-        assert mtr.rewrite_tiled_moe(back) == 0                       # idempotent
+        assert mtr.rewrite_tiled_moe(back) == {"blocks": 0, "swish": 0, "chains": 0}   # idempotent
         cm = _compile_cpu(back)
         rq = cm.create_infer_request()
         rq.set_tensor("hidden", ov.Tensor(x))
@@ -2548,13 +2570,15 @@ def test_the_tiled_rewrite_makes_an_old_artifact_match_and_keeps_its_values(tmp_
         # to none. The GPU's second stage (MoeOpFusion -> MOECompressed) is
         # not exercised here; the card census is.
         assert gm_old == 0 and gm_new == 3, (gm_old, gm_new)
-        # fused, the routed experts are summed in a different order: not bit
-        # for bit against the unfused all-experts block, but the same values
-        assert got.shape == want.shape and np.allclose(want, got, rtol=1e-4, atol=1e-5), diff
+        # fused, the routed experts are summed in another order AND the
+        # rewrite carries the scales as f16 (the old chain's are exact f32):
+        # the same values to ~2^-11 relative, not bit for bit (measured
+        # 4.3e-4 max at T=5; a mis-wired Reshape is off by O(1))
+        assert got.shape == want.shape and np.allclose(want, got, rtol=2e-3, atol=1e-3), diff
 
         fixed, rep = ss.build_serving_shape_ir(config=small, arena=arena, n_layers=4,
                                                rope_span=64)
-        assert mtr.rewrite_tiled_moe(fixed) == 0
+        assert mtr.rewrite_tiled_moe(fixed) == {"blocks": 0, "swish": 0, "chains": 0}
         ok3, _ = mtr.walk(fixed)
         assert len(ok3) == rep["n_layers"]
     finally:

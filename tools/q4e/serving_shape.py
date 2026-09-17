@@ -733,8 +733,11 @@ def _compressed_expert(arena, e, out, inn, name, filler=None,
     """One expert-stacked weight in the tiled lowering's shape.
 
     rank-4 [E, out, groups, group_size] u4 Constant
-      -> Convert(f32) -> Subtract(zero_point) -> Multiply(scale)
-      -> Reshape(rank 4 -> 3)  [E, out, inn]
+      -> Convert(f16) -> Subtract(Convert(u4 zero_point -> f16))
+      -> Multiply(f16 scale Constant) -> Reshape(rank 4 -> 3) [E, out, inn]
+      -> Convert(f32)
+    (the fusing control's chain, since 2026-09-17; the PORTED route below
+    keeps the f32 arithmetic it was measured with, and no trailing Convert)
 
     The trailing Reshape is not cosmetic: verify_moe_lowering.py:33-42 records
     a real GPU compile crashing inside the fusing pass's own rewrite when it
@@ -746,8 +749,9 @@ def _compressed_expert(arena, e, out, inn, name, filler=None,
 
     WITH a `filler` (q4e.expert_fill.ExpertFiller) the same shapes carry the
     real checkpoint: the filler returns packed u4 codes, packed u4
-    zero-points and f32 scales for (layer, kind), and each of the three
-    constants is built OVER pages written first. The graph is structurally
+    zero-points and f32 scales for (layer, kind) -- the scales are carried
+    as f16 Constants, the exact f32 stays in `arena.scales` -- and each of
+    the three constants is built OVER pages written first. The graph is structurally
     identical either way -- same ops, shapes and element types -- which is
     what lets the empty build's contract test speak for the filled one.
     """
@@ -799,7 +803,9 @@ def _compressed_expert(arena, e, out, inn, name, filler=None,
             sc16 = np.ascontiguousarray(sc, dtype=np.float16)
             scale = arena.constant(list(sc16.shape), Type.f16, fill=sc16,
                                    name=name + "/scale")
-            arena.scales[name + "/scale"] = sc16.astype(np.float32)   # as carried
+            # the EXACT scale the filler quantised with (tests dequantise the
+            # codes against it); the artifact carries its f16 rounding
+            arena.scales[name + "/scale"] = sc
     zp.set_friendly_name(name + "/zero_point")
     scale.set_friendly_name(name + "/scale")
     x = op.subtract(x, op.convert(zp, ct))
@@ -820,9 +826,10 @@ def swish1(x):
     rejects a node whose argument count differs (measured 2026-09-17: the
     fusing 35B control carries Swish/opset4 in=1, this emitter carried in=2,
     and the census stayed at 0 MoE primitives with the Reshapes in place)."""
-    from openvino.opset4.ops import _get_node_factory_opset4
-    from openvino.utils.types import as_nodes
-    return _get_node_factory_opset4().create("Swish", as_nodes(x), {})
+    s = op.swish(x)
+    s.set_arguments([s.input_value(0)])          # drop the beta the binding added
+    s.validate_and_infer_types()
+    return s
 
 
 def emit_moe_tiled(hidden_bth, config, state, arena, T, tag, filler=None,
@@ -899,20 +906,21 @@ def emit_moe_tiled(hidden_bth, config, state, arena, T, tag, filler=None,
     # expert computed for every token. Construction as export_mtp.py:532-537:
     # B read from ShapeOf, S a runtime -1 -- a target whose every dim is known
     # is folded away at validate/save on 2026.4.0 (export_mtp.py:515-531).
-    # Here B is statically 1, so the ShapeOf folds to a literal and the -1
-    # alone keeps the Reshape alive (M stays dynamic); export_mtp's B is a
-    # genuine runtime value. Whether a mid-pipeline pass drops a static-1
-    # rank insertion is what the card compile's primitive census answers.
+    # Here B is statically 1 (asserted), so the targets are the LITERALS
+    # [E,1,-1,H] and [E,1,-1] -- the same construction tools/
+    # moe_tiled_rewrite.py used for every card census on the record (12
+    # fused primitives, 3.00 GiB, the served legs of 2026-09-17); the -1
+    # alone keeps the Reshape alive (M stays dynamic). export_mtp's B is a
+    # genuine runtime value and stays a ShapeOf there.
     ps = hidden_bth.output(0).get_partial_shape()
-    assert (ps.rank.get_length() == 3 and ps[0].is_static and ps[0].get_length() == 1), (
+    assert (ps.rank.is_static and ps.rank.get_length() == 3
+            and ps[0].is_static and ps[0].get_length() == 1), (
         f"{tag}: emit_moe_tiled wants [1,T,H], got {ps}")
-    b_dim = op.slice(op.shape_of(hidden_bth, output_type="i32"),
-                     i32v(0), i32v(1), i32v(1), i32v(0))                  # [B]
-    outs4 = op.reshape(outs, op.concat([i32v(E), b_dim, i32v(-1), i32v(H)], axis=0),
-                       special_zero=False)                               # [E,B,S,H]
+    outs4 = op.reshape(outs, op.constant(np.array([E, 1, -1, H], np.int32)),
+                       special_zero=False)                               # [E,1,S,H]
     wt = op.transpose(weights, op.constant(np.array([1, 0], np.int32)))  # [E,M]
-    wr = op.reshape(wt, op.concat([i32v(E), b_dim, i32v(-1)], axis=0),
-                    special_zero=False)                                  # [E,B,S]
+    wr = op.reshape(wt, op.constant(np.array([E, 1, -1], np.int32)),
+                    special_zero=False)                                  # [E,1,S]
     wu = op.unsqueeze(wr, i32v(-1))                                      # [E,B,S,1]
     mixed = op.reduce_sum(op.multiply(outs4, wu), i32v(0), keep_dims=False)  # [B,S,H]
     mixed.set_friendly_name(f"{tag}/mix")      # the matcher's root, addressable

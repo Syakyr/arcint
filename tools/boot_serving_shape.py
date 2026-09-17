@@ -319,10 +319,11 @@ def main(argv=None):
     # ---- rewrite (campaign sub4bit-vram-kernel, 2026-09-17) --------------------
     if args.rewrite_tiled_moe:
         import moe_tiled_rewrite as mtr
-        n_rw = mtr.rewrite_tiled_moe(model)
+        r = mtr.rewrite_tiled_moe(model)
         ok_rw, fail_rw = mtr.walk(model)
-        say("rewrite", f"tiled MoE blocks rewritten {n_rw}; walker matched "
-                       f"{len(ok_rw)}; failing constraints {sorted(set(fail_rw.values()))}")
+        say("rewrite", f"tiled MoE blocks rewritten {r['blocks']} (swish {r['swish']}, "
+                       f"chains {r['chains']}); walker matched {len(ok_rw)}; "
+                       f"failing constraints {sorted(set(fail_rw.values()))}")
 
     # ---- pass (backend_ov.cpp:2582) ------------------------------------------
     if not args.no_pass:

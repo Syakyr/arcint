@@ -66,7 +66,8 @@ def _find_blocks(model):
                 continue
             if _type(tr.input_value(0).get_node()) != "ScatterElementsUpdate":
                 continue
-            if outs.get_partial_shape().rank.get_length() != 3:
+            r = outs.get_partial_shape().rank
+            if not r.is_static or r.get_length() != 3:
                 continue
             yield mul3, outs, uns.get_node()
             break
@@ -122,8 +123,10 @@ def _chain_to_f16(model):
         if _type(cw) != "Convert" or _type(cz) != "Convert":
             continue
         w, zp = cw.input_value(0).get_node(), cz.input_value(0).get_node()
-        if _type(w) != "Constant" or _type(zp) != "Constant" or w.get_output_element_type(0) != Type.u4:
+        if _type(w) != "Constant" or _type(zp) != "Constant":
             continue
+        if w.get_output_element_type(0) not in (Type.u4, Type.i4, Type.u8, Type.i8):
+            continue                                  # the matcher's own type list
         sc16 = op.constant(np.asarray(scale.get_data(), dtype=np.float32).astype(np.float16))
         sc16.set_friendly_name(scale.get_friendly_name())
         x = op.multiply(op.subtract(op.convert(w, Type.f16), op.convert(zp, Type.f16)), sc16)
@@ -136,10 +139,11 @@ def _chain_to_f16(model):
 
 
 def rewrite_tiled_moe(model):
-    """Insert the two matcher-anchoring Reshapes into every old-style block
-    and strip the beta input off every Swish(x, 1.0). Returns the number of
-    blocks rewritten (0 on an already-conformant model). Validates the model
-    afterwards so downstream shapes follow."""
+    """Insert the two matcher-anchoring Reshapes into every old-style block,
+    strip the beta input off every Swish(x, 1.0), and turn f32 dequant
+    chains into the f16 form. Returns a dict with the THREE counts kept
+    apart -- {"blocks", "swish", "chains"} -- all 0 on a conformant model.
+    Validates the model afterwards so downstream shapes follow."""
     from openvino import opset13 as op
 
     n = 0
@@ -162,17 +166,23 @@ def rewrite_tiled_moe(model):
         wr.set_friendly_name(f"{tag}/router_reshape")
         wu = op.unsqueeze(wr, op.constant(np.array([-1], np.int32)))
         # the Multiply keeps its operand order (pattern order: end_reshape
-        # first when the emitter wrote it that way)
+        # first when the emitter wrote it that way); identity by instance
+        # id, and a block counts only when BOTH operands were replaced
+        done = 0
         for i in range(2):
             src = mul3.input_value(i).get_node()
-            if src is outs.get_node():
+            if src.get_instance_id() == outs.get_node().get_instance_id():
                 mul3.input(i).replace_source_output(outs4.output(0))
-            elif src is uns:
+                done += 1
+            elif src.get_instance_id() == uns.get_instance_id():
                 mul3.input(i).replace_source_output(wu.output(0))
+                done += 1
+        if done != 2:
+            raise RuntimeError(f"{tag}: rewired {done} of 2 Multiply operands")
         n += 1
     if n or n_sw or n_16:
         model.validate_nodes_and_infer_types()
-    return max(n, n_sw, (n_16 + 2) // 3)
+    return {"blocks": n, "swish": n_sw, "chains": n_16}
 
 
 def walk(model):
@@ -203,9 +213,10 @@ def main():
     core = ov.Core()
     m = core.read_model(a.ir)
     before, _ = walk(m)
-    n = rewrite_tiled_moe(m)
+    r = rewrite_tiled_moe(m)
     after, fail = walk(m)
-    print(f"blocks rewritten {n}; walker matched before {len(before)} after {len(after)}; "
+    print(f"blocks rewritten {r['blocks']} (swish {r['swish']}, chains {r['chains']}); "
+          f"walker matched before {len(before)} after {len(after)}; "
           f"failing constraints after: {sorted(set(fail.values()))}; "
           f"peak RSS {resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 2**20:.2f} GiB")
     if a.out:
@@ -213,7 +224,10 @@ def main():
         xml = os.path.join(a.out, os.path.basename(a.ir))
         ov.save_model(m, xml, compress_to_fp16=False)
         print(f"saved {xml}")
-    return 0 if (n == 0 or len(after) >= len(before) + n) else 1
+    # success: every block whose Reshapes were inserted now walks; a chain or
+    # Swish-only rewrite leaves the walker count where it was (it checks
+    # neither dtypes nor, before 2026-09-17, input counts)
+    return 0 if len(after) >= len(before) + r["blocks"] else 1
 
 
 if __name__ == "__main__":

@@ -166,9 +166,11 @@ fusion-impact profile, not a kernel micro-benchmark) applies.
   (backend_ov.cpp:2570) still mmaps the full 77 GiB .bin; graph
   construction walks all 17,354 nodes, paging in mmap regions; the
   host (62 GiB RAM, 20 GiB swap) exhausts both → global OOM at 23:17
-  (dmesg: pid 637454, total-vm 36 GiB, 610k swap entries, roundhouse
+  (dmesg: pid 637454, total-vm 36 GiB, 610k swap entries, the unit manager
   killed first). The model cannot be compiled on this host at full
-  depth without a plugin change to avoid mmapping expert weight regions.
+  depth without a plugin change to avoid mmapping expert weight regions
+  (`measured-here`, three attempts; the next entry retracts the premise
+  that the offload path was engaged at all).
   arcint CLI flag (--moe-per-expert-dispatch) in working tree, not
   tagged. Services restored.
 - 2026-09-17 — **the per-expert series is inert on the Flash-Next
@@ -308,7 +310,8 @@ fusion-impact profile, not a kernel micro-benchmark) applies.
 - 2026-09-17, late — **the fused path served, on both cards, and the
   offload tier faults on the 24 GiB card.** Served binary at 0b66c43
   (registry entry for the rewritten depth-12 artifact, e384c05), the
-  +p17 plugin, n-gram shard bound, `measured-here`:
+  +p17 plugin, n-gram shard bound, KV u8, f16 inference, prefill chunk
+  512, one lane, `measured-here`:
   | card | artifact | offload | first forward | warm decode 64 tok |
   |---|---|---|---|---|
   | B60 | d12r fused | none (17.62 GiB) | OK, deterministic | **80.5 t/s** (unfused rung 09-13: 18.3) |

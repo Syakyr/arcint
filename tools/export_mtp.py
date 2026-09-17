@@ -504,8 +504,13 @@ def moe_block_tiled(y, w, p, topk, norm_topk):
 
     # ONE-input Swish: the binding's op.swish() appends a beta Constant and
     # the fusing pass declares Swish with one input; the C++ Matcher rejects
-    # an argument-count mismatch (q4e.serving_shape.swish1, 2026-09-17).
-    from q4e.serving_shape import swish1
+    # an argument-count mismatch (2026-09-17). Local, not imported: this
+    # file is installed on its own (CMakeLists: tools/export_mtp.py only).
+    def swish1(x):
+        s = op.swish(x)
+        s.set_arguments([s.input_value(0)])
+        s.validate_and_infer_types()
+        return s
     g = swish1(op.matmul(m_h3, gate_w, transpose_a=False, transpose_b=True))
     u = op.matmul(m_h3, up_w, transpose_a=False, transpose_b=True)
     outs = op.matmul(op.multiply(g, u), down_w, transpose_a=False, transpose_b=True)  # [E,M,H]
