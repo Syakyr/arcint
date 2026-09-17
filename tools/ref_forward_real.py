@@ -59,6 +59,10 @@ def main(argv=None):
                     help="feed linear_attn.A_log as log(-ssm_a): the experiment for a "
                          "converter that stored A = -exp(A_log) under ssm_a while the "
                          "pin computes -exp(A_log) itself")
+    ap.add_argument("--k-head-map", default=None, choices=(None, "interleave", "tiled"),
+                    help="experiment: how the 16 key heads serve the 48 value heads in "
+                         "layer 0's GDN core -- the pin's repeat_interleave (value head h "
+                         "<- key head h // 3) or llama.cpp's tiling (h <- h %% 16)")
     ap.add_argument("--gate-act", default=None,
                     help="experiment: override the activation of layer 0's GDN gated "
                          "norm (the pin's `norm.activation`, e.g. sigmoid or silu)")
@@ -163,6 +167,13 @@ def main(argv=None):
     _pin.causal_conv1d_fn = _conv_tap
     _orig_chunk = _pin.torch_chunk_gated_delta_rule
     def _chunk_tap(query, key, value, g, beta, *a, **kw):
+        if args.k_head_map == "tiled" and query.shape[2] == value.shape[2]:
+            r = value.shape[2] // 16 if value.shape[2] % 16 == 0 else 1
+            hk = value.shape[2] // r
+            # undo the pin's interleave (head 3h <- key head h), then tile
+            query = query[:, :, ::r].repeat(1, 1, r, 1)
+            key = key[:, :, ::r].repeat(1, 1, r, 1)
+            print(f"[k-head-map] tiled: value head h <- key head h % {hk}", flush=True)
         tap("L0/gdn/q_in", query); tap("L0/gdn/k_in", key); tap("L0/gdn/v_in", value)
         tap("L0/gdn/g_in", g); tap("L0/gdn/beta_in", beta)
         return _orig_chunk(query, key, value, g, beta, *a, **kw)
