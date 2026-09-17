@@ -1,0 +1,137 @@
+"""A REAL-GEOMETRY reference forward of the first N decoder layers, from the
+shipped GGUF, with a tap on every block -- the yardstick the cut ladder of
+`boot_serving_shape.py --cut` is read against (campaign serving-shape-logits).
+
+What it is: the pin's own modules (`q4e.ref_backbone.Qwen4ExpTextBackbone`,
+which wires `modeling_qwen4_exp`'s leaves) built at the checkpoint's geometry
+(`piecewise_export.real_config`), truncated to `--layers`, every weight fed
+from the GGUF through `q4e.gguf_feed` (dequantised f32, the same name map the
+exporter fills from), run in f32 on the CPU over the given token ids with an
+all-valid conv mask. The forward loop is the reference's own (pin 1283-1309),
+unrolled here so each block's output can be saved:
+
+    emb            [T, H]      embed_tokens rows
+    hc_init        [T, hc, H]  the residual streams before layer 0
+    L{i}/mix_attn  [T, H]      attn_hyper_connection's mixed input to the block
+    L{i}/attn_out  [T, H]      the GDN (or attention) block's output
+    L{i}/combine_attn [T, hc, H]
+    L{i}/mix_mlp   [T, H]
+    L{i}/ffn_out   [T, H]      the MoE block's output (routed + shared)
+    L{i}/out       [T, hc, H]  the residual streams after layer i
+
+each as `<out>/<name>.npy` (slashes become double underscores). A layer that
+is a full-attention layer is refused here (this reference is GDN-only; the
+attention emitter has its own harness), so `--layers` must stay below the
+first attention layer (3). The PLE at layer 1 needs the row ids; those are
+computed with `q4e.ngram_ids` exactly as the boot driver computes them.
+
+Reading it: llama.cpp's `llama-eval-callback` prints the same tensors of the
+same graph (`hc_mixed-i`, `linear_attn_out-i`, `hc_combine-i`, `ffn_out-i`,
+`l_last-i`) with their sums and 3-element corners; the artifact's cut dumps
+hold the whole tensor. Three-way: where this reference and llama.cpp agree
+and the artifact does not, the emitter or the fill is wrong at that block.
+
+  ref_forward_real.py --shards DIR --ids 760,6511,314,9338,369 --layers 1 --out DIR
+"""
+import argparse
+import sys
+import time
+from pathlib import Path
+
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--shards", required=True)
+    ap.add_argument("--ids", required=True, help="comma-separated token ids")
+    ap.add_argument("--layers", type=int, default=1)
+    ap.add_argument("--out", required=True)
+    args = ap.parse_args(argv)
+
+    import torch
+    from q4e import gguf_feed as gf
+    from q4e import ngram_ids as nid
+    from q4e.piecewise_export import real_config
+    from q4e.ref_backbone import Qwen4ExpTextBackbone
+
+    ids = [int(x) for x in args.ids.split(",") if x.strip()]
+    T = len(ids)
+    cfg = real_config()
+    L = int(args.layers)
+    if L < 1 or L > len(cfg.layer_types):
+        raise SystemExit(f"--layers {L} outside 1..{len(cfg.layer_types)}")
+    kinds = list(cfg.layer_types[:L])
+    if any(k != "linear_attention" for k in kinds):
+        raise SystemExit(f"layers 0..{L - 1} hold a full-attention layer ({kinds}); "
+                         "this reference is GDN-only")
+    cfg.num_hidden_layers = L
+    cfg.layer_types = kinds
+
+    t0 = time.time()
+    feed = gf.GgufFeed(args.shards)
+    print(f"[feed] over {args.shards} in {time.time() - t0:.1f}s; head declared: "
+          f"{feed.has_lm_head()}", flush=True)
+
+    torch.manual_seed(0)
+    ref = Qwen4ExpTextBackbone(cfg, declare_lm_head=feed.has_lm_head()).eval()
+    sd = ref.state_dict()
+    t0 = time.time()
+    fed = 0
+    for k in list(sd):
+        if any(k.endswith(s) for s in gf._DERIVED_SUFFIXES):
+            continue
+        arr = feed.fitted(k, tuple(sd[k].shape))
+        sd[k] = torch.from_numpy(np.ascontiguousarray(arr)).to(sd[k].dtype)
+        fed += 1
+    ref.load_state_dict(sd)
+    del sd
+    print(f"[feed] {fed} keys fed at the real geometry in {time.time() - t0:.1f}s "
+          f"(depth {L}, T={T})", flush=True)
+
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    taps = {}
+
+    def tap(name, t):
+        a = np.ascontiguousarray(t.detach().float().numpy().reshape(T, *t.shape[2:]) if t.dim() > 2
+                                 else t.detach().float().numpy().reshape(T, -1), dtype=np.float32)
+        taps[name] = a
+        np.save(out / (name.replace("/", "__") + ".npy"), a)
+        print(f"[tap] {name:<20} {str(a.shape):<16} sum {a.sum():+.6f} absmax {np.abs(a).max():.4f}",
+              flush=True)
+
+    hc = cfg.hc_count
+    H = cfg.hidden_size
+    input_ids = torch.tensor([ids], dtype=torch.long)
+    conv_mask = torch.ones(1, T)
+    with torch.no_grad():
+        emb = ref.embed_tokens(input_ids)                                    # [1,T,H]
+        tap("emb", emb)
+        hidden = emb.repeat(1, 1, hc)                                        # [1,T,hc*H]
+        tap("hc_init", hidden.reshape(1, T, hc, H))
+        for i, layer in enumerate(ref.layers):
+            if layer.ple is not None:
+                hidden = hidden + layer.ple(hidden, input_ids, None, conv_mask=conv_mask)
+                tap(f"L{i}/ple_out", hidden.reshape(1, T, hc, H))
+            h, hyper, inj = layer.attn_hyper_connection(hidden)
+            tap(f"L{i}/mix_attn", h)
+            g = layer.linear_attn(h, cache_params=None, attention_mask=conv_mask)
+            tap(f"L{i}/attn_out", g)
+            hidden = hyper + (g.unsqueeze(-2) * inj.unsqueeze(-1)).flatten(-2)
+            tap(f"L{i}/combine_attn", hidden.reshape(1, T, hc, H))
+            h, hyper, inj = layer.mlp_hyper_connection(hidden)
+            tap(f"L{i}/mix_mlp", h)
+            m = layer.mlp(h)
+            tap(f"L{i}/ffn_out", m)
+            hidden = hyper + (m.unsqueeze(-2) * inj.unsqueeze(-1)).flatten(-2)
+            tap(f"L{i}/out", hidden.reshape(1, T, hc, H))
+    print(f"[done] {len(taps)} taps under {out}", flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
