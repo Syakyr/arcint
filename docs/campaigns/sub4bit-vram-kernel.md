@@ -258,3 +258,13 @@ fusion-impact profile, not a kernel micro-benchmark) applies.
     `GPU_MEMORY_STATISTICS` — the campaign's next card window, after the
     artifact is re-exported. Until then patch 0041's question and the
     per-expert kernel's build failure stay open behind it.
+  - Re-export blocked the same day: the GGUF shards the exporter reads
+    are no longer on the dev host (two of three gone with a volume
+    re-purposed on 2026-09-15). Route around it for the census:
+    `tools/moe_tiled_rewrite.py` inserts the two Reshapes into a pre-fix
+    IR in memory before `compile_model`. `measured-here` (dev host, CPU
+    only): on the depth-12 IR 12 blocks rewritten, walker 0 → 12, 0.2 s,
+    0.08 GiB RSS; on an old-style block the CPU-plugin forward before and
+    after is bit-identical. The census window can therefore run on the
+    measured artifact; a servable on-disk artifact still needs the
+    shards (or a full `save_model` of the rewritten graph).
