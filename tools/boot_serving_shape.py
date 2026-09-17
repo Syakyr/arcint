@@ -178,6 +178,19 @@ def main(argv=None):
                          "materialisation) with GPU_MEMORY_STATISTICS before "
                          "and after a forward. Bytes: the filler's if --shards, "
                          "else zeros")
+    ap.add_argument("--rewrite-tiled-moe", action="store_true",
+                    help="before the pass: tools/moe_tiled_rewrite.py inserts "
+                         "the two Reshapes the GPU plugin's tiled MoE matcher "
+                         "anchors on into an artifact exported before the "
+                         "emitter fix of 2026-09-17 (idempotent on a fixed "
+                         "one); prints blocks rewritten and the walker count")
+    ap.add_argument("--census", action="store_true",
+                    help="after the compile: the runtime graph's primitive "
+                         "census off get_runtime_model() (exec node count, "
+                         "every MoE-typed layerType, the top types) and "
+                         "GPU_MEMORY_STATISTICS by allocation type -- the "
+                         "check that the MoE fused at all, which no residency "
+                         "delta can stand in for")
     ap.add_argument("--tiny", action="store_true",
                     help="TEST GEOMETRY: the suite's reduced config "
                          "(q4e.serving_shape.tiny_config: hidden 256, vocab "
@@ -303,6 +316,14 @@ def main(argv=None):
                   f"gdn={gdn_proto[:1]}x{len(gdn_proto)} "
                   f"variables={len(model.get_variables())} sinks={len(model.get_sinks())}")
 
+    # ---- rewrite (campaign sub4bit-vram-kernel, 2026-09-17) --------------------
+    if args.rewrite_tiled_moe:
+        import moe_tiled_rewrite as mtr
+        n_rw = mtr.rewrite_tiled_moe(model)
+        ok_rw, fail_rw = mtr.walk(model)
+        say("rewrite", f"tiled MoE blocks rewritten {n_rw}; walker matched "
+                       f"{len(ok_rw)}; failing constraints {sorted(set(fail_rw.values()))}")
+
     # ---- pass (backend_ov.cpp:2582) ------------------------------------------
     if not args.no_pass:
         from openvino._offline_transformations import (
@@ -374,6 +395,23 @@ def main(argv=None):
     say("compile", "ports: " + ", ".join(
         f"{p.get_any_name()}{dims(p)}:{p.get_element_type().get_type_name()}"
         for p in compiled.inputs))
+    if args.census:
+        types = {}
+        for node in compiled.get_runtime_model().get_ops():
+            ri = node.get_rt_info()
+            lt = ri["layerType"].astype(str) if "layerType" in ri else "?"
+            types[lt] = types.get(lt, 0) + 1
+        moe = {k: v for k, v in types.items() if "moe" in k.lower()}
+        top = sorted(types.items(), key=lambda kv: -kv[1])[:12]
+        say("census", f"exec nodes {sum(types.values())}; moe-typed {moe or 'NONE'}; "
+                      f"top {top}")
+        if dev.startswith("GPU"):
+            try:
+                st = dict(core.get_property(dev, "GPU_MEMORY_STATISTICS"))
+                say("census", "gpu-mem " + " ".join(
+                    f"{k}={v / 2 ** 30:.2f}GiB" for k, v in sorted(st.items()) if v))
+            except Exception as exc:                                  # noqa: BLE001
+                say("census", f"gpu-mem unavailable ({one_line(exc)})")
     if args.stage == "compile":
         arena.close()
         return 0

@@ -137,3 +137,17 @@ def test_expert_ports_bind_every_body_and_the_forward_repeats_bit_identically():
     assert "declared by the sink, not by the compiled model" not in out
     assert "BOOT [forward] INFER OK" in out
     assert re.search(r"#2 \(same request\) INFER OK [\d.]+s: BIT-IDENTICAL to #1", out), out[-2000:]
+
+
+def test_the_rewrite_flag_is_idempotent_on_a_fixed_build_and_the_census_prints():
+    """`--rewrite-tiled-moe` on the fixed emitter's build rewrites nothing and
+    the walker matches every MoE layer; `--census` prints the runtime graph's
+    primitive types (on the CPU plugin no MoE-typed primitive exists, and the
+    line must say so rather than stay silent -- that silence is the defect
+    class the flag was written for)."""
+    out = run("--stage", "compile", "--rewrite-tiled-moe", "--census")
+    m = re.search(r"BOOT \[rewrite\] tiled MoE blocks rewritten (\d+); walker matched (\d+)", out)
+    assert m and (int(m.group(1)), int(m.group(2))) == (0, 4), out[-2000:]
+    assert "BOOT [compile] OK" in out, out[-2000:]
+    c = re.search(r"BOOT \[census\] exec nodes (\d+); moe-typed (\S+); top \[", out)
+    assert c and int(c.group(1)) > 0 and c.group(2).rstrip(";") == "NONE", out[-2000:]
