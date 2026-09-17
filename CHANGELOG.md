@@ -60,6 +60,26 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
   card and its host pool exceeds RAM at 48 layers).
 
 
+### The Flash-Next fill, corrected three ways (campaign: serving-shape-logits)
+
+- **Feed** (`tools/q4e/gguf_feed.py`): the GGUF converter's folds are undone
+  at the feed — every plain-RMSNorm gamma is stored as (1 + w) and `ssm_a`
+  as −exp(A_log), and the pin applies both transforms itself. Fed as stored,
+  the first hyper-connection mix was 1.69× too large and the served
+  full-depth logits carried no information about the model (KL 12.4 nats).
+- **Emitter** (`tools/q4e/gdn.py`): the GDN output gate follows the config
+  (`output_gate_type`, sigmoid for this checkpoint as llama.cpp hard-codes
+  it) and the key-head pairing follows `gdn_key_head_map` (tiled: value
+  head h reads key head h % 16, as llama.cpp computes this GGUF; the pin
+  interleaves). Both keys are written into the exported `config.json`.
+- **Instruments**: `tools/ref_forward_real.py` (the pin's modules at the
+  real geometry, fed from the GGUF, tapped per block, with experiment
+  flags for each finding); `boot_serving_shape.py --cut-prune` (a cut keeps
+  only the ports it reaches, so a layer-0 cut binds no 26.8 GiB table).
+- Measured on the dev host against llama.cpp's whole tensors (France ids,
+  layer 0): the three fixes take the layer's output from corr 0.80 to
+  0.9999. DESIGN §7.0.2bz.
+
 ### Fit ledger and pre-warm lever (campaign: static-partition-cold-start)
 
 - **Fit ledger** (`--fit-ledger-dir`): persists the plateau-probe and

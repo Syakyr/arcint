@@ -124,3 +124,21 @@ it is mechanism, not an answer.
   agreement 0); the depth-12 and depth-4 rungs read the same and could not
   distinguish "missing layers" from "broken" — full depth does. Nothing
   localised yet.
+- 2026-09-18, 01:00–02:00 — **localised and fixed at layer 0, three ways**
+  (`measured-here`, B60 for the cuts, CPU for the references, France ids =
+  the served 5-token prefill). The cut ladder (`--cut layerN/out
+  --cut-prune --probe`, tree fd54fb6) against two references: the artifact's
+  layer 0 reproduces the pin's modules fed from the GGUF (corr 0.9988) — the
+  emitter was right; the pin-based reference departs from llama.cpp's tap at
+  the first hyper-connection mix — the FILL was wrong. Whole tensors
+  (llama-eval-dump) then found: (1) folded norm gammas (1 + w) and ssm_a =
+  −exp(A_log) fed as stored → `gguf_feed` kinds `gamma1`/`neglog`; (2) the
+  output gate is a sigmoid, not the pin's silu default → `output_gate_type`;
+  (3) value head h pairs with key head h % 16, not h // 3 → `gdn_key_head_map:
+  tiled`. Each red-first against the GGUF's own values or the transcription;
+  with all three the layer-0 output matches llama.cpp at corr 0.9999 (max
+  |diff| 0.004 on values of mean 0.008). Every earlier parity leg read 0.0
+  before and after: both sides shared the feed. DESIGN §7.0.2bz. Next: the
+  depth-4 re-export through all three fixes, its cut ladder against
+  llama.cpp's l_last-0..3 (the PLE and the first attention layer included),
+  then full depth and the KLD gate.

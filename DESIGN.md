@@ -9209,6 +9209,74 @@ scattered. Also owed: the unit-ladder cell that builds the tables with
 sentinel entries and asserts the filled count against the launch size; the
 served reproducer is this patch's only red-first cell.
 
+#### 7.0.2bz The Flash-Next fill was wrong three ways, and every parity leg against the pin read 0.0 (2026-09-18)
+
+Campaign: `docs/campaigns/serving-shape-logits.md`. Tools:
+`tools/ref_forward_real.py`, `tools/boot_serving_shape.py --cut --cut-prune
+--probe`, llama.cpp's `llama-eval-callback` and a 60-line sibling that writes
+whole tensors (kept in the dev host's pinned clone).
+
+**The reading.** The full-depth serving-shape artifact served logits with no
+information about the model's own (§7.0.2by's campaign: mean KL 12.4 nats
+against the llama.cpp capture, argmax agreement 0.000). A cut ladder on the
+artifact against two references settled where: the artifact's `layer0/out`
+reproduces the pin's own modules fed from the GGUF (corr 0.9988, f16), so
+the EMITTER was right and the FILL was not — the pin-based reference itself
+departs from llama.cpp's per-tensor tap of the same GGUF at the first
+hyper-connection mix, while the embedding and the residual init match to the
+last digit. Whole-tensor comparison of layer 0, block by block, then found
+three provenance defects, each `code` in llama.cpp's consumer and
+`measured-here` on the France ids:
+
+1. **Folded norm gammas.** The GGUF stores every plain-RMSNorm gamma
+   (hyper-connection, PLE, attention q/k, the output mixer) as (1 + w); the
+   pin applies (1 + w) itself. Fed as stored, the first mix was 1.69× too
+   large; unfolded, it matches llama.cpp to 0.0036 on values of ~0.6 (corr
+   1.0000). The GATED `ssm_norm` is ones-init and multiplied as is:
+   unfolding it as a control took the GDN output from corr +0.81 to −0.62.
+   `ssm_a` is stored as −exp(A_log) (llama.cpp: `gate = a_softplus * ssm_a
+   // -A_log.exp() * softplus`); the pin computes −exp(A_log) itself. Fixed in
+   `q4e.gguf_feed` (kinds `gamma1`, `neglog`).
+2. **The output gate.** llama.cpp hard-codes a sigmoid output gate for this
+   architecture ("the one numerical difference from Qwen3.5's GDN"); the GGUF
+   carries no key for it and the pin defaults to `hidden_act` = silu, which
+   is what our real-geometry config had. With sigmoid the gated norm's
+   output matches llama.cpp (corr 1.0000); the config now says
+   `output_gate_type: sigmoid` and the emitter follows it.
+3. **The key-head pairing.** With every input of the delta-rule core
+   agreeing (mix, projections, conv, gate, beta all corr > 0.9999), the
+   core's output agreed on 4 of 48 heads — 0, 23, 24, 47, exactly the heads
+   where h // 3 == h % 16 — and no permutation of the pin's heads matched
+   the rest. The pin (and HF's qwen3_5 files) pair value head h with key head
+   h // 3 (`repeat_interleave`); llama.cpp's qwen35 / qwen4exp pair h with
+   h % 16 (`ggml_repeat_4d` on the non-fused path, the fused op alike).
+   Tiled, 48 of 48 heads agree at token 0 and layer 0's output lands at
+   corr 0.9999 against llama.cpp, max |diff| 0.004 over values of mean
+   0.008 — quantisation noise. `gdn_key_head_map: tiled` in the real
+   geometry; the emitter and the reference transcription follow it (a
+   documented deviation from the pin). Whether HF's order or a converter
+   permutation of the value side explains the difference is unverified and
+   moot for a fill that reads the GGUF.
+
+**Why no test saw it.** `q4e.gguf_feed`'s own header said it: "parity
+against the pin is about graph semantics, not weight provenance." Every
+feed cell compares the transcription against the pin on the SAME fed
+tensors, and both sides held the same wrong number; the name-map content
+gate compares bytes to bytes. A provenance fold is invisible to any leg
+whose two sides share the feed. Only a reference OUTSIDE the pin can see
+one: llama.cpp's tap, or the KLD capture — which is what the gate is for,
+and it did. The new cells pin the three transforms to the GGUF's own values
+(`test_the_converter_folds_are_undone_at_the_feed`) and the emitter's
+options to the transcription's
+(`test_the_emitter_follows_the_configured_output_gate`,
+`test_the_emitter_follows_the_configured_key_head_pairing`).
+
+**Standing.** Three defects localised and fixed at layer 0; the layers
+after it (the PLE, the attention layer, the MoE at depth) are measured next
+on a re-exported artifact against the same tap, then the full depth and the
+KLD gate. The retracted reading in §7.0.2by's campaign ("44 layers
+missing") stands retracted: the depth rungs could never have shown this.
+
 #### 7.0.3 KV precision on the paged path — u8 is the lever, u4 is a tax
 
 The plugin accepts f16/u8/i8/u4/i4 for `KV_CACHE_PRECISION` on the paged path,
