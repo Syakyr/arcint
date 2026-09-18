@@ -504,4 +504,17 @@ fusion-impact profile, not a kernel micro-benchmark) applies.
   the smaller card and the A770 is bit-stable across forwards) → cut4n on
   the d4n artifact vs llama.cpp whole tensors (layer 3 ≥ 0.9999 is the
   target) → the full-depth native export → the KLD gate through the tier.
+- 2026-09-18 (evening) — patch 0043 reviewed before packaging (two
+  confirmed defects: the native-format members missing from the impl's
+  clone field list — the executing impl would have run affine on native
+  bytes, patch 0038's defect one patch earlier — and the flag read before
+  its assignment; both fixed) and pinned by three host-only decoder cells
+  in the plugin's tier tests (8/8 standalone). Full-depth native artifact
+  exported: `qwen38-flash-next-d48n`, 77.5 GB, 144 bodies native, built
+  in 468 s (the quantising fill took 3,583 s), peak host 39.4 GiB. Ladders
+  on the tip: C++ 592/0/0 with the real shard; python 334 passed after the
+  suite guard caught (and the fix removed) a new count gate. Everything
+  on-card — the control cell, the native cells, the depth-4 cut ladder,
+  the served native reading and the KLD gate — waits for the dev host's
+  reboot (the operator's call).
 
