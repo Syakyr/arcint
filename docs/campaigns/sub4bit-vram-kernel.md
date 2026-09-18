@@ -542,4 +542,18 @@ fusion-impact profile, not a kernel micro-benchmark) applies.
   fault (the offload flags live in an `EXTRA` variable the driver did not
   set — full residency, 60 GB of USM host, the watchdog), recorded as
   such.
+- 2026-09-18 (night) — **the gate's first native reading, and the premise
+  re-read.** Served d48n on the B60 (ratio 99 + tier, KV u8, f16, chunk
+  512): Paris, coherent 64-token continuation, 0.5–0.8 t/s on the scalar
+  tier. KLD against the model's own capture, window 0 (1,367 rows):
+  mean 0.42 / median 0.20 nats, argmax 0.79 — the u4 artifact on the same
+  window: 0.54 / 0.24, argmax 0.73 (`measured-here`, `tools/kld_position.py`).
+  The exact expert formats remove ~20% of the divergence at every position;
+  the remainder is flat in position (no rise 1280 → 2815, no chunk-seam
+  step, below = above the QSA boundary) — a per-token residual that the
+  depth-4 ladder's drift cannot explain at depth 48, so it lives deeper
+  than layer 3 and is NOT the experts. The campaign's gate premise ("the
+  residual = the u4 repack") was therefore only a fifth of the story; the
+  deeper cut ladder (layers 7/15/23/31/47 and the logits vs llama.cpp) is
+  the next localisation, before the OpenCL decode work is worth its rate.
 
