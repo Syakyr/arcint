@@ -103,6 +103,55 @@ formats (`code`: `_BANK_SCHEMAS` comments in `offload_cache.py` — "dequantizes
 in the K-loop (no bf16 materialization)" for fp8_block, "dequantized inside the
 borrowed ggml MoE kernels" for q4_0, "Triton inline-dequant kernels" for nvfp4).
 
+### §2.3a — the resident format is the checkpoint's own blocks (amended 2026-09-18)
+
+§2.3's u4 affine form is what the artifact holds today, and its price is
+now measured (`measured-here`, campaign `serving-shape-logits`, DESIGN
+§7.0.2bz): re-quantising the checkpoint's experts into u4 grouped-affine
+codes costs 0.10–0.13 relative RMS per expert tensor at group 128 and
+still 0.07–0.08 at group 16, and shows as 0.73 nats of KL at depth 48 on
+a served model that is otherwise the model's (every other block agrees
+with llama.cpp within quantisation noise). A finer group is mechanically
+available (the fused MoE takes `{experts, ofm, num_groups, group_size}`)
+and buys a third, not the order of magnitude the KLD gate needs. The
+kernel therefore decodes the GGUF's own blocks, and the fill becomes a
+byte copy of them:
+
+* **IQ4_NL** (the `down` experts; 4.5 bpw): per 32 values, one f16 scale
+  `d` and 16 bytes of nibbles; value = `d * kvalues_iq4nl[nibble]` where
+  `kvalues_iq4nl` is a fixed 16-entry signed-int8 table (`code`:
+  `ggml-quants.c dequantize_row_iq4_nl`, `ggml-common.h block_iq4_nl`).
+  In §2.3's inner loop this is the u4 path with the affine `(nibble -
+  zero_point) * scale` replaced by a 16-entry LUT and a per-32 scale — a
+  sub-group-constant table lookup, no zero point.
+* **IQ3_XXS** (the `gate` / `up` experts; 3.06 bpw): per 256 values, one
+  f16 scale `d`, 64 bytes of 8-bit grid indices (each selecting 8 values
+  of a fixed 256-entry grid, `iq3xxs_grid`), and 8 × uint32 of
+  scales-and-signs — per 32-value sub-block four 7-bit sign-mask indices
+  (`ksigns_iq2xs`, 8 signs each) and a 4-bit scale; value = `d * (0.5 +
+  scale4) * 0.5 * grid[idx][j] * sign` (`code`: `dequantize_row_iq3_xxs`).
+  In the kernel: two constant tables (the 256 × 8 grid, the 128 sign
+  masks) in `__constant` memory, one grid read per 8 values, the sign as a
+  select.
+
+Both keep §2.3's contract that no dequantised tensor is written to memory,
+and both remove the fill's re-quantisation entirely: the expert bodies in
+the artifact become the GGUF's block bytes, expert-major, which is also
+the slot format of the GPU cache and the host tier (§3, §4 — the host
+kernel decodes the same bytes; patch 0011's `dequant_weight` grows the two
+decoders). The byte budget per expert-layer moves from 2,457,600 B (u4 +
+f16 scales at 128) to the checkpoint's own 3.06 / 4.5 bpw — smaller for
+gate/up, larger for down; the Fit table (§5.1) is recomputed at that point.
+
+Red first, on the record before the kernel: (1) a host decoder for each
+format pinned bit for bit against llama.cpp's `dequantize_row_*` on real
+blocks of the shipped shards (the analogue of `test_expert_fill`'s
+executed-piece cells, with `gguf_feed`'s exact dequant as the oracle);
+(2) the per-expert kernel's harness cell fed with block bytes whose
+decode is NOT alike across pages (the blind-fill lesson of 2026-09-08);
+(3) the depth-4 cut ladder against llama.cpp's whole tensors reading
+layer 3 at ≥ 0.9999 where the u4 repack reads 0.9987; (4) the KLD gate.
+
 ### §2.4 — kernel technology
 
 The plugin's own OCL kernel infrastructure (`moe_3gemm_swiglu_mlp.cl` and
@@ -390,3 +439,6 @@ Every claim in this document carries its evidence class:
 | projected t/s figures | `projection` | WP6b (not a served measurement) |
 | kernel size 800–1,500 lines | `HYPOTHESIS` | §7.0.2y |
 | decode regression sign from in-kernel dequant | `HYPOTHESIS` | §7.0.3 precedent (u4 KV +63%) |
+| u4 repack error 0.10–0.13 (group 128), 0.07–0.08 (group 16) per expert tensor | `measured-here` | 2026-09-18, blk.0 / blk.24 experts, `expert_fill.quantise_group_affine` |
+| 0.73 nats KL at depth 48 from that repack, every other block within noise | `measured-here` | `serving-shape-logits.md`, DESIGN §7.0.2bz |
+| IQ4_NL / IQ3_XXS block layouts and decode | `code` | llama.cpp `ggml-common.h`, `ggml-quants.c` (pinned clone 56b9eb28) |
