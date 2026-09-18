@@ -250,6 +250,32 @@ void dequantize_row_iq4_nl(const uint8_t* p, size_t n_elements, float* out) {
     }
 }
 
+// IQ4_XS: per 256 values one f16 d, eight 6-bit sub-block scales (the low
+// nibble in scales_l[ib/2], the two high bits at 2*ib of scales_h), then 128
+// bytes of nibbles read exactly as IQ4_NL's: value = d * (ls - 32) * table[q].
+// Layer 2's gate/up in the shipped checkpoint (dequantize_row_iq4_xs).
+void dequantize_row_iq4_xs(const uint8_t* p, size_t n_elements, float* out) {
+    constexpr size_t kBlock = 256;
+    for (size_t b = 0; b * kBlock < n_elements; ++b) {
+        const uint8_t* block    = p + b * 136;  // 2B d + 2B scales_h + 4B scales_l + 128B nibbles
+        const float    d        = f16_to_f32(read_u16(block));
+        const uint16_t scales_h = read_u16(block + 2);
+        const uint8_t* scales_l = block + 4;
+        const uint8_t* qs       = block + 8;
+        float*         y        = out + b * kBlock;
+        for (int ib = 0; ib < 8; ++ib) {
+            const int   ls = ((scales_l[ib / 2] >> (4 * (ib % 2))) & 0xF) | (((scales_h >> (2 * ib)) & 3) << 4);
+            const float dl = d * static_cast<float>(ls - 32);
+            for (int j = 0; j < 16; ++j) {
+                y[j]      = dl * static_cast<float>(kIq4NlValues[qs[j] & 0xF]);
+                y[j + 16] = dl * static_cast<float>(kIq4NlValues[qs[j] >> 4]);
+            }
+            y += 32;
+            qs += 16;
+        }
+    }
+}
+
 // IQ3_XXS: per 256 values one f16 scale d, then 64 bytes of 8-bit grid
 // indices (each selects 8 values: two grid entries of 4 bytes) and 8 x u32
 // of scales-and-signs, one per 32-value sub-block -- bits 0..27 four 7-bit
@@ -350,10 +376,11 @@ void dequantize_row(int32_t ggml_type, const uint8_t* block_bytes, size_t n_elem
         case GgmlType::Q6_K: dequantize_row_q6_k(block_bytes, n_elements, out); return;
         case GgmlType::IQ4_NL: dequantize_row_iq4_nl(block_bytes, n_elements, out); return;
         case GgmlType::IQ3_XXS: dequantize_row_iq3_xxs(block_bytes, n_elements, out); return;
+        case GgmlType::IQ4_XS: dequantize_row_iq4_xs(block_bytes, n_elements, out); return;
         default:
             throw std::runtime_error(log::format(
                 "gguf: dequantize_row: %s is not implemented (stage 0 covers Q8_0/Q4_K/Q5_K/Q6_K, "
-                "FIX D adds Q4_0/Q4_1, FIX F adds IQ4_NL/IQ3_XXS, and F32/F16/BF16 passthrough)",
+                "FIX D adds Q4_0/Q4_1, FIX F adds IQ4_NL/IQ3_XXS/IQ4_XS, and F32/F16/BF16 passthrough)",
                 type_name(ggml_type).c_str()));
     }
 }

@@ -440,6 +440,38 @@ TEST(gguf_iq3_xxs_block_decodes_through_the_grid_and_the_sign_masks) {
     for (int j = 32; j < 256; ++j) CHECK_EQ(y[j], 1.f);    // scale 0 -> db 0.25, grid 0 -> 4
 }
 
+// IQ4_XS: layer 2's gate/up (the checkpoint mixes formats per layer; the
+// census is in docs/design-routing-aware-expert-execution.md 2.3d). One
+// 256-value block: d = 1.0; sub-block ib carries the 6-bit scale ls = ib + 30
+// (low nibble in scales_l[ib/2], the two high bits in scales_h) so its scale
+// is d * (ls - 32) = ib - 2; the nibbles as in the IQ4_NL cell. Red first:
+// dequantize_row threw "not implemented" for IQ4_XS.
+TEST(gguf_iq4_xs_block_decodes_with_its_six_bit_sub_block_scales) {
+    uint8_t block[136] = {0};
+    block[0] = 0x00; block[1] = 0x3C;                       // d = 1.0
+    uint16_t scales_h = 0;
+    for (int ib = 0; ib < 8; ++ib) {
+        const int ls = ib + 30;
+        block[4 + ib / 2] |= static_cast<uint8_t>((ls & 0xF) << (4 * (ib % 2)));
+        scales_h |= static_cast<uint16_t>(((ls >> 4) & 3) << (2 * ib));
+    }
+    block[2] = static_cast<uint8_t>(scales_h & 0xFF);
+    block[3] = static_cast<uint8_t>(scales_h >> 8);
+    for (int ib = 0; ib < 8; ++ib)
+        for (int j = 0; j < 16; ++j)
+            block[8 + ib * 16 + j] = static_cast<uint8_t>((j & 0xF) | ((15 - j) << 4));
+    static const int8_t T[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+    float y[256];
+    gguf::dequantize_row(static_cast<int32_t>(gguf::GgmlType::IQ4_XS), block, 256, y);
+    for (int ib = 0; ib < 8; ++ib) {
+        const float dl = static_cast<float>(ib - 2);
+        for (int j = 0; j < 16; ++j) {
+            CHECK_EQ(y[ib * 32 + j], dl * static_cast<float>(T[j]));
+            CHECK_EQ(y[ib * 32 + 16 + j], dl * static_cast<float>(T[15 - j]));
+        }
+    }
+}
+
 // The real shard: expert 0, row 0 of the two expert tensors, pinned to
 // llama.cpp's own gguf-py dequantisation (`gguf.quants.dequantize`, read on
 // the dev host 2026-09-18, the shard that carries blk.0's experts). The
@@ -456,6 +488,13 @@ TEST(gguf_iq_decoders_match_gguf_py_on_the_real_shard) {
         {"blk.0.ffn_gate_exps.weight", gguf::GgmlType::IQ3_XXS, 2560,
          {-0.041832, 0.0134942, -0.0296872, 0.0134942, -0.0242895, -0.0188919, 0.0026988, 0.0080965},
          0.044130, 29.625160},
+        // layer 2, the checkpoint's IQ4_XS gate over a Q8_0 down (2026-09-18)
+        {"blk.2.ffn_gate_exps.weight", gguf::GgmlType::IQ4_XS, 2560,
+         {-0.0013936, -0.0013936, -0.0030658, 0.0052955, 0.0001394, -0.0090581, 0.0018116, 0.0157472},
+         0.092474, 26.058311},
+        {"blk.2.ffn_down_exps.weight", gguf::GgmlType::Q8_0, 640,
+         {-0.0019727, 0.0223570, -0.0032878, 0.0177541, -0.0065756, -0.0170965, -0.0003288, -0.0049317},
+         0.155361, 6.580421},
     };
     int seen = 0;
     for (const Pin& pin : pins) {
@@ -472,7 +511,7 @@ TEST(gguf_iq_decoders_match_gguf_py_on_the_real_shard) {
         CHECK_NEAR(abs_sum, pin.abs_sum, 1e-4);
         std::fprintf(stderr, "  %s: row 0 of expert 0 matches gguf-py (sum %.6f)\n", pin.name, sum);
     }
-    SKIP_UNLESS(seen > 0, "this shard carries neither blk.0 expert tensor");
+    SKIP_UNLESS(seen > 0, "this shard carries none of the pinned expert tensors");
 }
 
 // ------------------------------------------------------------- real-file check

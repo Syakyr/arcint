@@ -843,6 +843,10 @@ def _native_expert(arena, e, out, inn, name, fmt, parts):
 
       IQ4_NL   codes u4 [E,out,inn/32,32] -> Convert(i32) -> Gather(table[16] f32)
                * scales f32 [E,out,inn/32,1] -> Reshape [E,out,inn]
+      IQ4_XS   the IQ4_NL chain over the IQ4_NL layout (sub-block scales folded
+               into the f32 scale by the split)
+      Q8_0     codes i8 [E,out,inn/32,32] -> Convert(f32)
+               * scales f32 [E,out,inn/32,1] -> Reshape [E,out,inn]
       IQ3_XXS  gridix u8 [E,out,inn/32,8] -> Convert(i32) -> Gather(grid[256,4])
                -> Reshape [E,out,inn/32,32]  (the magnitudes)
                signix u8 [E,out,inn/32,4] -> Convert(i32) -> Gather(ksigns[128])
@@ -876,7 +880,10 @@ def _native_expert(arena, e, out, inn, name, fmt, parts):
     rows = e * out
     groups = inn // 32
     g4 = op.constant(np.array([e, out, groups, 32], np.int64))
-    if fmt == "IQ4_NL":
+    if fmt in ("IQ4_NL", "IQ4_XS"):
+        # IQ4_XS splits to the IQ4_NL layout (its 6-bit sub-block scales are
+        # folded into the per-32 f32 scale, native_blocks.iq4_xs_split), so
+        # the chain -- and the plugin's lowering -- are the IQ4_NL ones
         codes, scales = parts
         assert codes.shape == (rows, inn) and scales.shape == (rows, groups), (codes.shape, scales.shape)
         w = arena.constant([e, out, groups, 32], Type.u4, fill=pack_u4(codes), name=name + "/codes_u4")
@@ -907,8 +914,17 @@ def _native_expert(arena, e, out, inn, name, fmt, parts):
         sign = op.reshape(sign, g4, special_zero=False)
         sign.set_friendly_name(name + "/iq3xxs_sign")
         x = op.multiply(mag, sign)
+    elif fmt == "Q8_0":
+        codes, scales = parts
+        assert codes.shape == (rows, inn) and codes.dtype == np.int8 and scales.shape == (rows, groups), (
+            codes.shape, codes.dtype, scales.shape)
+        w = arena.constant([e, out, groups, 32], Type.i8, fill=np.ascontiguousarray(codes, np.int8),
+                           name=name + "/codes_i8")
+        w.set_friendly_name(name + "/codes_i8")
+        x = op.convert(w, Type.f32)
     else:
-        raise ValueError(f"{name}: unsupported native expert format {fmt!r} (IQ4_NL or IQ3_XXS)")
+        raise ValueError(f"{name}: unsupported native expert format {fmt!r} "
+                         f"({sorted(nb.SPLIT)})")
     sc = arena.f32_filled(np.ascontiguousarray(scales, np.float32).reshape(e, out, groups, 1))
     sc.set_friendly_name(name + "/block_scale")
     arena.scales[name + "/block_scale"] = np.ascontiguousarray(scales, np.float32)

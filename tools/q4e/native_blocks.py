@@ -92,6 +92,15 @@ IQ3XXS_GRID = _IQ3XXS_GRID_U32.view(np.uint8).reshape(256, 4).copy()
 
 IQ4_NL_BLOCK, IQ4_NL_BYTES = 32, 18
 IQ3_XXS_BLOCK, IQ3_XXS_BYTES = 256, 98
+IQ4_XS_BLOCK, IQ4_XS_BYTES = 256, 136
+Q8_0_BLOCK, Q8_0_BYTES = 32, 34
+
+# (values per block, bytes per block) per format this module splits. The
+# shipped checkpoint mixes them per layer (read, not assumed, 2026-09-18):
+# 43 layers IQ3_XXS gate/up over an IQ4_NL down; layer 2 IQ4_XS gate/up over
+# a Q8_0 down; layers 4, 30, 46, 47 IQ3_XXS gate/up over a Q8_0 down.
+BLOCK_BYTES = {"IQ4_NL": (IQ4_NL_BLOCK, IQ4_NL_BYTES), "IQ3_XXS": (IQ3_XXS_BLOCK, IQ3_XXS_BYTES),
+               "IQ4_XS": (IQ4_XS_BLOCK, IQ4_XS_BYTES), "Q8_0": (Q8_0_BLOCK, Q8_0_BYTES)}
 
 
 def _f16_le(bytes2):
@@ -155,4 +164,58 @@ def iq3_xxs_decode(gridix, signix, scales):
     return (y.reshape(rows, inn // 32, 32) * scales[:, :, None].astype(np.float32)).reshape(rows, inn)
 
 
-SPLIT = {"IQ4_NL": iq4_nl_split, "IQ3_XXS": iq3_xxs_split}
+# --------------------------------------------------------------------- IQ4_XS
+def iq4_xs_split(raw):
+    """raw: u8 [rows, in // 256 * 136] -> (codes u8 [rows, in] in 0..15 in
+    LINEAR element order, scales f32 [rows, in // 32]) -- the IQ4_NL layout.
+
+    A 256-value block carries one f16 d and eight 6-bit sub-block scales
+    (low nibble in scales_l, two high bits in scales_h): the per-32 scale is
+    d * (ls - 32), the nibbles index the same 16-entry table in the same
+    order as IQ4_NL (ggml-quants.c dequantize_row_iq4_xs), so the split lands
+    on the IQ4_NL layout and the IQ4_NL decode reads it."""
+    raw = np.ascontiguousarray(raw, dtype=np.uint8)
+    rows, nbytes = raw.shape
+    assert nbytes % IQ4_XS_BYTES == 0, f"{nbytes} B is not whole IQ4_XS blocks"
+    nb = nbytes // IQ4_XS_BYTES
+    blk = raw.reshape(rows, nb, IQ4_XS_BYTES)
+    d = _f16_le(blk[:, :, 0:2])                                     # [rows, nb]
+    scales_h = np.ascontiguousarray(blk[:, :, 2:4]).view("<u2").reshape(rows, nb).astype(np.int64)
+    scales_l = blk[:, :, 4:8].astype(np.int64)                      # [rows, nb, 4]
+    ib = np.arange(8)
+    lo = (scales_l[:, :, ib // 2] >> (4 * (ib % 2))) & 0xF          # [rows, nb, 8]
+    hi = (scales_h[:, :, None] >> (2 * ib)) & 3
+    ls = lo | (hi << 4)
+    scales = (d[:, :, None] * (ls - 32).astype(np.float32)).reshape(rows, nb * 8)
+    qs = blk[:, :, 8:136].reshape(rows, nb, 8, 16)                  # 16 bytes per sub-block
+    codes = np.empty((rows, nb, 8, 32), dtype=np.uint8)
+    codes[..., :16] = qs & 0x0F
+    codes[..., 16:] = qs >> 4
+    return codes.reshape(rows, nb * IQ4_XS_BLOCK), scales
+
+
+iq4_xs_decode = iq4_nl_decode
+
+
+# ----------------------------------------------------------------------- Q8_0
+def q8_0_split(raw):
+    """raw: u8 [rows, in // 32 * 34] -> (codes i8 [rows, in], scales f32
+    [rows, in // 32]): y = d * q (ggml-quants.c dequantize_row_q8_0)."""
+    raw = np.ascontiguousarray(raw, dtype=np.uint8)
+    rows, nbytes = raw.shape
+    assert nbytes % Q8_0_BYTES == 0, f"{nbytes} B is not whole Q8_0 blocks"
+    nb = nbytes // Q8_0_BYTES
+    blk = raw.reshape(rows, nb, Q8_0_BYTES)
+    scales = _f16_le(blk[:, :, 0:2])
+    codes = np.ascontiguousarray(blk[:, :, 2:]).view(np.int8).reshape(rows, nb * Q8_0_BLOCK)
+    return codes, scales
+
+
+def q8_0_decode(codes, scales):
+    rows, inn = codes.shape
+    return (codes.astype(np.float32).reshape(rows, inn // Q8_0_BLOCK, Q8_0_BLOCK)
+            * scales[:, :, None]).reshape(rows, inn)
+
+
+SPLIT = {"IQ4_NL": iq4_nl_split, "IQ3_XXS": iq3_xxs_split, "IQ4_XS": iq4_xs_split, "Q8_0": q8_0_split}
+DECODE = {"IQ4_NL": iq4_nl_decode, "IQ3_XXS": iq3_xxs_decode, "IQ4_XS": iq4_xs_decode, "Q8_0": q8_0_decode}

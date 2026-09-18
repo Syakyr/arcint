@@ -303,9 +303,10 @@ class NativeExpertFiller:
     re-laid per role by q4e.native_blocks -- no quantisation, a byte
     re-arrangement plus the per-block scales (DESIGN 7.0.2bz). `native(layer,
     kind, e, out, inn)` returns (format, parts) where format is the GGUF's
-    tensor type for that expert tensor ("IQ3_XXS" for gate/up, "IQ4_NL" for
-    down in the shipped checkpoint -- read, not assumed) and parts are the
-    per-role arrays over e*out rows. `layer_of` maps an IR layer to a GGUF
+    tensor type for that expert tensor (read, not assumed: the shipped
+    checkpoint mixes IQ3_XXS / IQ4_XS gate/up over IQ4_NL / Q8_0 downs per
+    layer, `native_blocks.BLOCK_BYTES`) and parts are the per-role arrays
+    over e*out rows. `layer_of` maps an IR layer to a GGUF
     block as in `gguf_expert_source`. The census matches ExpertFiller's."""
 
     def __init__(self, feed, layer_of=None):
@@ -327,7 +328,7 @@ class NativeExpertFiller:
         raw = self._feed.raw_rows(gname, rows=e)                     # [e, out, row_bytes]
         assert raw.shape[0] == e and raw.shape[1] == out, (
             f"{gname}: shard rows {raw.shape} vs the IR's ({e}, {out}, {inn})")
-        block, nbytes = (nb.IQ4_NL_BLOCK, nb.IQ4_NL_BYTES) if fmt == "IQ4_NL" else (nb.IQ3_XXS_BLOCK, nb.IQ3_XXS_BYTES)
+        block, nbytes = nb.BLOCK_BYTES[fmt]
         assert raw.shape[2] == inn // block * nbytes, (
             f"{gname}: {raw.shape[2]} B per row is not {inn} values of {fmt}")
         parts = nb.SPLIT[fmt](raw.reshape(e * out, raw.shape[2]))

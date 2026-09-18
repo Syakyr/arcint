@@ -25,13 +25,14 @@ _skip = pytest.mark.skipif(not _SHARDS, reason="Q4E_GGUF_SHARDS unset (real GGUF
 
 def _random_raw(rng, rows, inn, fmt):
     """Valid random blocks: every byte random, the f16 scale finite and non-zero."""
-    if fmt == "IQ4_NL":
-        block, nbytes = nb.IQ4_NL_BLOCK, nb.IQ4_NL_BYTES
-    else:
-        block, nbytes = nb.IQ3_XXS_BLOCK, nb.IQ3_XXS_BYTES
+    block, nbytes = nb.BLOCK_BYTES[fmt]
     nblk = inn // block
     raw = rng.integers(0, 256, size=(rows, nblk, nbytes), dtype=np.uint8)
-    d = rng.uniform(0.01, 0.2, size=(rows, nblk)).astype("<f2")
+    # IQ4_XS multiplies d by a 6-bit sub-block scale of up to 31: a smaller d
+    # keeps the random weights at the other formats' magnitude (the exact
+    # cells compare at 1e-5, which a 1e4 accumulation would not meet in f32)
+    d = rng.uniform(0.01, 0.2, size=(rows, nblk)).astype(np.float32) / (31.0 if fmt == "IQ4_XS" else 1.0)
+    d = d.astype("<f2")
     raw[:, :, 0:2] = d.view(np.uint8).reshape(rows, nblk, 2)
     return raw.reshape(rows, nblk * nbytes)
 
@@ -44,13 +45,13 @@ def _matmul_model(arena, e, out, inn, fmt, parts, T):
     return ov.Model([res], [x], "native_expert_chain")
 
 
-@pytest.mark.parametrize("fmt,inn", [("IQ4_NL", 64), ("IQ3_XXS", 512)])
+@pytest.mark.parametrize("fmt,inn", [("IQ4_NL", 64), ("IQ3_XXS", 512), ("IQ4_XS", 512), ("Q8_0", 64)])
 def test_the_chain_decodes_random_blocks_exactly(fmt, inn):
-    rng = np.random.default_rng({"IQ4_NL": 11, "IQ3_XXS": 13}[fmt])
+    rng = np.random.default_rng({"IQ4_NL": 11, "IQ3_XXS": 13, "IQ4_XS": 17, "Q8_0": 19}[fmt])
     e, out, T = 3, 5, 7
     raw = _random_raw(rng, e * out, inn, fmt)
     parts = nb.SPLIT[fmt](raw)
-    w_ref = (nb.iq4_nl_decode(*parts) if fmt == "IQ4_NL" else nb.iq3_xxs_decode(*parts)).reshape(e, out, inn)
+    w_ref = nb.DECODE[fmt](*parts).reshape(e, out, inn)
     # not alike: every row differs from every other, and no row is constant
     assert len({r.tobytes() for r in w_ref.reshape(e * out, inn)}) == e * out
     assert (w_ref.reshape(e * out, inn).std(axis=1) > 0).all()
@@ -64,9 +65,14 @@ def test_the_chain_decodes_random_blocks_exactly(fmt, inn):
         arena.close()
     want = np.einsum("tk,eok->eto", x[0], w_ref)
     d = np.abs(y - want)
-    print(f"\n[native-chain] {fmt} inn={inn}: max|diff| {d.max():.3e} vs max|want| {np.abs(want).max():.3e}")
+    # exact decode, inexact summation: the two f32 dots (the plugin's and
+    # numpy's) round in different orders, so the bound is on the dot's own
+    # magnitude sum(|x||w|), not on the (possibly cancelled) output
+    bound = np.einsum("tk,eok->eto", np.abs(x[0]), np.abs(w_ref))
+    print(f"\n[native-chain] {fmt} inn={inn}: max|diff| {d.max():.3e} vs max|want| {np.abs(want).max():.3e}; "
+          f"max diff/bound {(d / bound).max():.2e}")
     assert y.shape == (e, T, out)
-    assert np.allclose(y, want, rtol=1e-5, atol=1e-5), f"{fmt}: max|diff| {d.max():.3e}"
+    assert (d <= 1e-5 * bound + 1e-6).all(), f"{fmt}: max|diff| {d.max():.3e}, max diff/bound {(d / bound).max():.2e}"
     # the chain is standard ops only: nothing the plugin does not know
     types = {n.get_type_name() for n in model.get_ordered_ops()}
     assert types <= {"Parameter", "Constant", "Convert", "Gather", "Reshape", "Multiply", "Unsqueeze",
@@ -83,16 +89,20 @@ def test_an_unknown_format_is_refused():
 
 
 @_skip
-@pytest.mark.parametrize("kind,fmt", [("down", "IQ4_NL"), ("gate", "IQ3_XXS")])
-def test_two_real_experts_through_the_native_filler_match_gguf_py(kind, fmt):
+@pytest.mark.parametrize("layer,kind,fmt", [(0, "down", "IQ4_NL"), (0, "gate", "IQ3_XXS"),
+                                            (2, "gate", "IQ4_XS"), (2, "down", "Q8_0")])
+def test_two_real_experts_through_the_native_filler_match_gguf_py(layer, kind, fmt):
+    """Layer 2 is the checkpoint's odd one: IQ4_XS gate/up over a Q8_0 down
+    (four more layers carry a Q8_0 down under IQ3_XXS; the census of all 48
+    is in docs/design-routing-aware-expert-execution.md 2.3d)."""
     from q4e import expert_fill as ef, gguf_feed as gf
     feed = gf.GgufFeed(_SHARDS)
     filler = ef.NativeExpertFiller(feed)
     e, T = 2, 3
     out, inn = (2560, 640) if kind == "down" else (640, 2560)
-    got_fmt, parts = filler.native(0, kind, e, out, inn)
+    got_fmt, parts = filler.native(layer, kind, e, out, inn)
     assert got_fmt == fmt
-    ref = np.asarray(feed.dequant(f"blk.0.ffn_{kind}_exps.weight", rows=e), np.float32)   # gguf-py, [e,out,inn]
+    ref = np.asarray(feed.dequant(f"blk.{layer}.ffn_{kind}_exps.weight", rows=e), np.float32)   # gguf-py, [e,out,inn]
     rng = np.random.default_rng(0)
     arena = ss.SparseArena()
     try:
