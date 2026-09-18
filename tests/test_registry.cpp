@@ -25,9 +25,12 @@ TEST(registry_holds_exactly_the_target_models) {
     // d48g in its slot (2026-09-18, the re-export through the corrected
     // fill, which serves the Paris line), pinned by its own xml hash.
     const auto ids = model_ids();
-    CHECK_EQ(ids.size(), 12u);
+    CHECK_EQ(ids.size(), 13u);   // d48n beside d48g (2026-09-18, the native-format artifact)
     CHECK(find_model("qwen3.8-flash-next-d48g") != nullptr);
     CHECK(find_by_artifact("qwen38-flash-next-d48g-ov") == find_model("qwen3.8-flash-next-d48g"));
+    CHECK(find_model("qwen3.8-flash-next-d48n") != nullptr);
+    CHECK(find_by_artifact("qwen38-flash-next-d48n-ov") == find_model("qwen3.8-flash-next-d48n"));
+    CHECK_EQ(find_model("qwen3.8-flash-next-d48n")->arch_hash, std::string("641fcb1863f83629"));
     CHECK(find_model("qwen3.8-flash-next-d48f") == nullptr);   // superseded, not admitted
     CHECK(find_model("qwen3.8-flash-next-d12r") != nullptr);
     CHECK(find_by_artifact("qwen38-flash-next-d12r-ov") == find_model("qwen3.8-flash-next-d12r"));

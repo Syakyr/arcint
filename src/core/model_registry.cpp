@@ -470,6 +470,45 @@ std::vector<ModelEntry> build_registry() {
         r.push_back(std::move(e));
     }
 
+    {
+        // qwen3.8-flash-next-d48n (2026-09-18): the 48-layer serving-shape IR
+        // with the checkpoint's OWN expert blocks (IQ3_XXS / IQ4_XS gate-up,
+        // IQ4_NL / Q8_0 down, per layer as the GGUF ships them) decoded in
+        // standard ops, tree 69dfffd -- the native-format artifact of campaign
+        // sub4bit-vram-kernel (design-routing-aware-expert-execution 2.3a-d).
+        // Serves through marfrit-openvino +p19 (patch 0043): every routed
+        // expert on the CPU tier. Its depth-4 sibling agrees with llama.cpp at
+        // layer 0/1/2/3 out corr 0.99991 / 0.99989 / 0.99970 / 0.99953 (the u4
+        // repack's d48g sibling: 0.99924 / 0.99918 / - / 0.99873). Hashes read
+        // off the export log. d48g stays registered beside it.
+        ModelEntry e;
+        e.id                      = "qwen3.8-flash-next-d48n";
+        e.family                  = "qwen3.8";
+        e.artifact_aliases        = {"qwen38-flash-next-d48n-ov"};
+        e.ov_arch                 = "Qwen4ExpForConditionalGeneration";
+        e.model_type              = "qwen4_exp";
+        e.moe                     = true;
+        e.has_mtp_head            = false;
+        e.mtp_head_pinned         = true;   // the export writes none
+        e.mtp_in_checkpoint       = true;
+        e.n_embd                  = 2560;
+        e.n_expert                = 512;
+        e.full_attention_interval = 4;
+        e.n_layer                 = 48;
+        e.n_ctx_train             = 262144;
+        e.quants                  = {Quant::Q4};   // the registry's coarse label; the experts are the GGUF's IQ3_XXS/IQ4_XS/IQ4_NL/Q8_0
+        e.arch_hash               = "641fcb1863f83629";
+        e.template_hash           = "12827f24b742ea4e";
+        e.tokenizer_hash          = "87a7830d63fcf43b";
+        e.weights_bytes           = 77492280673ull;
+        e.status                  = "full-depth artifact with the checkpoint's native expert formats (patch 0043, "
+                                    "every routed expert on the CPU tier); the KLD gate against the model's own "
+                                    "capture is its acceptance";
+        e.sampler = qwen_card_defaults();
+        split_layers(e);
+        r.push_back(std::move(e));
+    }
+
     return r;
 }
 
