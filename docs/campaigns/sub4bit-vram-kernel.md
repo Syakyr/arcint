@@ -556,4 +556,23 @@ fusion-impact profile, not a kernel micro-benchmark) applies.
   residual = the u4 repack") was therefore only a fifth of the story; the
   deeper cut ladder (layers 7/15/23/31/47 and the logits vs llama.cpp) is
   the next localisation, before the OpenCL decode work is worth its rate.
+- 2026-09-18 (late night) — **the residual's mechanism, measured.** Block
+  cuts inside layers 1–3 of the native depth-4 artifact against llama.cpp's
+  block taps: the GDN and hyper-connection paths sit at the ~1% floor at
+  every token; the routed-expert sums are 15–28% off on specific tokens
+  with exact weights. The router is llama's to 1e-8 on llama's own input;
+  its top-10 margins are 1e-4…1e-6 and the ten hold 6–27% of the mass. An
+  exact recompute of layer 1's routed sum from the GGUF matches llama at
+  0.8–1.1% (llama's Q8-activation floor); a 2% input perturbation moves it
+  1–2% on four tokens and 15% mean / 29% max on the token the artifact gets
+  18.5% wrong. The residual against the model's own llama.cpp capture is
+  routing instability under the ~1% activation difference any independent
+  forward has — history-dependent, flat in position past ~1,300 tokens
+  (median 0.20 nats), the same with an f16 KV cache (0.21) — not a defect
+  of the artifact, and not closable without replicating llama's activation
+  quantisation. The u4 repack was the removable term (0.54 → 0.42 mean on
+  window 0); the gate's bar has to be re-derived from a reference that
+  shares this model's routing noise. The rate lever (the OpenCL decode of
+  the native formats, design 2.3c step 3) is now the campaign's next work,
+  with the quality question closed at this artifact's own floor.
 
