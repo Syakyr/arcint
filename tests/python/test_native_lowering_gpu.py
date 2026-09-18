@@ -92,7 +92,12 @@ def _build(tmp_path, T, gate_up_fmt, down_fmt):
         "mlp.shared_expert.down_proj.weight": (rng.standard_normal((H, Is)) * 0.05).astype(np.float32),
         "mlp.shared_expert_gate.weight": (rng.standard_normal((1, H)) * 0.05).astype(np.float32),
     }
-    x = op.parameter([1, T, H], Type.f32, name="x")
+    # T dynamic as in every served artifact: the emitter's Reshape targets keep
+    # M as the runtime -1, and the plugin's router/MoE lowering is only ever
+    # exercised with a dynamic token dim (the first form of this cell declared
+    # T static and the stock control failed at compile on a missing router
+    # primitive, 2026-09-18 GPU.1)
+    x = op.parameter([1, -1, H], Type.f32, name="x")
     filler = _RandomAffineFiller() if gate_up_fmt == "affine" else _RandomNativeFiller(gate_up_fmt, down_fmt)
     y = ss.emit_moe_tiled(x, cfg, st, arena, T, "layer0/moe", filler=filler, layer=0)
     model = ov.Model([op.result(y)], [x], "native_moe_block")
