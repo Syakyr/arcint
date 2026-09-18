@@ -437,12 +437,16 @@ def test_b_a_filled_body_reads_back_as_the_file_within_the_u4_rounding(
         zcodes = ef.unpack_u4(raw_zp[zlo // 2:(zlo + out * groups) // 2],
                               out * groups).reshape(out, groups, 1)
         # the scale the IR's chain multiplies is the f16 Constant, not the
-        # arena's exact f32 (a reviewer's catch: test_c rounds, this cell did not)
+        # arena's exact f32 (a reviewer's catch: test_c rounds, this cell did
+        # not). The codes were CHOSEN with the exact scale, so a read-back
+        # through the f16 scale is entitled to half a step of the exact scale
+        # plus the f16 rounding of the scale times the largest code distance
+        # (15): |(q - zp) * s16 - x| <= s/2 + 15 * |s16 - s|.
         scale16 = np.float16(scale[e]).astype(np.float32)
         back = ef.dequantise_affine(codes, zcodes, scale16)
         ref = ref_all[e].reshape(out, groups, gs)
         err = np.abs(back - ref)
-        bound = ef.quantisation_step_bound(scale16)
+        bound = ef.quantisation_step_bound(scale[e]) + 15.0 * np.abs(scale16 - scale[e])
         ratio = err / np.where(bound > 0, bound, 1.0)
         worst_err = max(worst_err, float(err.max()))
         worst_ratio = max(worst_ratio, float(ratio.max()))
