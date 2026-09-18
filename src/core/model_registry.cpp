@@ -443,6 +443,7 @@ std::vector<ModelEntry> build_registry() {
         // superseded: it served logits with no information about the model
         // (KL 12.4 nats against the model's own capture) and is not admitted
         // any more. Hashes read off the export log.
+        ModelEntry e;
         e.id                      = "qwen3.8-flash-next-d48g";
         e.family                  = "qwen3.8";
         e.artifact_aliases        = {"qwen38-flash-next-d48g-ov"};
