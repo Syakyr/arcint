@@ -792,6 +792,34 @@ index f0ef5675e8..72f1973be4 100644
                  // Cannot fit all experts simultaneously → fall back to per-expert onednn loop
                  instance.output_memory_ptr(0)->fill(stream, 0u);
                  return exec_prefill_onednn(events, stream, instance, scratch);
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.hpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.hpp
+index e527bdb485..f1a231ac34 100644
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.hpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.hpp
+@@ -13,6 +13,7 @@
+ #include "moe_3gemm_base.hpp"
+ #include "program_node.h"
+ #include "registry/implementation_manager.hpp"
++#include "ov_ops/moe_compressed.hpp"
+ 
+ using namespace cldnn;  // TODO: Remove once namespaces are aligned
+ namespace ov::intel_gpu::ocl {
+@@ -64,7 +65,14 @@ struct moe_3gemm_swiglu_opt : public ImplementationManager {
+ 
+         // Only support zp: u4, i4, u8, i8 (skip check for symmetric quantization where ZP is element::dynamic placeholder)
+         const auto& config = std::static_pointer_cast<const moe_3gemm_fused_compressed>(node.get_primitive())->_config;
+-        if (config.has_zp) {
++        // arcint (patch 0043): under a native gate/up format the zero-point
++        // slot carries the u8 sign indices (IQ3_XXS) or the f16 scale again
++        // (IQ4_NL, Q8_0); the tier's row decoders read it, the affine type
++        // rule does not apply (measured 2026-09-18, GPU.1: an IQ4_XS layer's
++        // f16 slot left the primitive without an impl -- "No layout format
++        // available for moecompressed").
++        const bool native_gate_up = ov::op::internal::MOECompressed::is_native_format(config.gate_up_weight_format);
++        if (config.has_zp && !native_gate_up) {
+             static constexpr std::array supported_zp_type = {
+                 ov::element::u4,  // asym-quant type
+                 ov::element::i4,  // sym-quant type
 diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_cpu_expert.cpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_cpu_expert.cpp
 index 90b9f1de58..0a67576c61 100644
 --- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_cpu_expert.cpp
@@ -996,6 +1024,38 @@ index bb67d9c95a..d4fb56199c 100644
  // arcint M14 (patches/0012 wires this up; declared here so T1 can exercise it
  // standalone). Plain std::thread + condvar pool, independent of whatever
  // executor the plugin's streams use -- it runs *inside* an infer request
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_runtime.cpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_runtime.cpp
+index d6edc9794a..dc15bdceb7 100644
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_runtime.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_runtime.cpp
+@@ -12,6 +12,7 @@
+ #include <limits>
+ 
+ #include "intel_gpu/runtime/debug_configuration.hpp"
++#include "ov_ops/moe_compressed.hpp"
+ 
+ namespace ov::intel_gpu::ocl::moe_otd {
+ 
+@@ -127,6 +128,19 @@ void maybe_transpose_scale_zp(const cldnn::MOECompressed::Config& config,
+     }
+ 
+     const bool is_down = (offset_pos % 3 == 2);
++    // arcint (patch 0043): under a native expert format the zero-point slot
++    // carries the IQ3_XXS sign indices (4 bytes per 32-value group) or the
++    // scale again (IQ4_NL, Q8_0); only the CPU tier reads it, from the file,
++    // in the exporter's [oc, groups, k] order. The device copy is never read
++    // by a kernel, so it is neither size-checked nor transposed here
++    // (measured 2026-09-18, GPU.1: "Unexpected zp payload size for
++    // offset_pos=6, expected=4096, got=16384" on an IQ3_XXS gate).
++    if (is_zp) {
++        const size_t fmt = is_down ? config.down_weight_format : config.gate_up_weight_format;
++        if (ov::op::internal::MOECompressed::is_native_format(fmt)) {
++            return;
++        }
++    }
+     size_t oc = 0;
+     size_t ic = 0;
+     if (is_down) {
 diff --git a/src/plugins/intel_gpu/src/plugin/transformations_pipeline.cpp b/src/plugins/intel_gpu/src/plugin/transformations_pipeline.cpp
 index cc64807cff..6dd5367d6b 100644
 --- a/src/plugins/intel_gpu/src/plugin/transformations_pipeline.cpp

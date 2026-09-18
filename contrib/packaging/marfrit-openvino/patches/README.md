@@ -878,19 +878,27 @@ with `moe_cpu_expert*.cpp`, gtest from `thirdparty/gtest`,
 `libopenvino` (8 cells, all green on the dev host). The OpenCL decode in
 the fused and per-expert kernels is the next patch.
 
-**MEASURED (partial):** on the Arc Pro B60 the compile of a native block
-reached the plugin's op translation with a `MOECompressed` of the native
-inputs (the pass fires), which refused an f32 scale Constant wrapped by
-`ConvertPrecision` — hence the f16 scale. The second attempt wedged the
-card at its first job (kernel-owned queue "not started", GuC reset
-cascade, NULL dereference in `xe_sched_job_set_error` — the DKMS
-`xe-ringorder/7.0.14+p1` on kernel 7.0.14-12-pve) before the pass's
-output could run; whether the native path is the trigger is NOT
-established — the stock-affine control cell through the same harness
-(`tests/python/test_native_lowering_gpu.py`, the `affine` parameter) is
-the first leg after the host comes back. Owed with this patch: that cell
-on a card, the served depth-4 and depth-48 native artifacts through the
-tier, the KLD gate's native reading.
+Two more relaxations found on the card: the impl's static
+`validate_impl` refused an f16 zero-point slot (IQ4_NL / Q8_0 gate-up: no
+impl, "No layout format available"), and the offload runtime's payload
+transpose asserted one byte per group in the zero-point slot (IQ3_XXS: four
+sign indices per group) — under a native format that slot is neither
+type-checked nor transposed; only the tier reads it, from the file.
+
+**MEASURED (2026-09-18, `tests/python/test_native_lowering_gpu.py`, tree
+dffd272, plugin 5a6968ec):** on BOTH cards — Arc A770 (GPU.1) and Arc Pro
+B60 (GPU.0) — the stock-affine control fuses (`moe_router_fused` +
+`moe_3gemm_fused_compressed`, corr 0.999999 against the CPU plugin) and
+the two native pairs (IQ3_XXS/IQ4_NL, IQ4_XS/Q8_0) lower to
+`MOECompressedNative`, run every routed expert through the tier and match
+the CPU plugin at corr 1.000000, max diff at 0.19 / 0.15 of the band the
+control's f16 noise calibrates; peaks vram0 94 MiB. The first form of this
+patch (before the review's clone-list fix) had wedged the B60 at the
+process's first job — with that form the executing impl ran the fused GEMV
+over native-layout bytes; the wedge has not recurred since the fix on
+either card (three legs), which is consistent with, not proof of, that
+mechanism. Owed: the served depth-4 and depth-48 native artifacts through
+the tier, the KLD gate's native reading.
 
 ## Deliberately NOT applied
 
