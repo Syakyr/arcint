@@ -171,3 +171,27 @@ it is mechanism, not an answer.
   compounding over 48 layers (the card's layer-3 cut sits at corr 0.9987 ≈
   5% RMS against llama.cpp where the CPU f32 reference reads 0.9999 ≈ 1.3%).
   The precision leg (f32 / KV f16 cuts at depth 4) measures it next.
+- 2026-09-18, 04:50 — **the residual, named; localisation complete**
+  (`measured-here`, CPU): with `--precision f32` refused by the fused MoE
+  route (`MoERouterFused` has no f32 layout) and `--paged-kv f16` inert at
+  five tokens, the CPU plugin's f32 GatherMatmul route reads layer 0 at
+  corr 0.99925 against llama.cpp — the card's f16 figure to the fourth
+  digit — where the pin's modules fed with the EXACT dequant read 0.99991.
+  What the serving graph holds that the reference does not is the expert
+  repack: `expert_fill.quantise_group_affine`, u4 codes over groups of 128,
+  of experts the checkpoint ships as IQ3_XXS (gate, up) and IQ4_NL (down).
+  Its relative RMS error on blk.0's experts is 0.13 / 0.13 / 0.11 (gate /
+  up / down), the matmul output on random activations inherits it, and the
+  uniform per-token residual at depth 48 (median KL ≈ 0.2) follows. The
+  precision, the KV cache, the chunking, the QSA seam and the PLE boundary
+  are excluded by measurement. This campaign's question — where the served
+  model loses the model — is answered three times over (the fill's folds,
+  the gate, the pairing) plus once for the residual; the residual's remedy
+  is `sub4bit-vram-kernel`'s own goal, the native sub-4-bit expert kernel.
+
+## Gate, re-read
+
+The Paris line is served at depth 48. The KLD number (0.73 nats) is the u4
+repack's price on top of a graph that is otherwise the model's; the bar it is
+read against stays provisional and borrowed. The next KLD that can move is
+the one after the expert kernel reads the checkpoint's own blocks.

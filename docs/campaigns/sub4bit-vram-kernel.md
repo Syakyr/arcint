@@ -454,3 +454,10 @@ fusion-impact profile, not a kernel micro-benchmark) applies.
   greedy continuation stays coherent. This campaign's route (the fused MoE,
   the CPU tier, the residency at 8 GiB device) computes the model. The KLD
   replay against the model's own capture runs next as the gate number.
+- 2026-09-18, 04:50 — **the KLD residual is this campaign's premise,
+  measured end to end** (`serving-shape-logits.md`, last entry): the served
+  full-depth model reads 0.73 nats against its own capture, and the whole of
+  that residual traces to the u4 grouped-affine repack (group 128) of the
+  IQ3_XXS / IQ4_NL experts — 0.13 / 0.13 / 0.11 relative RMS on blk.0's
+  expert tensors — not to the card, the precision, the KV cache or the
+  route. The native sub-4-bit expert kernel is what the gate waits on.

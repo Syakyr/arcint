@@ -9282,8 +9282,13 @@ u8, f16). The KLD gate on it: mean KL 0.73 nats below / 0.68 above the 2051
 boundary, argmax agreement 0.73 / 0.71 — the model, with a uniform
 per-token residual an order of magnitude above the (provisional, borrowed)
 0.0599 bar; the residual does not grow with position, does not step at the
-chunk boundaries or the QSA boundary, and is under measurement as the f16
-inference precision compounding over 48 layers. The retracted reading in
+chunk boundaries or the QSA boundary, and is NOT the f16 precision: the CPU
+plugin's f32 route reads layer 0 at the card's figure (0.99925) while the
+exact-dequant reference reads 0.99991. It is the u4 grouped-affine repack
+(group 128) of the checkpoint's IQ3_XXS / IQ4_NL experts — 0.13 / 0.13 /
+0.11 relative RMS on blk.0's expert tensors, measured — which is the
+`sub4bit-vram-kernel` campaign's premise; the native sub-4-bit expert kernel
+is what the KLD gate waits on. The retracted reading in
 §7.0.2by's campaign ("44 layers missing") stands retracted: the depth rungs
 could never have shown this.
 

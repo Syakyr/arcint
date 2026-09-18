@@ -83,8 +83,10 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
 - **Registry**: `qwen38-flash-next-d48g-ov` (the full-depth re-export)
   supersedes d48f. Served on one 24 GB card at `--offload-ratio 99
   --moe-cpu-tier` it answers the Paris line; its KLD against the model's own
-  llama.cpp capture reads 0.73 nats (from 12.4), with a uniform per-token
-  residual still under measurement.
+  llama.cpp capture reads 0.73 nats (from 12.4); the residual is the u4
+  repack of the IQ3_XXS / IQ4_NL experts (0.11–0.13 relative RMS per
+  expert tensor), the `sub4bit-vram-kernel` campaign's premise, not the
+  card, the precision, the KV cache or the route.
 
 ### Fit ledger and pre-warm lever (campaign: static-partition-cold-start)
 
