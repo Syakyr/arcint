@@ -832,6 +832,84 @@ def swish1(x):
     return s
 
 
+def _native_expert(arena, e, out, inn, name, fmt, parts):
+    """One expert-stacked weight as the CHECKPOINT'S OWN BLOCKS, decoded in
+    standard ops (design-routing-aware-expert-execution 2.3a/2.3b, DESIGN
+    7.0.2bz): the u4 grouped-affine repack of the IQ3_XXS / IQ4_NL experts
+    costs 0.10-0.13 relative RMS per tensor and 0.73 nats at depth 48, so the
+    experts are carried as q4e.native_blocks lays them out per role, and the
+    decode is expressed in ops the CPU plugin runs exactly (the suite's
+    oracle) and the GPU plugin's matcher will lower to native kernels:
+
+      IQ4_NL   codes u4 [E,out,inn] -> Convert(i32) -> Gather(table[16] f32)
+               -> Reshape [E,out,inn/32,32] * scales f32 [E,out,inn/32,1]
+               -> Reshape [E,out,inn]
+      IQ3_XXS  gridix u8 [E,out,inn/4] -> Convert(i32) -> Gather(grid[256,4])
+               -> Reshape [E,out,inn]  (the magnitudes)
+               signix u8 [E,out,inn/8] -> Convert(i32) -> Gather(ksigns[128])
+               -> Unsqueeze -> BitwiseAnd(masks[8]) -> Greater(0)
+               -> Select(-1, +1) -> Reshape [E,out,inn]  (the signs)
+               magnitudes * signs -> Reshape [E,out,inn/32,32] * scales
+               f32 [E,out,inn/32,1] -> Reshape [E,out,inn]
+
+    The arithmetic is f32 (exact against numpy's decode); the fusing u4 chain
+    is f16 with a trailing Convert because its matcher demands direct f16
+    Constants, and the native matcher variants are the plugin patch's to
+    define. Until that patch, the GPU plugin would constant-fold these
+    chains into dense f16 weights (10 GiB per layer), so a native artifact
+    is measured on the CPU plugin at small geometry and, at depth, through
+    the served binary once the patch exists.
+
+    `parts` are q4e.native_blocks' per-role arrays over [e*out, ...] rows.
+    Returns the [E,out,inn] f32 node.
+    """
+    from q4e import native_blocks as nb
+    from q4e.expert_fill import pack_u4
+    rows = e * out
+    if fmt == "IQ4_NL":
+        codes, scales = parts
+        assert codes.shape == (rows, inn) and scales.shape == (rows, inn // 32), (codes.shape, scales.shape)
+        w = arena.constant([e, out, inn], Type.u4, fill=pack_u4(codes), name=name + "/codes_u4")
+        w.set_friendly_name(name + "/codes_u4")
+        table = op.constant(nb.KVALUES_IQ4NL.astype(np.float32))
+        vals = op.gather(table, op.convert(w, Type.i32), op.constant(np.int64(0)))
+        vals.set_friendly_name(name + "/iq4nl_table")
+        x = op.reshape(vals, op.constant(np.array([e, out, inn // 32, 32], np.int64)), special_zero=False)
+    elif fmt == "IQ3_XXS":
+        gridix, signix, scales = parts
+        assert gridix.shape == (rows, inn // 4) and signix.shape == (rows, inn // 8), (gridix.shape, signix.shape)
+        assert scales.shape == (rows, inn // 32), scales.shape
+        gi = arena.constant([e, out, inn // 4], Type.u8, fill=np.ascontiguousarray(gridix, np.uint8),
+                            name=name + "/gridix_u8")
+        gi.set_friendly_name(name + "/gridix_u8")
+        grid = op.constant(nb.IQ3XXS_GRID.astype(np.float32))                      # [256, 4]
+        mag = op.gather(grid, op.convert(gi, Type.i32), op.constant(np.int64(0)))    # [E,out,inn/4,4]
+        mag = op.reshape(mag, op.constant(np.array([e, out, inn], np.int64)), special_zero=False)
+        mag.set_friendly_name(name + "/iq3xxs_grid")
+        si = arena.constant([e, out, inn // 8], Type.u8, fill=np.ascontiguousarray(signix, np.uint8),
+                            name=name + "/signix_u8")
+        si.set_friendly_name(name + "/signix_u8")
+        ks = op.constant(nb.KSIGNS_IQ2XS.astype(np.int32))                          # [128]
+        masks = op.gather(ks, op.convert(si, Type.i32), op.constant(np.int64(0)))    # [E,out,inn/8]
+        bits = op.bitwise_and(op.unsqueeze(masks, op.constant(np.int64(-1))),
+                              op.constant(nb.KMASK_IQ2XS.astype(np.int32)))         # [E,out,inn/8,8]
+        neg = op.greater(bits, op.constant(np.int32(0)))
+        sign = op.select(neg, op.constant(np.float32(-1.0)), op.constant(np.float32(1.0)))
+        sign = op.reshape(sign, op.constant(np.array([e, out, inn], np.int64)), special_zero=False)
+        sign.set_friendly_name(name + "/iq3xxs_sign")
+        x = op.reshape(op.multiply(mag, sign),
+                       op.constant(np.array([e, out, inn // 32, 32], np.int64)), special_zero=False)
+    else:
+        raise ValueError(f"{name}: unsupported native expert format {fmt!r} (IQ4_NL or IQ3_XXS)")
+    sc = arena.f32_filled(np.ascontiguousarray(scales, np.float32).reshape(e, out, inn // 32, 1))
+    sc.set_friendly_name(name + "/block_scale")
+    arena.scales[name + "/block_scale"] = np.ascontiguousarray(scales, np.float32)
+    x = op.multiply(x, sc)
+    x = op.reshape(x, op.constant(np.array([e, out, inn], np.int64)), special_zero=False)
+    x.set_friendly_name(name + "/native_f32")
+    return x
+
+
 def emit_moe_tiled(hidden_bth, config, state, arena, T, tag, filler=None,
                    layer=None, port_sink=None):
     """The MoE layer in the shape the GPU plugin's
@@ -883,12 +961,17 @@ def emit_moe_tiled(hidden_bth, config, state, arena, T, tag, filler=None,
     m_h3 = op.reshape(tiled, op.constant(np.array([E, -1, H], np.int32)),
                       special_zero=False)                              # [E,M,H]
 
-    gate_w = _compressed_expert(arena, E, I, H, f"{tag}/experts_gate",
-                                filler, layer, "gate", port_sink)
-    up_w = _compressed_expert(arena, E, I, H, f"{tag}/experts_up",
-                              filler, layer, "up", port_sink)
-    down_w = _compressed_expert(arena, E, H, I, f"{tag}/experts_down",
-                                filler, layer, "down", port_sink)
+    def _expert(kind, out_, inn_):
+        nm = f"{tag}/experts_{kind}"
+        if filler is not None and hasattr(filler, "native"):
+            # the checkpoint's own blocks, decoded in ops (2026-09-18)
+            fmt, parts = filler.native(layer, kind, E, out_, inn_)
+            return _native_expert(arena, E, out_, inn_, nm, fmt, parts)
+        return _compressed_expert(arena, E, out_, inn_, nm, filler, layer, kind, port_sink)
+
+    gate_w = _expert("gate", I, H)
+    up_w = _expert("up", I, H)
+    down_w = _expert("down", H, I)
 
     g = swish1(op.matmul(m_h3, gate_w, transpose_a=False, transpose_b=True))
     u = op.matmul(m_h3, up_w, transpose_a=False, transpose_b=True)
