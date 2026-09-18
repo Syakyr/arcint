@@ -572,7 +572,7 @@ index 0000000000..3ccea39dec
 +    REGISTER_ANCHORS(this, codes, scale, reshape);
 +}
 diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp
-index f0ef5675e8..3669df0520 100644
+index f0ef5675e8..72f1973be4 100644
 --- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp
 +++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp
 @@ -21,6 +21,8 @@
@@ -688,10 +688,22 @@ index f0ef5675e8..3669df0520 100644
          scratch._expert_index_buffer->copy_from(stream, slots_u32.data(), 0, 0, topk_bytes, true);
  
          // arcint M14 (patches/0017). MOE_OTD_READBACK_NOHOIST-only: x/rw,
-@@ -1685,6 +1725,14 @@ public:
+@@ -1685,6 +1725,26 @@ public:
          if (batched_gemv_threshold == 0) {
              batched_gemv_threshold = 1;
          }
++        // arcint (patch 0043): the native format is CONFIGURATION, read off the
++        // primitive here, before anything below consults it (review 2026-09-18:
++        // the first form set it inside the tier block ~70 lines further down,
++        // after the prefill-path choice had already read it as false), and
++        // copied to the clone in clone() below (the executing impl).
++        {
++            const auto& native_cfg = node.as<moe_3gemm_fused_compressed>().get_primitive()->_config;
++            _cpu_native_gate_up = native_cfg.gate_up_weight_format;
++            _cpu_native_down = native_cfg.down_weight_format;
++            _native_tier_only = ov::op::internal::MOECompressed::is_native_format(_cpu_native_gate_up) ||
++                                ov::op::internal::MOECompressed::is_native_format(_cpu_native_down);
++        }
 +        if (_native_tier_only) {
 +            // arcint (patch 0043): the prefill GEMM paths read the affine u4
 +            // form; a native format takes the batched GEMV path at every token
@@ -703,7 +715,7 @@ index f0ef5675e8..3669df0520 100644
          GPU_DEBUG_TRACE_DETAIL << "[DEBUG] moe_3gemm_swiglu_opt_impl(): batched_gemv_threshold=" << batched_gemv_threshold << std::endl;
  
          // Weight provider: select based on OTD configuration.
-@@ -1704,6 +1752,15 @@ public:
+@@ -1704,6 +1764,15 @@ public:
          // default (config.get_moe_cpu_tier() defaults false), so an unpatched
          // load, or a load that never set the property, is provably unaffected.
          _cpu_tier = config.get_moe_cpu_tier();
@@ -719,17 +731,15 @@ index f0ef5675e8..3669df0520 100644
          if (_cpu_tier && _weight_provider->is_offloaded()) {
              static_cast<OffloadExpertWeightProvider*>(_weight_provider.get())->set_cpu_tier(true);
              // arcint F2 (patch 0018). config.get_moe_cpu_tier_static_partition()
-@@ -1735,21 +1792,28 @@ public:
+@@ -1735,21 +1804,26 @@ public:
                              "MOE_CPU_TIER supports f16 activations only (MOE_DTYPE=half); got ",
                              params.get_input_layout(0).data_type);
              const auto wdt = params.get_input_layout(static_cast<size_t>(MOE3GemmInputIndex::WEIGHT_0)).data_type;
-+            // arcint (patch 0043): a native format's tensors are u4/u8 weights,
-+            // f32 per-block scales and a u8 (or the scale's f32) zero-point
-+            // slot -- read by the tier's row decoders, never by the affine path.
-+            _cpu_native_gate_up = cur_moe->_config.gate_up_weight_format;
-+            _cpu_native_down = cur_moe->_config.down_weight_format;
-+            _native_tier_only = ov::op::internal::MOECompressed::is_native_format(_cpu_native_gate_up) ||
-+                                ov::op::internal::MOECompressed::is_native_format(_cpu_native_down);
++            // arcint (patch 0043): a native format's tensors are u4/u8/i8
++            // weights, f16 per-32 scales and a u8 (or the scale's f16)
++            // zero-point slot -- read by the tier's row decoders, never by the
++            // affine path. _native_tier_only and the two formats were read off
++            // the primitive at the top of this constructor.
              // 4-bit only. The host kernels carry an 8-bit scalar path, but no
              // T1 fixture exercises it (found in review); until one does, an
              // 8-bit artifact is refused here rather than served on an
@@ -752,7 +762,7 @@ index f0ef5675e8..3669df0520 100644
                                  "MOE_CPU_TIER supports u4/u8 expert zero points only; got ", zdt);
                  _cpu_zp_is_u8 = (zdt == ov::element::u8);
              } else {
-@@ -1780,6 +1844,8 @@ public:
+@@ -1780,6 +1854,8 @@ public:
                  static_cast<OffloadExpertWeightProvider*>(_weight_provider.get())->set_per_expert_dispatch(true);
              }
  
@@ -761,7 +771,19 @@ index f0ef5675e8..3669df0520 100644
              if (_per_expert_dispatch) {
                  OPENVINO_ASSERT(wdt == ov::element::u4,
                      "per-expert dispatch requires u4 weights; got ", wdt);
-@@ -2392,6 +2458,8 @@ public:
+@@ -2118,6 +2194,11 @@ public:
+         cur_moe->_cpu_zp_is_u8 = _cpu_zp_is_u8;
+         cur_moe->_cpu_gate_act = _cpu_gate_act;
+         cur_moe->_per_expert_dispatch = _per_expert_dispatch;
++        // arcint (patch 0043): the native format is configuration; without
++        // these three the executing impl runs affine (found in review).
++        cur_moe->_native_tier_only = _native_tier_only;
++        cur_moe->_cpu_native_gate_up = _cpu_native_gate_up;
++        cur_moe->_cpu_native_down = _cpu_native_down;
+         if (_cpu_tier)
+             cur_moe->_cpu_y_staging = moe_otd::StagingRing(_max_topk * 2);
+         return cur_moe;
+@@ -2392,6 +2473,8 @@ public:
              bool needs_fallback = false;
              on_before_batched_gemv(stream, instance, scratch, token_num, topk_count, needs_fallback);
              if (needs_fallback) {
@@ -771,10 +793,10 @@ index f0ef5675e8..3669df0520 100644
                  instance.output_memory_ptr(0)->fill(stream, 0u);
                  return exec_prefill_onednn(events, stream, instance, scratch);
 diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_cpu_expert.cpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_cpu_expert.cpp
-index 90b9f1de58..4839777237 100644
+index 90b9f1de58..0a67576c61 100644
 --- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_cpu_expert.cpp
 +++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_cpu_expert.cpp
-@@ -163,12 +163,131 @@ inline float scale_at(const QuantMatrix& m, int n, int g, int group_count) {
+@@ -163,12 +163,133 @@ inline float scale_at(const QuantMatrix& m, int n, int g, int group_count) {
      return f16_to_f32(m.s[idx]);
  }
  
@@ -887,6 +909,8 @@ index 90b9f1de58..4839777237 100644
  // it indexes x[k] directly and derives the nibble from k&1, so it exercises
  // the packing rule independently of the AVX2 kernel's interpretation of it
  // (that independence is what makes T1's nibble-flip red case meaningful).
++}  // namespace (arcint patch 0043: compute_stage_f32 is linkable for the unit cells)
++
  void compute_stage_f32(const QuantMatrix& mat, const float* x, int n_begin, int n_end, float* acc_out) {
 +    if (mat.format != kQuantFormatU4Affine) {
 +        // arcint (patch 0043): a native format decodes the row (scale folded
@@ -906,7 +930,16 @@ index 90b9f1de58..4839777237 100644
      const int group_count = mat.ic / mat.group_size;
      std::vector<float> sx(static_cast<size_t>(group_count), 0.0f);
      for (int g = 0; g < group_count; g++) {
-@@ -351,7 +470,9 @@ void moe_cpu_expert(const ExpertDesc& e, const ExpertJob* jobs, size_t n_jobs, i
+@@ -200,6 +321,8 @@ void compute_stage_f32(const QuantMatrix& mat, const float* x, int n_begin, int
+     }
+ }
+ 
++namespace {
++
+ }  // namespace
+ 
+ void moe_cpu_expert_ref(const ExpertDesc& e, const ExpertJob* jobs, size_t n_jobs, int col_begin, int col_end) {
+@@ -351,7 +474,9 @@ void moe_cpu_expert(const ExpertDesc& e, const ExpertJob* jobs, size_t n_jobs, i
      // say, 96 would start mid-block and pair lanes with the wrong elements
      // (found in review); such shapes take the scalar reference instead.
      auto avx2_ok = [](const QuantMatrix& m) {
@@ -918,7 +951,7 @@ index 90b9f1de58..4839777237 100644
      if (have_avx2 && avx2_ok(e.gate) && avx2_ok(e.up) && avx2_ok(e.down)) {
          moe_cpu_expert_avx2(e, jobs, n_jobs, col_begin, col_end);
 diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_cpu_expert.hpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_cpu_expert.hpp
-index bb67d9c95a..27f3174d05 100644
+index bb67d9c95a..d4fb56199c 100644
 --- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_cpu_expert.hpp
 +++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_cpu_expert.hpp
 @@ -45,8 +45,28 @@ struct QuantMatrix {
@@ -950,6 +983,19 @@ index bb67d9c95a..27f3174d05 100644
  enum class GateAct { Silu, GeluTanh, GeluErf };   // mirrors MOE_GATE_ACT, mlp.cl:46-65
  
  struct ExpertDesc {
+@@ -98,6 +118,12 @@ void moe_cpu_expert_ref_gpu_emul(const ExpertDesc& e,
+ // Runtime dispatch: avx2 when the build has it AND ov::with_cpu_x86_avx2(), else ref.
+ void moe_cpu_expert(const ExpertDesc& e, const ExpertJob* jobs, size_t n_jobs, int col_begin, int col_end);
+ 
++// arcint (patch 0043). One projection stage of the plain-scalar reference:
++// acc_out[n - n_begin] = dot(x, row n of mat) for n in [n_begin, n_end),
++// through the affine algebra or the native row decoders by mat.format.
++// Declared for the unit cells that pin the decoders to hand-built blocks.
++void compute_stage_f32(const QuantMatrix& mat, const float* x, int n_begin, int n_end, float* acc_out);
++
+ // arcint M14 (patches/0012 wires this up; declared here so T1 can exercise it
+ // standalone). Plain std::thread + condvar pool, independent of whatever
+ // executor the plugin's streams use -- it runs *inside* an infer request
 diff --git a/src/plugins/intel_gpu/src/plugin/transformations_pipeline.cpp b/src/plugins/intel_gpu/src/plugin/transformations_pipeline.cpp
 index cc64807cff..6dd5367d6b 100644
 --- a/src/plugins/intel_gpu/src/plugin/transformations_pipeline.cpp
@@ -963,3 +1009,102 @@ index cc64807cff..6dd5367d6b 100644
                  manager.register_pass<ov::pass::MoeOpFusion>(has_batch_dim);
                  manager.register_pass<ov::intel_gpu::FuseMoERouterScale>();
                  manager.register_pass<ov::intel_gpu::FuseMOESharedExpert>();
+diff --git a/src/plugins/intel_gpu/tests/unit/test_cases/moe_cpu_expert_test.cpp b/src/plugins/intel_gpu/tests/unit/test_cases/moe_cpu_expert_test.cpp
+index 9fc3f9df14..2b0b09f2bb 100644
+--- a/src/plugins/intel_gpu/tests/unit/test_cases/moe_cpu_expert_test.cpp
++++ b/src/plugins/intel_gpu/tests/unit/test_cases/moe_cpu_expert_test.cpp
+@@ -464,3 +464,94 @@ TEST(moe_cpu_expert, gpu_emul_prediction_is_finite_and_recorded) {
+         EXPECT_GT(max_err, 0.0) << "shape=" << cfg.card << " -- a zero diff means the half-accumulation emulation is a no-op";
+     }
+ }
++
++// arcint (patch 0043, campaign sub4bit-vram-kernel). The native row decoders,
++// pinned to hand-built blocks whose expected values follow from the format's
++// definition (ggml-quants.c), not from the code under test; the same three
++// blocks the exporter's python cells use (tests/python/test_native_blocks.py
++// in arcint). Read through compute_stage_f32 with unit vectors, so the value
++// at every k is the decoder's, not a summed one. Red first: with
++// mat.format left at the affine 0 the same bytes decode to other numbers.
++namespace {
++using ov::intel_gpu::ocl::moe::compute_stage_f32;
++using ov::intel_gpu::ocl::moe::kQuantFormatIq3Xxs;
++using ov::intel_gpu::ocl::moe::kQuantFormatIq4Nl;
++using ov::intel_gpu::ocl::moe::kQuantFormatQ8_0;
++
++std::vector<float> decode_row_through_stage(const QuantMatrix& m) {
++    std::vector<float> out(static_cast<size_t>(m.ic)), x(static_cast<size_t>(m.ic), 0.0f);
++    for (int k = 0; k < m.ic; k++) {
++        x[static_cast<size_t>(k)] = 1.0f;
++        float acc = 0.0f;
++        compute_stage_f32(m, x.data(), 0, 1, &acc);
++        out[static_cast<size_t>(k)] = acc;
++        x[static_cast<size_t>(k)] = 0.0f;
++    }
++    return out;
++}
++
++QuantMatrix native_matrix(int format, int ic, const uint8_t* w, const uint8_t* z, const uint16_t* s) {
++    QuantMatrix m;
++    m.w = w; m.z = z; m.s = s;
++    m.oc = 1; m.ic = ic; m.group_size = 32;
++    m.weight_bits = 4; m.weight_signed = false; m.has_zp = (z != nullptr); m.zp_is_u8 = true;
++    m.format = format;
++    return m;
++}
++}  // namespace
++
++TEST(moe_cpu_expert_native, iq4_nl_row_decodes_through_the_16_entry_table) {
++    // two 32-value blocks of codes in LINEAR element order (the exporter's
++    // split re-lays the GGUF block's nibbles, native_blocks.iq4_nl_split, and
++    // pack_u4 packs element k into byte k/2, even index low): y[j] = T[j],
++    // y[j+16] = T[15-j]; d = 1.0 then 0.5. (The first form of this cell built
++    // the GGUF's own nibble layout and failed against the correct decoder.)
++    static const int8_t T[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
++    uint8_t codes[64];
++    for (int b = 0; b < 2; b++)
++        for (int j = 0; j < 16; j++) {
++            codes[b * 32 + j] = static_cast<uint8_t>(j);
++            codes[b * 32 + 16 + j] = static_cast<uint8_t>(15 - j);
++        }
++    uint8_t w[32];
++    for (int m = 0; m < 32; m++) w[m] = static_cast<uint8_t>(codes[2 * m] | (codes[2 * m + 1] << 4));
++    const uint16_t s[2] = {f32_to_f16_bits(1.0f), f32_to_f16_bits(0.5f)};
++    const auto y = decode_row_through_stage(native_matrix(kQuantFormatIq4Nl, 64, w, nullptr, s));
++    for (int j = 0; j < 16; j++) {
++        EXPECT_EQ(y[j], static_cast<float>(T[j]));
++        EXPECT_EQ(y[16 + j], static_cast<float>(T[15 - j]));
++        EXPECT_EQ(y[32 + j], 0.5f * static_cast<float>(T[j]));
++        EXPECT_EQ(y[48 + j], 0.5f * static_cast<float>(T[15 - j]));
++    }
++    // the affine reading of the same bytes is a different row (the cell can fail)
++    const auto affine = decode_row_through_stage(native_matrix(0, 64, w, nullptr, s));
++    EXPECT_NE(affine[0], y[0]);
++}
++
++TEST(moe_cpu_expert_native, q8_0_row_decodes_as_d_times_q) {
++    int8_t q[64];
++    for (int j = 0; j < 64; j++) q[j] = static_cast<int8_t>((j % 32) - 16);
++    const uint16_t s[2] = {f32_to_f16_bits(0.5f), f32_to_f16_bits(-2.0f)};
++    const auto y = decode_row_through_stage(
++        native_matrix(kQuantFormatQ8_0, 64, reinterpret_cast<const uint8_t*>(q), nullptr, s));
++    for (int j = 0; j < 32; j++) {
++        EXPECT_EQ(y[j], 0.5f * static_cast<float>(j - 16));
++        EXPECT_EQ(y[32 + j], -2.0f * static_cast<float>(j - 16));
++    }
++}
++
++TEST(moe_cpu_expert_native, iq3_xxs_row_decodes_through_the_grid_and_the_sign_masks) {
++    // one 32-value sub-block: grid index pair (1, 0) for the first 8 values
++    // (grid[1] = 0x04040414 -> magnitudes 20,4,4,4; grid[0] -> 4,4,4,4), sign
++    // index 5 (= 0b101: values 0 and 2 negative), scale d*(0.5+3)*0.5 = 1.75
++    // -> [-35, 7, -7, 7, 7, 7, 7, 7]; the remaining 24 values grid 0, sign 0
++    // -> 7. A second sub-block at scale 0.25 (s = 0) -> 1.0 everywhere.
++    uint8_t gridix[16] = {0}; gridix[0] = 1;
++    uint8_t signix[8] = {0}; signix[0] = 5;
++    const uint16_t s[2] = {f32_to_f16_bits(1.75f), f32_to_f16_bits(0.25f)};
++    const auto y = decode_row_through_stage(native_matrix(kQuantFormatIq3Xxs, 64, gridix, signix, s));
++    const float want[8] = {-35, 7, -7, 7, 7, 7, 7, 7};
++    for (int j = 0; j < 8; j++) EXPECT_EQ(y[j], want[j]);
++    for (int j = 8; j < 32; j++) EXPECT_EQ(y[j], 7.0f);
++    for (int j = 32; j < 64; j++) EXPECT_EQ(y[j], 1.0f);
++}

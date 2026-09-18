@@ -862,8 +862,21 @@ decoders in `moe_cpu_expert.cpp` (the tables verbatim from llama.cpp's
 ggml-common.h, pinned in arcint's `src/core/gguf_dequant.cpp` against
 gguf-py on the real shards); (3) the new source is listed in the
 transformations library's `sources.cmake` (no glob there — a source not
-listed is silently not built). The OpenCL decode in the fused and
-per-expert kernels is the next patch.
+listed is silently not built); (4) three host-only cells in
+`tests/unit/test_cases/moe_cpu_expert_test.cpp` (`moe_cpu_expert_native.*`)
+pin the three row decoders to hand-built blocks through
+`compute_stage_f32` (declared for them, outside the anonymous namespace).
+Reviewed before packaging (2026-09-18): the first form had the three
+native-format members missing from `clone()`'s field list (the executing
+impl would have run affine on native bytes — patch 0038's defect one
+patch earlier) and read `_native_tier_only` before assigning it; both
+fixed, the format is read off the primitive's config at the top of the
+constructor. The cells run without `ENABLE_TESTS`: compile the test file
+with `moe_cpu_expert*.cpp`, gtest from `thirdparty/gtest`,
+`-DOV_MOE_CPU_TIER_HAVE_AVX2 -mavx2 -mfma -mf16c`, the source tree's
+`src/inference/dev_api` on the include path, linked against the built
+`libopenvino` (8 cells, all green on the dev host). The OpenCL decode in
+the fused and per-expert kernels is the next patch.
 
 **MEASURED (partial):** on the Arc Pro B60 the compile of a native block
 reached the plugin's op translation with a `MOECompressed` of the native

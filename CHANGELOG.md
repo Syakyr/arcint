@@ -51,9 +51,17 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
   on the second attempt (a kernel oops in the xe scheduler's timeout path)
   before any of the patch's device code ran; the stock-affine control cell
   through the same harness is the first leg after the host is back.
-- **Depth-4 native artifact** exported (`qwen38-flash-next-d4n`, 9.5 GiB;
-  not registered — a measurement artifact for the cut ladder against
-  llama.cpp's whole tensors).
+- **Native artifacts** exported, not registered (the registry entry comes
+  with the served reading): depth 4 (`qwen38-flash-next-d4n`, 9.5 GiB, for
+  the cut ladder against llama.cpp's whole tensors) and depth 48
+  (`qwen38-flash-next-d48n`, 77.5 GB, 144 expert bodies native, built in
+  468 s against the quantising fill's 3,583 s, peak host 39.4 GiB under
+  the 40 GiB fence).
+- **Reviewed** before packaging: the plugin patch's first form had the
+  native-format members missing from the impl's clone field list and read
+  the flag before assigning it — the executing impl would have run affine
+  on native bytes; fixed, with three host-only decoder cells in the
+  plugin's tier tests.
 
 ### The serving-shape MoE block fuses (campaign: sub4bit-vram-kernel)
 
