@@ -575,4 +575,9 @@ fusion-impact profile, not a kernel micro-benchmark) applies.
   shares this model's routing noise. The rate lever (the OpenCL decode of
   the native formats, design 2.3c step 3) is now the campaign's next work,
   with the quality question closed at this artifact's own floor.
+  Confirmed from the other side: the pin's own exact f32 forward differs
+  from llama's layer-0 router input by 1.7–2.2% and already routes 2 of
+  the 5 tokens to a different expert at layer 0 (at the two smallest
+  margins, 3.9e-5 and 5.2e-5). No implementation short of llama's own
+  arithmetic matches this capture's routing.
 

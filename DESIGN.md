@@ -9340,7 +9340,10 @@ token-wise through the GDN state and the attention. The gate's 0.06-nat
 bar, carried over from a model with a less flat router, cannot be met
 against this capture by an implementation that does not replicate llama's
 activation quantisation; the reference for this model has to share its
-routing noise. Evidence class throughout: `measured-here`.
+routing noise. Confirmed from the other side: the pin's own exact f32
+forward differs from llama's layer-0 router input by 1.7–2.2% and already
+routes two of the five tokens to a different expert at layer 0. Evidence
+class throughout: `measured-here`.
 
 **Recorded beside it.** Three served attempts were killed by the host
 watchdog before the reading: the served-leg driver had not forwarded the
