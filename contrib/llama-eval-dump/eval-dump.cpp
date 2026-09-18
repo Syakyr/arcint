@@ -60,10 +60,13 @@ static bool dump_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     }
     const std::string path = st->dir + "/" + tag + ".f32";
     FILE * f = fopen(path.c_str(), "wb");
-    if (f) {
-        fwrite(buf.data(), sizeof(float), n, f);
-        fclose(f);
+    if (!f || fwrite(buf.data(), sizeof(float), n, f) != n) {
+        if (f) fclose(f);
+        fprintf(st->index, "%s SKIPPED cannot write %s\n", tag.c_str(), path.c_str());
+        fflush(st->index);
+        return true;
     }
+    fclose(f);
     fprintf(st->index, "%s %lld %lld %lld %lld %s\n", tag.c_str(),
             (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3],
             ggml_type_name(t->type));
@@ -111,11 +114,6 @@ int main(int argc, char ** argv) {
         }
     }
     st.dir = dir;
-    st.index = fopen((st.dir + "/index.txt").c_str(), "w");
-    if (!st.index) {
-        fprintf(stderr, "cannot write %s/index.txt\n", dir);
-        return 1;
-    }
 
     common_params params;
     common_init();
@@ -133,6 +131,13 @@ int main(int argc, char ** argv) {
     auto * ctx   = llama_init->context();
     if (model == nullptr || ctx == nullptr) {
         LOG_ERR("%s : failed to init\n", __func__);
+        return 1;
+    }
+    // the index is opened only now: a bad flag or a failed load must not
+    // truncate a previous run's index in the same directory
+    st.index = fopen((st.dir + "/index.txt").c_str(), "w");
+    if (!st.index) {
+        fprintf(stderr, "cannot write %s/index.txt\n", dir);
         return 1;
     }
     bool OK = run(ctx, params);

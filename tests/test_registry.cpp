@@ -20,9 +20,10 @@ TEST(registry_holds_exactly_the_target_models) {
     // Eleven with the fused-MoE rewrite of the 12-layer rung (2026-09-17,
     // campaign sub4bit-vram-kernel): the same rung in the shape the GPU
     // plugin's tiled MoE matcher accepts, pinned by its own xml hash.
-    // Twelve with the full-depth artifact in that shape (the same day): the
-    // first 48-layer artifact that compiles to a fused MoE, pinned by its
-    // own xml hash; no forward on the record yet.
+    // Twelve with the full-depth artifact in that shape: first d48f (the
+    // same day; it served noise -- its fill was wrong, DESIGN 7.0.2bz), then
+    // d48g in its slot (2026-09-18, the re-export through the corrected
+    // fill, which serves the Paris line), pinned by its own xml hash.
     const auto ids = model_ids();
     CHECK_EQ(ids.size(), 12u);
     CHECK(find_model("qwen3.8-flash-next-d48g") != nullptr);

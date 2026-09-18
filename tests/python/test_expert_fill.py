@@ -436,10 +436,13 @@ def test_b_a_filled_body_reads_back_as_the_file_within_the_u4_rounding(
         zlo = e * out * groups
         zcodes = ef.unpack_u4(raw_zp[zlo // 2:(zlo + out * groups) // 2],
                               out * groups).reshape(out, groups, 1)
-        back = ef.dequantise_affine(codes, zcodes, scale[e])
+        # the scale the IR's chain multiplies is the f16 Constant, not the
+        # arena's exact f32 (a reviewer's catch: test_c rounds, this cell did not)
+        scale16 = np.float16(scale[e]).astype(np.float32)
+        back = ef.dequantise_affine(codes, zcodes, scale16)
         ref = ref_all[e].reshape(out, groups, gs)
         err = np.abs(back - ref)
-        bound = ef.quantisation_step_bound(scale[e])
+        bound = ef.quantisation_step_bound(scale16)
         ratio = err / np.where(bound > 0, bound, 1.0)
         worst_err = max(worst_err, float(err.max()))
         worst_ratio = max(worst_ratio, float(ratio.max()))

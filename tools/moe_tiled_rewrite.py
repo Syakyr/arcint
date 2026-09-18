@@ -157,6 +157,14 @@ def rewrite_tiled_moe(model):
                              f"is not [E static, M, H static]")
         E, H = E.get_length(), H.get_length()
         tag = mul3.get_friendly_name()
+        # identity by instance id, checked BEFORE anything is spliced: a block
+        # whose Multiply does not read both the expert output and the
+        # Unsqueeze refuses here, with the model untouched (a reviewer's
+        # catch: the earlier version raised after mutating)
+        srcs = {mul3.input_value(i).get_node().get_instance_id() for i in range(2)}
+        if srcs != {outs.get_node().get_instance_id(), uns.get_instance_id()}:
+            raise RuntimeError(f"{tag}: the Multiply's operands are not the expert output "
+                               f"and the router Unsqueeze; nothing rewritten")
         outs4 = op.reshape(outs, op.constant(np.array([E, 1, -1, H], np.int32)),
                            special_zero=False)
         outs4.set_friendly_name(f"{tag}/end_reshape")
@@ -177,8 +185,7 @@ def rewrite_tiled_moe(model):
             elif src.get_instance_id() == uns.get_instance_id():
                 mul3.input(i).replace_source_output(wu.output(0))
                 done += 1
-        if done != 2:
-            raise RuntimeError(f"{tag}: rewired {done} of 2 Multiply operands")
+        assert done == 2, (tag, done)              # guaranteed by the check above
         n += 1
     if n or n_sw or n_16:
         model.validate_nodes_and_infer_types()

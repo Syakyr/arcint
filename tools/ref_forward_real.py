@@ -50,15 +50,16 @@ def main(argv=None):
     ap.add_argument("--ids", required=True, help="comma-separated token ids")
     ap.add_argument("--layers", type=int, default=1)
     ap.add_argument("--out", required=True)
-    ap.add_argument("--unfold-norms", default="",
-                    help="comma-separated pin-key suffixes whose fed vector gets 1.0 "
-                         "subtracted after the feed -- the experiment for a norm gamma "
-                         "the GGUF converter stored folded as (1 + w) while the pin "
-                         "applies (1 + w) itself")
-    ap.add_argument("--alog-from-neg-a", action="store_true",
-                    help="feed linear_attn.A_log as log(-ssm_a): the experiment for a "
-                         "converter that stored A = -exp(A_log) under ssm_a while the "
-                         "pin computes -exp(A_log) itself")
+    ap.add_argument("--refold-norms", default="",
+                    help="comma-separated pin-key suffixes whose fed gamma gets 1.0 ADDED "
+                         "back: the feed undoes the converter's (1 + w) fold since "
+                         "2026-09-18 (gguf_feed kind gamma1), so this re-creates the "
+                         "AS-STORED experiment that found it (the pin then applies "
+                         "(1 + w) on top of the stored (1 + w))")
+    ap.add_argument("--a-as-stored", action="store_true",
+                    help="feed linear_attn.A_log as the GGUF stores ssm_a, -exp(A_log): "
+                         "the feed undoes that fold (kind neglog), so this re-creates the "
+                         "AS-STORED experiment that found it")
     ap.add_argument("--k-head-map", default=None, choices=(None, "interleave", "tiled"),
                     help="experiment: how the 16 key heads serve the 48 value heads in "
                          "layer 0's GDN core -- the pin's repeat_interleave (value head h "
@@ -103,21 +104,17 @@ def main(argv=None):
         arr = feed.fitted(k, tuple(sd[k].shape))
         sd[k] = torch.from_numpy(np.ascontiguousarray(arr)).to(sd[k].dtype)
         fed += 1
-    unfold = tuple(x for x in args.unfold_norms.split(",") if x)
-    if unfold:
-        hit = [k for k in sd if k.endswith(unfold)]
+    refold = tuple(x for x in args.refold_norms.split(",") if x)
+    if refold:
+        hit = [k for k in sd if k.endswith(refold)]
         for k in hit:
-            sd[k] = sd[k] - 1.0
-        print(f"[unfold] 1.0 subtracted from {len(hit)} fed vector(s): {hit}", flush=True)
-    if args.alog_from_neg_a:
+            sd[k] = sd[k] + 1.0
+        print(f"[refold] 1.0 added back to {len(hit)} fed gamma(s) (as stored): {hit}", flush=True)
+    if args.a_as_stored:
         hit = [k for k in sd if k.endswith("linear_attn.A_log")]
         for k in hit:
-            v = sd[k]
-            if bool((v >= 0).any()):
-                raise SystemExit(f"{k}: fed values are not all negative (min {float(v.min())}, "
-                                 f"max {float(v.max())}); not a -exp(A_log) fold")
-            sd[k] = torch.log(-v)
-        print(f"[alog] A_log = log(-ssm_a) for {len(hit)} vector(s): {hit}", flush=True)
+            sd[k] = -torch.exp(sd[k])
+        print(f"[a-as-stored] A_log <- -exp(A_log) for {len(hit)} vector(s): {hit}", flush=True)
     ref.load_state_dict(sd)
     del sd
     print(f"[feed] {fed} keys fed at the real geometry in {time.time() - t0:.1f}s "
@@ -159,25 +156,32 @@ def main(argv=None):
     # own L2 norm -> llama's q/k/v_conv_predelta-i, gate-i, beta_sigmoid-i
     import q4e.ref_backbone as _rb
     _pin = _rb._pin
+    # the module-level functions are called once per GDN layer, in layer
+    # order; the call index names the tap's layer (a reviewer caught the
+    # earlier version writing every layer under L0)
+    calls = {"conv": 0, "chunk": 0}
     _orig_conv = _pin.causal_conv1d_fn
     def _conv_tap(*a, **kw):
         o = _orig_conv(*a, **kw)
-        tap("L0/gdn/conv_silu", o[0] if isinstance(o, tuple) else o)
+        tap(f"L{calls['conv']}/gdn/conv_silu", o[0] if isinstance(o, tuple) else o)
+        calls["conv"] += 1
         return o
     _pin.causal_conv1d_fn = _conv_tap
     khm = args.k_head_map or getattr(cfg, "gdn_key_head_map", None) or "interleave"
-    print(f"[k-head-map] {khm} ({'flag' if args.k_head_map else 'the real config'})", flush=True)
+    hk, hv = int(cfg.linear_num_key_heads), int(cfg.linear_num_value_heads)
+    print(f"[k-head-map] {khm} ({'flag' if args.k_head_map else 'the real config'}; "
+          f"{hk} key heads, {hv} value heads)", flush=True)
     _orig_chunk = _pin.torch_chunk_gated_delta_rule
     def _chunk_tap(query, key, value, g, beta, *a, **kw):
-        if khm == "tiled" and query.shape[2] == value.shape[2]:
-            r = value.shape[2] // 16 if value.shape[2] % 16 == 0 else 1
-            hk = value.shape[2] // r
-            # undo the pin's interleave (head 3h <- key head h), then tile
+        li = calls["chunk"]
+        calls["chunk"] += 1
+        if khm == "tiled" and query.shape[2] == hv and hv % hk == 0 and hv > hk:
+            r = hv // hk
+            # undo the pin's interleave (head r*h <- key head h), then tile
             query = query[:, :, ::r].repeat(1, 1, r, 1)
             key = key[:, :, ::r].repeat(1, 1, r, 1)
-            print(f"[k-head-map] tiled: value head h <- key head h % {hk}", flush=True)
-        tap("L0/gdn/q_in", query); tap("L0/gdn/k_in", key); tap("L0/gdn/v_in", value)
-        tap("L0/gdn/g_in", g); tap("L0/gdn/beta_in", beta)
+        tap(f"L{li}/gdn/q_in", query); tap(f"L{li}/gdn/k_in", key); tap(f"L{li}/gdn/v_in", value)
+        tap(f"L{li}/gdn/g_in", g); tap(f"L{li}/gdn/beta_in", beta)
         return _orig_chunk(query, key, value, g, beta, *a, **kw)
     _pin.torch_chunk_gated_delta_rule = _chunk_tap
     # the gated norm's INPUT is the delta-rule core's output (llama: attn_output-i)

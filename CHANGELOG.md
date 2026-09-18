@@ -43,8 +43,9 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
   fusion that silently did not happen); the CPU plugin runs the same
   tiled pass and serves as a device-free oracle in the suite.
 - **Registry**: `qwen3.8-flash-next-d12r`, the fused-MoE rewrite of the
-  depth-12 rung, and `qwen3.8-flash-next-d48f`, the 48-layer artifact in
-  the fused shape (both measurement artifacts).
+  depth-12 rung (a measurement artifact); the 48-layer artifact of the same
+  day (`d48f`) was withdrawn before release — its fill was wrong (below)
+  and `qwen3.8-flash-next-d48g` took its slot.
 - **Runtime dependency: `marfrit-openvino +p18` (patches 0003–0042).**
   Patch 0042 fixes patch 0037's page fault on the Arc Pro B60: the hybrid
   prefill's grouped-GEMM gather ran over every token-expert pair while
@@ -53,11 +54,11 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
   (the 35B with the CPU tier serves on the B60 at ratio 99, 23.6 t/s decode,
   KV u8, f16 inference).
   Patch 0041 measured inert on the fused offload route at compile.
-- **Full depth compiles**: the 48-layer artifact in the fused shape
-  (`qwen3.8-flash-next-d48f`) compiles on the 24 GiB card at
-  `--offload-ratio 99 --moe-cpu-tier` with 8.06 GiB device-resident and a
-  2.5 GiB host peak; no forward at full depth yet (the tier faults on that
-  card and its host pool exceeds RAM at 48 layers).
+- **Full depth compiles and serves**: the 48-layer artifact in the fused
+  shape compiles on the 24 GiB card at `--offload-ratio 99 --moe-cpu-tier`
+  with 8.06 GiB device-resident and serves from an NVMe copy; with the
+  corrected fill (`qwen3.8-flash-next-d48g`, below) it answers the Paris
+  line.
 
 
 ### The Flash-Next fill, corrected three ways (campaign: serving-shape-logits)

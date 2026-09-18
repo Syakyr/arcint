@@ -14,7 +14,7 @@ shape is (ne3, ne2, ne1, ne0) squeezed; ours is reshaped to that (a [T,
 hc*H] residual becomes [T, hc, H], the same memory order as llama's
 {H, hc, T}).
 
-  llama_tap_compare.py dump DUMP_DIR TAG NPY [--per-head]
+  llama_tap_compare.py dump DUMP_DIR TAG NPY [--per-head] [--reshape]
   llama_tap_compare.py log  LOG TAG NPY        (TAG = name or name#k)
 """
 import re
@@ -96,18 +96,23 @@ def load_index(d):
     return idx
 
 
-def compare_dump(dump, tag, npy, per_head=False):
+def compare_dump(dump, tag, npy, per_head=False, reshape=False):
     ne = load_index(dump)[tag]
     L = np.fromfile(Path(dump) / f"{tag}.f32", dtype=np.float32)
-    L = L.reshape(ne[3], ne[2], ne[1], ne[0]).squeeze().astype(np.float64)
+    L = L.reshape(ne[3], ne[2], ne[1], ne[0]).astype(np.float64)
+    while L.ndim > 2 and L.shape[0] == 1:          # drop leading unit axes only (T = 1 survives)
+        L = L[0]
     P = np.load(npy).astype(np.float64)
+    if P.ndim == 3 and P.shape[0] == 1 and P.shape[1:] == L.shape[::-1]:
+        P = P[0].T                                   # a [1, C, T] activation against llama's {C, T}
+    elif P.ndim == 2 and P.shape != L.shape and P.shape == L.shape[::-1]:
+        P = P.T
+    elif P.shape != L.shape and P.size == L.size and reshape:
+        P = P.reshape(L.shape)                       # explicit: the caller vouched for the memory order
     if P.shape != L.shape:
-        if P.ndim == 3 and P.shape[0] == 1:
-            P = P[0]
-        if P.ndim == 2 and P.T.shape == L.shape:
-            P = P.T
-        elif P.size == L.size:
-            P = P.reshape(L.shape)
+        print(f"{tag:<26} shape mismatch: llama {L.shape} ours {P.shape} (pass --reshape to "
+              f"reinterpret an equal-size array in llama's memory order)")
+        return
     d = np.abs(L - P)
     print(f"{tag:<26} shape {str(L.shape):<16} sum llama {L.sum():+.4f} ours {P.sum():+.4f} | "
           f"max|diff| {d.max():.5f} mean|diff| {d.mean():.6f} mean|llama| {np.abs(L).mean():.6f} "
@@ -128,7 +133,7 @@ def main(argv):
     if mode == "log":
         compare_log(ref, tag, npy)
     elif mode == "dump":
-        compare_dump(ref, tag, npy, per_head="--per-head" in argv)
+        compare_dump(ref, tag, npy, per_head="--per-head" in argv, reshape="--reshape" in argv)
     else:
         print(__doc__)
         return 2

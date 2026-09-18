@@ -36,15 +36,16 @@ def main():
     ap.add_argument("a"); ap.add_argument("b")
     ap.add_argument("--records", type=int, default=0, help="compare only the first N records (0 = all shared)")
     ap.add_argument("--from-n", type=int, default=0,
-                    help="align on the first record with this many new tokens in EACH file (the request's prefill; the load ladder and the slot-pool probe come first and differ per configuration), then compare it and the records after it")
+                    help="align on the LAST record with this many new tokens in EACH file (the request's prefill; the load ladder's 128..2048-token forwards and the slot-pool probe come BEFORE it and can share its length, so the first such record may be a ladder rung), then compare it and the records after it; the number of candidates is printed so an ambiguous prompt length is visible")
     a = ap.parse_args()
     ra, rb = read_dump(a.a), read_dump(a.b)
     if a.from_n:
-        ia = next((i for i, r in enumerate(ra) if r[2] == a.from_n), None)
-        ib = next((i for i, r in enumerate(rb) if r[2] == a.from_n), None)
-        if ia is None or ib is None:
-            print(f"no record with n={a.from_n} in A ({ia}) or B ({ib})"); return 1
-        print(f"aligned: A record {ia}, B record {ib} (first with n={a.from_n})")
+        ca = [i for i, r in enumerate(ra) if r[2] == a.from_n]
+        cb = [i for i, r in enumerate(rb) if r[2] == a.from_n]
+        if not ca or not cb:
+            print(f"no record with n={a.from_n} in A ({len(ca)}) or B ({len(cb)})"); return 1
+        ia, ib = ca[-1], cb[-1]
+        print(f"aligned: A record {ia} of {len(ca)} with n={a.from_n}, B record {ib} of {len(cb)} (the last each)")
         ra, rb = ra[ia:], rb[ib:]
     n = min(len(ra), len(rb))
     if a.records:
