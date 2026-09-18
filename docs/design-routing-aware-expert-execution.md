@@ -152,6 +152,61 @@ decode is NOT alike across pages (the blind-fill lesson of 2026-09-08);
 (3) the depth-4 cut ladder against llama.cpp's whole tensors reading
 layer 3 at ≥ 0.9999 where the u4 repack reads 0.9987; (4) the KLD gate.
 
+### §2.3b — how the native blocks reach the op (decided 2026-09-18)
+
+Read from the plugin source (`code`, the pinned tree on the dev host):
+
+* `ov::op::internal::MOECompressed::Config` (`ov_ops/moe_compressed.hpp`:
+  hidden_size, inter_size, num_expert, top_k, group_size, has_zp,
+  out_type) is where a `weight_format` field lives (gate/up and down
+  separately: the checkpoint mixes IQ3_XXS and IQ4_NL).
+* The offload copy path is format-agnostic already:
+  `expert_tensor_span` sizes one expert as the tensor's bytes divided by
+  the expert count and `fill_weights_memory` copies nine per-expert
+  tensors by name — gate/up/down weights, scales, zero-points. Nine
+  tensors carry the native formats without new plumbing: for IQ4_NL the
+  nibble tensor and the per-32 scales (zero-points unused); for IQ3_XXS the
+  grid-index tensor, the per-32 scales (d·(0.5 + s)·0.5, precomputed at
+  fill in f32 — the checkpoint's own numbers, no re-quantisation) and the
+  sign-mask index tensor in the zero-point slot.
+* The CPU tier (`moe_cpu_expert.cpp`) decodes per element inside a
+  per-group loop; a native row decodes into a per-row f32 scratch of `ic`
+  values first (the tier is bandwidth-bound, the extra pass is free), with
+  the two decoders of `gguf_dequant.cpp` ported.
+* The fused kernels select by weight type (u4/i4/u8) and a group size; a
+  native format is refused there until its OpenCL decode exists, so the
+  first served form runs every expert on the tier.
+
+The GRAPH SIDE decides the order of work. The plugin's tiled matcher
+(`convert_tiled_moe_block_to_gather_matmuls.cpp`) recognises a
+`CompressedWeightsBlock` — a u4/i4/u8 Constant through Convert, an optional
+Subtract of a zero-point and a Multiply by a scale — and nothing else; a
+raw block tensor cannot be matched, and the emitter (python) cannot
+construct the internal op. So the emitter expresses the native decode in
+STANDARD ops over the checkpoint's own bytes re-laid per tensor:
+
+* IQ4_NL: `Gather(table[16] as f16, Convert(nibbles u4 → i32))` × per-32
+  scale — the affine chain with the Subtract replaced by a table Gather;
+* IQ3_XXS: `Gather(grid[256×8] → magnitudes)` reshaped to the row,
+  `Gather(signs[128], sign_index)` → `BitwiseAnd` with the eight masks →
+  a sign of ±1, × per-32 scale.
+
+Both are shape-valid, exact in f32, and RUN ON THE CPU PLUGIN as they are —
+the device-free oracle of the suite — and on the card as generic ops in the
+unfused form (every expert computed, the pre-fusion residency), which is
+enough for the depth-4 ladder against llama.cpp's whole tensors without a
+plugin patch. The plugin patch then adds the two `CompressedWeightsBlock`
+variants to the matcher, `weight_format` to the config, the tier's row
+decoders and, last, the OpenCL decode in the fused and per-expert kernels.
+The fill becomes a re-layout of the GGUF's block bytes into these tensors
+(nibbles, grid indices, sign indices, per-block scales) — exact, and
+pinned against `gguf_dequant.cpp`'s decoders on the real shards.
+
+A depth-4 llama.cpp reference by `--override-kv qwen4exp.block_count` is
+NOT available (`measured-here`: the loader refuses, `compress_ratios` is an
+array of 48); the depth-4 acceptance stays the whole-tensor comparison at
+`layer3/out` (≥ 0.9999, the u4 repack reads 0.9987).
+
 ### §2.4 — kernel technology
 
 The plugin's own OCL kernel infrastructure (`moe_3gemm_swiglu_mlp.cl` and
