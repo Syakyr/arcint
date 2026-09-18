@@ -207,6 +207,48 @@ NOT available (`measured-here`: the loader refuses, `compress_ratios` is an
 array of 48); the depth-4 acceptance stays the whole-tensor comparison at
 `layer3/out` (≥ 0.9999, the u4 repack reads 0.9987).
 
+### §2.3c — the native formats in the fused op's own layout (2026-09-18)
+
+`MOECompressed` (`ov_ops/moe_compressed.hpp`, `code`) takes each expert
+weight as rank-4 `[E, out, groups, group_size]` with a scale
+`[E, out, groups, 1]` and an optional zero-point `[E, out, groups, 1]`;
+`validate_and_infer_types` checks K = groups × group_size against the
+scale's group count. Both native formats fit that layout at group 32
+without any re-layout of the per-role arrays:
+
+| format | weight slot | scale slot | zero-point slot | decode |
+|---|---|---|---|---|
+| IQ4_NL (down) | u4 codes `[E, out, K/32, 32]`, linear element order | f32 `d` `[E, out, K/32, 1]` | none (`has_zp = false`) | `d · T[code]`, T the 16-entry table |
+| IQ3_XXS (gate, up) | u8 grid indices `[E, out, K/32, 8]` (4 values each) | f32 `d·(0.5+s)·0.5` `[E, out, K/32, 1]` | u8 sign indices `[E, out, K/32, 4]` (8 signs each) | `scale · grid[idx][j] · sign` |
+
+The emitter's Constants (`_native_expert`, tree after 8ae3d15) are these
+shapes exactly, so the plugin patch's matcher lowers them as they are, the
+offload path copies one expert's bytes as it does today (tensor bytes ÷
+experts, nine slots), and a `weight_format` per projection in
+`MOECompressed::Config` (visited as an attribute, so it serialises) tells
+the kernels how to read the three slots. The validation relaxes at two
+places under a native format: the weight's last dimension (8 for IQ3_XXS,
+not the group size) and the zero-point's (4, not 1). Per expert-layer the
+bytes are 2 × (640 × 80 × 8 + 640 × 80 × 4 + 640 × 80 × 4) + 2560 × 20 ×
+16 + 2560 × 20 × 4 = 1,638,400 + 1,024,000 = 2,662,400 B — 8% more than
+the u4 repack's 2,457,600 B (the f32 per-32 scales; f16 scales would put
+it at 2,355,200 B), the Fit table row to recompute.
+
+Order of the plugin work, each a patch on the series: (1) the graph side
+— a `NativeExpertBlock` pattern for the two chains beside
+`CompressedWeightsBlock`, the chain-to-compressed-GatherMatmul conversion
+carrying the format, `weight_format` in the config with the two relaxed
+checks; (2) the tier — every routed expert through the CPU tier under a
+native format (patch 0038's mechanism, at any offload ratio; a ratio of
+100 is "disabled" in `prepare_moe_otd_params`, so the resident set is
+never empty and the fused kernels must refuse the format until they can
+read it) with the two row decoders of `gguf_dequant.cpp` in
+`moe_cpu_expert.cpp`; (3) the OpenCL decode in the fused and per-expert
+kernels. After (1)+(2) the depth-4 native artifact runs on the card
+through the boot driver's cut ladder and the served binary serves the
+model from the tier alone — the first native serve, and the KLD gate's
+first native reading.
+
 ### §2.4 — kernel technology
 
 The plugin's own OCL kernel infrastructure (`moe_3gemm_swiglu_mlp.cl` and
