@@ -48,6 +48,25 @@ class _RandomNativeFiller:
         return fmt, nb.SPLIT[fmt](raw.reshape(rows, nblk * nbytes))
 
 
+class _RandomAffineFiller:
+    """The CONTROL: the stock u4 grouped-affine bodies (serving_shape's
+    fusing chain, group 128) at the same geometry, through the same harness
+    and properties. A failure here is the harness or the environment, not
+    the native lowering."""
+
+    def __init__(self, seed=0):
+        self.rng = np.random.default_rng(seed)
+
+    def body(self, layer, kind, e, out, inn):
+        from q4e.expert_fill import pack_u4
+        gs = ss.EXPERT_GROUP_SIZE
+        groups = inn // gs
+        codes = self.rng.integers(0, 16, size=(e, out, groups, gs), dtype=np.uint8)
+        zp = self.rng.integers(0, 16, size=(e, out, groups, 1), dtype=np.uint8)
+        sc = self.rng.uniform(0.001, 0.02, size=(e, out, groups, 1)).astype(np.float32)
+        return pack_u4(codes), pack_u4(zp), sc
+
+
 def _config():
     from transformers.models.qwen4_exp import configuration_qwen4_exp as pin_cfg
     return pin_cfg.Qwen4ExpTextConfig(
@@ -71,14 +90,15 @@ def _build(tmp_path, T, gate_up_fmt, down_fmt):
         "mlp.shared_expert_gate.weight": (rng.standard_normal((1, H)) * 0.05).astype(np.float32),
     }
     x = op.parameter([1, T, H], Type.f32, name="x")
-    y = ss.emit_moe_tiled(x, cfg, st, arena, T, "layer0/moe", filler=_RandomNativeFiller(gate_up_fmt, down_fmt), layer=0)
+    filler = _RandomAffineFiller() if gate_up_fmt == "affine" else _RandomNativeFiller(gate_up_fmt, down_fmt)
+    y = ss.emit_moe_tiled(x, cfg, st, arena, T, "layer0/moe", filler=filler, layer=0)
     model = ov.Model([op.result(y)], [x], "native_moe_block")
     ov.save_model(model, str(tmp_path / "moe.xml"), compress_to_fp16=False)
     return arena, cfg
 
 
 @_skip
-@pytest.mark.parametrize("gate_up_fmt,down_fmt", [("IQ3_XXS", "IQ4_NL"), ("IQ4_XS", "Q8_0")])
+@pytest.mark.parametrize("gate_up_fmt,down_fmt", [("affine", "affine"), ("IQ3_XXS", "IQ4_NL"), ("IQ4_XS", "Q8_0")])
 def test_the_native_block_lowers_to_the_fused_primitive_and_matches_the_cpu_plugin(tmp_path, gate_up_fmt, down_fmt):
     T = 6
     arena, cfg = _build(tmp_path, T, gate_up_fmt, down_fmt)

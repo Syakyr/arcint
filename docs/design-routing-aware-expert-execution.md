@@ -249,6 +249,64 @@ through the boot driver's cut ladder and the served binary serves the
 model from the tier alone — the first native serve, and the KLD gate's
 first native reading.
 
+### §2.3d — what the checkpoint actually ships, and the scale's precision (2026-09-18)
+
+The two-format premise of §2.3a–c was read off `blk.0` and `blk.24`. The
+first native depth-4 export refused layer 2, and the census of all 48
+layers (`measured-here`, every `ffn_*_exps` tensor's GGML type read from
+the shards) is:
+
+| layers | gate / up | down |
+|---|---|---|
+| 0, 1, 3, 5–29, 31–45 (43 layers) | IQ3_XXS | IQ4_NL |
+| 2 | IQ4_XS | Q8_0 |
+| 4, 30, 46, 47 | IQ3_XXS | Q8_0 |
+
+Two more formats, both fitting the group-32 layout (`code`, ggml-quants.c
+`dequantize_row_iq4_xs` / `dequantize_row_q8_0`, pinned clone 56b9eb28):
+
+| format | weight slot | scale slot | zero-point slot | decode |
+|---|---|---|---|---|
+| IQ4_XS (gate, up of layer 2) | u4 codes `[E, out, K/32, 32]` — **the IQ4_NL layout**: a 256-value block's nibbles index the same 16-entry table in the same order | f16 `d·(ls−32)`, the 6-bit sub-block scale folded in by the exporter (`native_blocks.iq4_xs_split`) | the scale again | the IQ4_NL decode, unchanged |
+| Q8_0 (down of 5 layers) | i8 codes `[E, out, K/32, 32]` | f16 `d` | the scale again | `d · q` (plugin format 3, `NativeQ8WeightsBlock`, a third row decoder in the tier) |
+
+So the plugin knows three decodes (IQ4_NL-table, IQ3_XXS-grid, Q8_0)
+for four checkpoint formats; the config's `weight_format` names the
+decode, and `serving_shape` keeps the provenance (`IQ4_XS` in the census,
+the chain is the IQ4_NL one).
+
+**The block scale is an f16 Constant, not f32** (`measured-here`, GPU.0,
+2026-09-18, first attempt of the lowering cell): an f32 scale Constant
+under the fused op is wrapped in a `Convert(f16)` by the plugin's
+`ConvertPrecision` (transformations_pipeline.cpp: the native pass runs at
+line ~671, the precision pass at ~777), the offload series cannot fold it
+(file-backed Constants), and the op translation (`ops/moe.cpp:65`) refuses
+a non-Constant input. Every stock scale is f16, so the native one is too,
+behind a `Convert(f32)` in the emitter's chain that the pattern blocks
+accept as optional. Exactness: IQ4_NL's and Q8_0's `d` IS an f16, so those
+stay exact; IQ3_XXS's `d·(0.5+s)·0.5` and IQ4_XS's `d·(ls−32)` round once
+to f16, ≤ 2⁻¹¹ relative per block (asserted per random block in
+`test_native_expert_chain`, and the real layer-0 / layer-2 experts through
+the chain against gguf-py within that bound plus f32 summation). Against
+the 0.10–0.13 relative RMS of the u4 repack this is three orders of
+magnitude below; the f16 scales also put the per expert-layer bytes at the
+2,355,200 B of the §2.3c note, not 2,662,400 B.
+
+The lowering itself fired on the card (the compile reached the plugin's
+op translation with a `MOECompressed` of the native inputs, first
+attempt). The second attempt, with f16 scales, never got to run the pass's
+output: the B60 wedged at the first job of the process (kernel-owned
+queue, "not started", GuC reset cascade, then a NULL dereference in
+`xe_sched_job_set_error` inside the driver's own timeout path — the xe
+DKMS build `xe-ringorder/7.0.14+p1` on kernel 7.0.14-12-pve). That is an
+observation of the host, not a measurement of the native path: the
+stock-affine control cell through the same harness (the `affine` parameter
+of `test_native_lowering_gpu.py`) is the first thing to run when a card is
+back, before any native cell — a wedge that reproduces on the control is
+the harness or the driver; one that does not is the native path's, and
+then the tier-only execution (`_native_tier_only`, batched-GEMV path with
+every expert a sentinel) is where to look.
+
 ### §2.4 — kernel technology
 
 The plugin's own OCL kernel infrastructure (`moe_3gemm_swiglu_mlp.cl` and
