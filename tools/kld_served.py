@@ -250,8 +250,18 @@ def compare(args):
           f"records in {len(all_windows)} window(s), {len(replays)} of them {n_ctx}-token "
           f"replays (the rest: the server's load-time probes)", flush=True)
     if len(windows) != n_chunk:
-        raise ValueError(f"dump holds {len(replays)} replayed window(s) of {n_ctx} tokens, "
-                         f"the capture has {n_chunk}")
+        if args.partial and 0 < len(replays) < n_chunk:
+            # a replay cut short (2026-09-18: the native tier's first serve
+            # finished window 0 of 2 in 58 min before the leg's own hour ran
+            # out): read the windows that are there, in capture order, and
+            # say so in the report -- never a floor, never the full reading
+            print(f"PARTIAL: {len(replays)} of {n_chunk} windows replayed; comparing those "
+                  f"(--partial)", flush=True)
+            n_chunk = len(replays)
+            windows = replays[-n_chunk:]
+        else:
+            raise ValueError(f"dump holds {len(replays)} replayed window(s) of {n_ctx} tokens, "
+                             f"the capture has {n_chunk}")
     first = n_ctx // 2
     n_rows = n_ctx - 1 - first
     report = {"ref": args.ref, "dump": args.dump, "n_ctx": n_ctx, "n_vocab": n_vocab,
@@ -285,6 +295,7 @@ def compare(args):
               f"{entry['mean_kl_above'] if entry['mean_kl_above'] is None else format(entry['mean_kl_above'], '.6e')}; "
               f"max {entry['max_kl']:.4e}; argmax agreement {entry['argmax_agreement']:.4f}",
               flush=True)
+    report["partial"] = bool(len(windows) < len(rows))
     report["mean_kl_below"] = float(np.mean(all_below)) if all_below else None
     report["mean_kl_above"] = float(np.mean(all_above)) if all_above else None
     # THE FLOOR: every earlier replay (A) against the last one (B), same rows.
@@ -359,6 +370,9 @@ def main(argv=None):
                          "during the warmups shows in the earlier pairs")
     ap.add_argument("--timeout", type=float, default=3600.0)
     ap.add_argument("--dump", default=None, help="the ARCINT_LOGITS_DUMP file")
+    ap.add_argument("--partial", action="store_true",
+                    help="compare: accept a dump with fewer replayed windows than the capture "
+                         "(a replay cut short); the report names the windows it read")
     ap.add_argument("--out", default=None, help="write the report JSON here")
     args = ap.parse_args(argv)
     if args.replay:
