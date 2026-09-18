@@ -45,6 +45,11 @@ def test_the_config_carries_every_key_the_loader_reads_at_depth_4():
     assert cfg["ngram_vocab_size_base"] == 20_000_000
     assert cfg["ple_embed_dim"] == 2560 and cfg["vocab_size"] == 248320
     assert cfg["model_type"] == "qwen4_exp"
+    # the GDN's output gate: sigmoid for this checkpoint (llama.cpp hard-codes
+    # it for the architecture; the pin defaults to hidden_act = silu when the
+    # key is absent, which is how the first artifacts were exported)
+    assert cfg["output_gate_type"] == "sigmoid"
+    assert cfg["gdn_key_head_map"] == "tiled"
     json.dumps(cfg)                                    # serialisable as written
 
 

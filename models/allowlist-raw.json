@@ -147,6 +147,25 @@
     "mtp_num_hidden_layers": 1,
     "mtp_head_exported": false
   },
+  "qwen38-flash-next-d48g-ov": {
+    "_note": "2026-09-18: the 48-layer serving-shape IR re-exported from tree f91ea73 through the corrected fill (DESIGN 7.0.2bz: the GGUF converter's folded norm gammas and -exp(A_log) undone at the feed, the sigmoid output gate, the tiled key-head pairing), after the fill's three defects were found against llama.cpp's own tensors of the same GGUF. Its depth-4 sibling agrees with llama.cpp at every cut (layer 3 out corr 0.9987). Supersedes d48f (tree da52858, xml f89a162348b13d18), which served logits with no information about the model (KL 12.4 nats against the model's own capture). Hashes read off the export log.",
+    "arch": [
+      "Qwen4ExpForConditionalGeneration"
+    ],
+    "model_type": "qwen4_exp",
+    "hidden": 2560,
+    "layers": 48,
+    "experts": 512,
+    "ctx": 262144,
+    "full_attention_interval": 4,
+    "template_sha": "12827f24b742ea4e",
+    "tokenizer_sha": "87a7830d63fcf43b",
+    "lm_xml_sha": "a077e6e4bfa9b847",
+    "lm_bin_bytes": 80061287197,
+    "status": "full-depth fused-MoE artifact through the corrected fill; the KLD gate against the model's own capture is its acceptance",
+    "mtp_num_hidden_layers": 1,
+    "mtp_head_exported": false
+  },
   "qwen38-flash-next-d12-ov": {
     "_note": "2026-09-13: the serving-shape IR of Qwen3.8 Flash-Next (qwen4exp) at DEPTH 12 of 48 -- the depth ladder's first rung (docs/window-051.md row (b)), real weights from the UD-Q3_K_XL shards (tools/export_serving_artifact.py --layers 12, tree d93508c, serving-shape.json beside it). Hashes read off /models/ov/qwen38-flash-next-d12-ov on the dev host (build 1,450.9 s, peak host 30.39 GiB). A measurement artifact: 36 layers are missing, its answers are not the model's.",
     "arch": [
@@ -163,6 +182,25 @@
     "lm_xml_sha": "7738fa87cddca8e2",
     "lm_bin_bytes": 22613492905,
     "status": "measurement artifact: depth 12 of 48, the depth ladder's first rung; not the model's answers",
+    "mtp_num_hidden_layers": 1,
+    "mtp_head_exported": false
+  },
+  "qwen38-flash-next-d12r-ov": {
+    "_note": "2026-09-17: the DEPTH-12 artifact of 2026-09-13 rewritten in memory by tools/moe_tiled_rewrite.py at tree 0b66c43 and written back with ov.save_model (NOT an export: same u4 codes and zero-points, scales rounded to f16, the MoE block in the shape the GPU plugin's tiled matcher accepts -- two Reshapes, a one-input Swish, an f16 dequant chain with a trailing Convert). The first Flash-Next serving-shape artifact that compiles to moe_3gemm_fused_compressed; with --offload-ratio 99 --moe-cpu-tier it is 3.00 GiB device-resident on the 24 GiB card against 17.73 unfused. Hashes read off the artifact on the dev host (arcint --inspect-artifact). A measurement artifact: 36 layers are missing, its answers are not the model's; superseded by a re-export from the shards.",
+    "arch": [
+      "Qwen4ExpForConditionalGeneration"
+    ],
+    "model_type": "qwen4_exp",
+    "hidden": 2560,
+    "layers": 12,
+    "experts": 512,
+    "ctx": 262144,
+    "full_attention_interval": 4,
+    "template_sha": "12827f24b742ea4e",
+    "tokenizer_sha": "87a7830d63fcf43b",
+    "lm_xml_sha": "d1d1005332c96fbc",
+    "lm_bin_bytes": 22141633733,
+    "status": "measurement artifact: depth 12 of 48, the fused-MoE rewrite of the first rung; not the model's answers",
     "mtp_num_hidden_layers": 1,
     "mtp_head_exported": false
   },

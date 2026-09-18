@@ -303,6 +303,7 @@ struct Config {
     // tier_prefix_cache_decision (below) makes the load-time call.
     bool moe_cpu_tier = false;   // --moe-cpu-tier
     int  moe_cpu_tier_threads = 0;  // --moe-cpu-tier-threads; 0 = plugin default
+    bool moe_per_expert_dispatch = false;  // --moe-per-expert-dispatch
 
     bool show_help    = false;
     bool show_version = false;

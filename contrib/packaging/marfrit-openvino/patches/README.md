@@ -805,6 +805,40 @@ OFF) is **not met** — the host dispatch for non-resident experts serialises
 through ~128 experts per layer and dominates prefill time. The campaign
 remains open.
 
+### 0042-moe-hybrid-prefill-gather-filled-count.patch
+
+The fix for patch 0037's page fault on the Arc Pro B60 (Xe2). Under the
+hybrid prefill split the grouped-GEMM tables hold only the resident
+(token, k) pairs and the rest of `tokens_per_expert_cpu` stays -1, but the
+gather kernel was still launched over `token_num * max_topk` work-groups;
+every work-group past the fill computed `token_index = -1 * HIDDEN_SIZE`
+and added it to the kernel's `uint` offset, which wraps to ~2^32 elements,
+~8 GiB PAST the buffer — the B60's faulted address (0x1f0f5e000, ~8.2 GiB)
+is consistent with that; why the A770 never faulted on the same read is
+NOT explained on the record. The gather
+(and the stages it sizes) now runs over the filled count, the token tables
+are zero-initialised on both prefill paths (the micro-GEMM path carries the
+same over-sized launch, latent for arcint: grouped on), the GPU mask-gen's
+device table is zeroed before the kernel, and a batch with no resident
+expert takes the per-expert path as before 0037, counted as a grouped
+fallback. Known, not fixed: the filled count is also the oneDNN grouped
+primitive cache key, routing-dependent on the hybrid path (rebuilds per
+prompt; bucketing owed).
+
+Bisected on the served binary (2026-09-17): +p13 serves, +p16 faults,
++p16 without 0037 serves, the LRU partition serves, and within 0037 a
+`stream.finish()` after every grouped-path stage showed the first
+synchronisation after the gather already throwing. Campaigns:
+`docs/campaigns/static-partition-prefill.md`,
+`docs/campaigns/sub4bit-vram-kernel.md` (status 2026-09-17).
+
+**MEASURED:** the 35B at `--offload-ratio 99 --moe-cpu-tier` on the B60
+serves Paris, warm repeat identical, decode 23.6 t/s (B60, KV u8, f16 inference, prefill chunk 512, one lane), the
+hybrid path active; no fault. Owed: the unit-ladder cell (tables with sentinel entries,
+filled count against launch size).
+
+Package: `+p18` (built 2026-09-17 20:31–20:43 local on the dev host from tree 83701d6; the packaged plugin's own cell on the B60 — the 35B at ratio 99 with the tier, KV u8, f16 — serves Paris at 23.3 t/s; not installed on any host by the seat that built it).
+
 ## Deliberately NOT applied
 
 These live in the arcint repository's `patches/` as records of measurements.

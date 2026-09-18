@@ -17,7 +17,77 @@ nightly is a different ABI, and since 0.3.0 floors the patch level within
 it (`>= +pN`, `<<` the next nightly) instead of pinning it exactly: an exact
 pin made apt remove arcint when the runtime was upgraded to +p3.
 
-## Unreleased (qfndev)
+## Unreleased
+
+### The serving-shape MoE block fuses (campaign: sub4bit-vram-kernel)
+
+- **Emitter** (`tools/q4e/serving_shape.py`): the MoE block now carries the
+  three anchors the GPU plugin's tiled matcher requires and the fusing
+  35B export has — the two Reshapes around the router-weight Multiply, a
+  one-input Swish (the Python binding's `op.swish` adds a beta input the
+  C++ matcher rejects), and an f16 dequant chain with a trailing Convert
+  so the scale reaches the fused op as a direct Constant. Before this no
+  Flash-Next serving-shape artifact ever compiled to a MoE primitive: the
+  expert layers ran as batched FullyConnected, every expert for every
+  token, at full residency, and the whole offload series was inert.
+- **Measured** (B60, depth-12 artifact, KV u8, f16): 0 → 12
+  `moe_3gemm_fused_compressed`; device residency 17.73 → 3.00 GiB at
+  `--offload-ratio 99 --moe-cpu-tier`; served decode 18.3 → 80.5 t/s at
+  full residency; 26.6 t/s warm at ratio 99 with the tier on the A770.
+  The tier's first forward page-faults on the B60 (a card/driver-side
+  fault, 30-second reproducer with the 35B); it serves on the A770.
+- **Tools**: `tools/moe_tiled_rewrite.py` makes a pre-fix artifact
+  conformant in memory or on disk; `tools/check_tiled_pattern.py` checks
+  argument counts; the boot driver gained `--rewrite-tiled-moe` and
+  `--census` (the runtime graph's primitive types, the loud check for a
+  fusion that silently did not happen); the CPU plugin runs the same
+  tiled pass and serves as a device-free oracle in the suite.
+- **Registry**: `qwen3.8-flash-next-d12r`, the fused-MoE rewrite of the
+  depth-12 rung (a measurement artifact); the 48-layer artifact of the same
+  day (`d48f`) was withdrawn before release — its fill was wrong (below)
+  and `qwen3.8-flash-next-d48g` took its slot.
+- **Runtime dependency: `marfrit-openvino +p18` (patches 0003–0042).**
+  Patch 0042 fixes patch 0037's page fault on the Arc Pro B60: the hybrid
+  prefill's grouped-GEMM gather ran over every token-expert pair while
+  the tables held only the resident pairs, reading through a wrapped
+  offset ~8 GiB past the activation buffer. Bisected on the served binary and measured fixed
+  (the 35B with the CPU tier serves on the B60 at ratio 99, 23.6 t/s decode,
+  KV u8, f16 inference).
+  Patch 0041 measured inert on the fused offload route at compile.
+- **Full depth compiles and serves**: the 48-layer artifact in the fused
+  shape compiles on the 24 GiB card at `--offload-ratio 99 --moe-cpu-tier`
+  with 8.06 GiB device-resident and serves from an NVMe copy; with the
+  corrected fill (`qwen3.8-flash-next-d48g`, below) it answers the Paris
+  line.
+
+
+### The Flash-Next fill, corrected three ways (campaign: serving-shape-logits)
+
+- **Feed** (`tools/q4e/gguf_feed.py`): the GGUF converter's folds are undone
+  at the feed — every plain-RMSNorm gamma is stored as (1 + w) and `ssm_a`
+  as −exp(A_log), and the pin applies both transforms itself. Fed as stored,
+  the first hyper-connection mix was 1.69× too large and the served
+  full-depth logits carried no information about the model (KL 12.4 nats).
+- **Emitter** (`tools/q4e/gdn.py`): the GDN output gate follows the config
+  (`output_gate_type`, sigmoid for this checkpoint as llama.cpp hard-codes
+  it) and the key-head pairing follows `gdn_key_head_map` (tiled: value
+  head h reads key head h % 16, as llama.cpp computes this GGUF; the pin
+  interleaves). Both keys are written into the exported `config.json`.
+- **Instruments**: `tools/ref_forward_real.py` (the pin's modules at the
+  real geometry, fed from the GGUF, tapped per block, with experiment
+  flags for each finding); `boot_serving_shape.py --cut-prune` (a cut keeps
+  only the ports it reaches, so a layer-0 cut binds no 26.8 GiB table).
+- Measured on the dev host against llama.cpp's whole tensors (France ids,
+  layer 0): the three fixes take the layer's output from corr 0.80 to
+  0.9999; the depth-4 re-export agrees at every cut on the card (layer 3
+  corr 0.9987). DESIGN §7.0.2bz.
+- **Registry**: `qwen38-flash-next-d48g-ov` (the full-depth re-export)
+  supersedes d48f. Served on one 24 GB card at `--offload-ratio 99
+  --moe-cpu-tier` it answers the Paris line; its KLD against the model's own
+  llama.cpp capture reads 0.73 nats (from 12.4); the residual is the u4
+  repack of the IQ3_XXS / IQ4_NL experts (0.11–0.13 relative RMS per
+  expert tensor), the `sub4bit-vram-kernel` campaign's premise, not the
+  card, the precision, the KV cache or the route.
 
 ### Fit ledger and pre-warm lever (campaign: static-partition-cold-start)
 
