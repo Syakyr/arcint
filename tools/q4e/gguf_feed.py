@@ -265,6 +265,18 @@ class GgufFeed:
             raise KeyError(f"GGUF tensor {gguf_name!r} not in any shard")
         return _dequant(self._index[gguf_name], rows=rows)
 
+    def raw_rows(self, gguf_name, rows=None):
+        """The tensor's BLOCK BYTES as the shard holds them, u8 with the
+        reader's own leading axes (an expert tensor: [E, out, row_bytes]),
+        the leading axis cut to `rows`. Nothing is dequantised: this is what
+        q4e.native_blocks re-lays per role, so the experts stay the
+        checkpoint's own numbers (DESIGN 7.0.2bz)."""
+        if gguf_name not in self._index:
+            raise KeyError(f"GGUF tensor {gguf_name!r} not in any shard")
+        t = self._index[gguf_name]
+        data = t.data if rows is None else t.data[:rows]
+        return np.ascontiguousarray(data, dtype=np.uint8)
+
     # -- name-mapped ---------------------------------------------------------
     def _split_key(self, pin_key):
         m = re.match(r"layers\.(\d+)\.(.+)$", pin_key)
