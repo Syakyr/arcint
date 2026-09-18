@@ -483,3 +483,25 @@ fusion-impact profile, not a kernel micro-benchmark) applies.
   against the I-quant codebooks, not a plumbing one. The native sub-4-bit
   expert kernel — IQ4_NL's 16-entry table per 32-block, IQ3_XXS's 256-entry
   8-element grid — is what the gate waits on.
+- 2026-09-18 (afternoon) — **the native format, end to end short of the
+  card.** The residual of the corrected depth-48 artifact (0.73 nats) is
+  the u4 repack (`measured-here`, per-tensor relative RMS 0.10–0.13; G16
+  0.077, so finer groups are not the lever). The checkpoint's per-layer
+  formats read off the shards: 43 layers IQ3_XXS/IQ4_NL, layer 2
+  IQ4_XS/Q8_0, four layers IQ3_XXS/Q8_0. `q4e.native_blocks` (four splits,
+  bit-exact vs gguf-py), `serving_shape._native_expert` (standard-op decode
+  in the fused op's group-32 layout, f16 block scale), `NativeExpertFiller`,
+  `--expert-format native`; plugin patch 0043 (three pattern blocks, the
+  native pass to `MOECompressed`, `weight_format` per projection, tier-only
+  execution with three row decoders; +p19). Depth-4 native artifact
+  exported. On the B60: attempt 1 — the pass fires, op translation refuses
+  the f32 scale (fixed: f16); attempt 2 — the card wedges at the process's
+  first job (GuC "not started" cascade, NULL deref in
+  `xe_sched_job_set_error`, DKMS xe-ringorder/7.0.14+p1), before the
+  pass's output ran. Not attributed: the control (stock affine, same
+  harness) is the first leg when a card is back. Host reboot is the
+  operator's call. Next: control cell → native cells (GPU.1 first, it is
+  the smaller card and the A770 is bit-stable across forwards) → cut4n on
+  the d4n artifact vs llama.cpp whole tensors (layer 3 ≥ 0.9999 is the
+  target) → the full-depth native export → the KLD gate through the tier.
+

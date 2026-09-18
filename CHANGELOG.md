@@ -19,6 +19,42 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
 
 ## Unreleased
 
+### The native expert formats (campaign: sub4bit-vram-kernel)
+
+- **The residual, named**: with the fill's three provenance defects fixed
+  the depth-48 artifact answers Paris and sits at 0.73 nats KLD against the
+  model's own llama.cpp logits; the residual is the u4 grouped-affine
+  repack of the checkpoint's IQ3_XXS / IQ4_NL experts (0.10–0.13 relative
+  RMS per tensor, `measured-here`; finer groups do not help: G16 still
+  0.077). The experts are therefore carried in their own formats.
+- **What the checkpoint ships** (read off all 48 layers, not assumed):
+  43 layers IQ3_XXS gate/up over an IQ4_NL down; layer 2 IQ4_XS gate/up
+  over a Q8_0 down; layers 4, 30, 46, 47 IQ3_XXS gate/up over a Q8_0 down.
+- **Tools**: `q4e.native_blocks` re-lays the GGUF's expert blocks per
+  role (IQ4_NL: u4 codes in linear order + per-32 scale; IQ4_XS: the same
+  layout with the 6-bit sub-block scale folded in; IQ3_XXS: grid indices,
+  7-bit sign indices, per-32 scale; Q8_0: i8 codes + scale), bit-exact
+  against gguf-py on the real shards; `serving_shape._native_expert` emits
+  each as Constants in the fused op's rank-4 group-32 layout decoded in
+  standard ops (exact on the CPU plugin; the block scale an f16 Constant,
+  exact for IQ4_NL / Q8_0, one f16 rounding ≤ 2⁻¹¹ for the two others);
+  `export_serving_artifact.py --expert-format native` fills from them
+  (`NativeExpertFiller`); `src/core/gguf_dequant.cpp` decodes IQ4_NL,
+  IQ3_XXS and IQ4_XS rows, pinned to gguf-py on the real shards.
+- **Runtime dependency: `marfrit-openvino +p19` (patches 0003–0043).**
+  Patch 0043 lowers the native chains straight to `MOECompressed` with a
+  `weight_format` per projection and executes every routed expert on the
+  CPU tier through three row decoders; the fused kernels are never
+  launched under a native format (the OpenCL decode is the next patch).
+  On the card: the pass fires (the compile reached the op translation);
+  the cell that runs its output is owed — the B60 wedged at its first job
+  on the second attempt (a kernel oops in the xe scheduler's timeout path)
+  before any of the patch's device code ran; the stock-affine control cell
+  through the same harness is the first leg after the host is back.
+- **Depth-4 native artifact** exported (`qwen38-flash-next-d4n`, 9.5 GiB;
+  not registered — a measurement artifact for the cut ladder against
+  llama.cpp's whole tensors).
+
 ### The serving-shape MoE block fuses (campaign: sub4bit-vram-kernel)
 
 - **Emitter** (`tools/q4e/serving_shape.py`): the MoE block now carries the

@@ -839,6 +839,46 @@ filled count against launch size).
 
 Package: `+p18` (built 2026-09-17 20:31–20:43 local on the dev host from tree 83701d6; the packaged plugin's own cell on the B60 — the 35B at ratio 99 with the tier, KV u8, f16 — serves Paris at 23.3 t/s; not installed on any host by the seat that built it).
 
+### 0043-native-expert-formats-through-the-tier.patch
+
+The checkpoint's own expert blocks computed as they are, instead of the u4
+grouped-affine repack that costs 0.10–0.13 relative RMS per expert tensor
+and 0.73 nats at depth 48 against the model's own llama.cpp logits
+(DESIGN §7.0.2bz; `docs/design-routing-aware-expert-execution.md`
+§2.3a–d). The serving-shape emitter carries each expert weight in the
+fused op's rank-4 group-32 layout — IQ4_NL / IQ4_XS as u4 codes plus an
+f16 per-32 scale (a 16-entry table decode), IQ3_XXS as u8 grid indices
+plus u8 sign indices in the zero-point slot plus the f16 scale, Q8_0 as i8
+codes plus the f16 scale — and decodes them in standard ops. This patch:
+(1) three pattern blocks (`pattern_blocks/native_expert_block.*`) and a
+pass `ConvertTiledMoeBlockNativeToMoeCompressed` beside the stock tiled
+matcher, lowering the three chains straight to `MOECompressed` with a
+`weight_format` per projection in the config (visited, so it serialises;
+the shape checks relax at the weight's last dimension and the zero-point's
+under a native format); (2) the tier executes every routed expert under a
+native format (`_native_tier_only`: the batched-GEMV path forced, every
+expert a sentinel, the fused kernels never launched) with three row
+decoders in `moe_cpu_expert.cpp` (the tables verbatim from llama.cpp's
+ggml-common.h, pinned in arcint's `src/core/gguf_dequant.cpp` against
+gguf-py on the real shards); (3) the new source is listed in the
+transformations library's `sources.cmake` (no glob there — a source not
+listed is silently not built). The OpenCL decode in the fused and
+per-expert kernels is the next patch.
+
+**MEASURED (partial):** on the Arc Pro B60 the compile of a native block
+reached the plugin's op translation with a `MOECompressed` of the native
+inputs (the pass fires), which refused an f32 scale Constant wrapped by
+`ConvertPrecision` — hence the f16 scale. The second attempt wedged the
+card at its first job (kernel-owned queue "not started", GuC reset
+cascade, NULL dereference in `xe_sched_job_set_error` — the DKMS
+`xe-ringorder/7.0.14+p1` on kernel 7.0.14-12-pve) before the pass's
+output could run; whether the native path is the trigger is NOT
+established — the stock-affine control cell through the same harness
+(`tests/python/test_native_lowering_gpu.py`, the `affine` parameter) is
+the first leg after the host comes back. Owed with this patch: that cell
+on a card, the served depth-4 and depth-48 native artifacts through the
+tier, the KLD gate's native reading.
+
 ## Deliberately NOT applied
 
 These live in the arcint repository's `patches/` as records of measurements.
