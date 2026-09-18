@@ -265,6 +265,12 @@ def main(argv=None):
                          "<out>/.arena.bin; the file is removed after the save "
                          "unless --keep-arena)")
     ap.add_argument("--keep-arena", action="store_true")
+    ap.add_argument("--expert-format", choices=("u4", "native"), default="u4",
+                    help="the expert bodies: 'u4' = the plugin's grouped-affine repack "
+                         "(group 128; 0.10-0.13 relative RMS against the checkpoint), "
+                         "'native' = the checkpoint's own IQ4_NL / IQ3_XXS blocks re-laid "
+                         "per role and decoded in standard ops (exact; served through the "
+                         "plugin's native lowering, patch 0043)")
     ap.add_argument("--skip-hash", action="store_true",
                     help="do not sha256 the written IR files (the manifest "
                          "then says so)")
@@ -295,7 +301,13 @@ def main(argv=None):
     # ---- the shards, the vocab comparison, the template, the boundary ------
     t0 = time.time()
     feed = gf.GgufFeed(args.shards)
-    filler = ef.ExpertFiller(ef.gguf_expert_source(feed), ss.EXPERT_GROUP_SIZE)
+    if args.expert_format == "native":
+        # the checkpoint's own IQ4_NL / IQ3_XXS blocks, re-laid per role and
+        # decoded in ops (DESIGN 7.0.2bz; design-routing-aware-expert-execution
+        # 2.3a-2.3c); the u4 repack costs 0.10-0.13 relative RMS per tensor
+        filler = ef.NativeExpertFiller(feed)
+    else:
+        filler = ef.ExpertFiller(ef.gguf_expert_source(feed), ss.EXPERT_GROUP_SIZE)
     reader0 = feed._readers[0]
     ple_eos = gguf_field(reader0, PLE_EOS_KEY)
     gen_eos = gguf_field(reader0, GENERATION_EOS_KEY)
