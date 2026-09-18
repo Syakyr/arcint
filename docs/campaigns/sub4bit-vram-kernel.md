@@ -461,3 +461,14 @@ fusion-impact profile, not a kernel micro-benchmark) applies.
   IQ3_XXS / IQ4_NL experts — 0.13 / 0.13 / 0.11 relative RMS on blk.0's
   expert tensors — not to the card, the precision, the KV cache or the
   route. The native sub-4-bit expert kernel is what the gate waits on.
+- 2026-09-18, 13:58 — **a finer repack is not the lever** (`measured-here`,
+  CPU, real expert tensors of blk.0 and blk.24): the u4 grouped-affine
+  repack's relative RMS error at groups 16 / 32 / 64 / 128 is 0.077 / 0.099
+  / 0.117 / 0.130 on IQ3_XXS (gate) and 0.069 / 0.085 / 0.095 / 0.106 on
+  IQ4_NL (down). Even 16-element groups leave 7–8% per tensor — a third of
+  the KL at 8× the scale bytes, not the order of magnitude the gate needs.
+  The fused MoE takes any group size mechanically ({experts, ofm,
+  num_groups, group_size}), so this is a numerics limit of the affine grid
+  against the I-quant codebooks, not a plumbing one. The native sub-4-bit
+  expert kernel — IQ4_NL's 16-entry table per 32-block, IQ3_XXS's 256-entry
+  8-element grid — is what the gate waits on.
