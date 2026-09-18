@@ -17,7 +17,7 @@ nightly is a different ABI, and since 0.3.0 floors the patch level within
 it (`>= +pN`, `<<` the next nightly) instead of pinning it exactly: an exact
 pin made apt remove arcint when the runtime was upgraded to +p3.
 
-## Unreleased (qfndev)
+## Unreleased
 
 ### The serving-shape MoE block fuses (campaign: sub4bit-vram-kernel)
 
