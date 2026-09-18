@@ -150,3 +150,9 @@ it is mechanism, not an answer.
   the fused MoE route and the attention layer are all right on the card.
   Full-depth re-export running; the gate (the KLD replay, the Paris line)
   follows on it.
+- 2026-09-18, 03:53 — **the Paris line, served at depth 48** (`measured-here`,
+  B60, the d48g artifact from the NVMe, +p18, ratio 99 + tier, KV u8, f16):
+  ` Paris. Paris is a city in France`, cold and warm byte-identical, a
+  coherent 64-token continuation, the chat form reasoning in the model's
+  own voice. The KLD replay (2 × 2,735 ids of the llama.cpp capture) is
+  running for the gate number.

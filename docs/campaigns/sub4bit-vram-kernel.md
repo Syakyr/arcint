@@ -445,3 +445,12 @@ fusion-impact profile, not a kernel micro-benchmark) applies.
   fused route, the tier on both cards, full depth at 8.06 GiB, the NVMe
   — and its gate now waits on `serving-shape-logits.md`: the emitter or
   the fill loses the model before any expert is computed.
+- 2026-09-18, 03:53 — **the Paris line at depth 48, served** (`measured-here`,
+  Arc Pro B60, the full-depth artifact re-exported through the corrected
+  fill — `serving-shape-logits.md`, DESIGN §7.0.2bz — from the NVMe at
+  `--offload-ratio 99 --moe-cpu-tier`, KV u8, f16, one lane): "The capital
+  of France is" → ` Paris. Paris is a city in France`, cold and warm
+  byte-identical; the chat form reasons in the model's own voice; a 64-token
+  greedy continuation stays coherent. This campaign's route (the fused MoE,
+  the CPU tier, the residency at 8 GiB device) computes the model. The KLD
+  replay against the model's own capture runs next as the gate number.
