@@ -28,8 +28,15 @@ library.
 Sub-4-bit precision (Q3_K 3.44 bpw, IQ3_XXS 3.06, Q2_K 2.63) is one
 lever for more cache headroom — int4→int3 shrinks the expert pool 25 %
 (`docs/design-qwen-flash-next.md` WP6b: ~95 % hit → ~97 % at the same
-resident capacity) — but the kernel works at u4 first and the gate does
-not require sub-4-bit to close.
+resident capacity). The kernel works at u4 first, and the price of that
+is now measured (2026-09-18, status below): the u4 grouped-affine repack
+of the checkpoint's IQ3_XXS / IQ4_NL experts carries 0.10–0.13 relative
+RMS per expert tensor (0.07–0.08 even at 16-element groups) and shows as
+0.73 nats of KL at depth 48 on a served model that is otherwise the
+model's (`serving-shape-logits.md`). The KLD gate therefore does require
+the native format: in-kernel decode of the checkpoint's own blocks
+(IQ4_NL's 16-entry table per 32-block, IQ3_XXS's 256-entry 8-element
+grid), not a re-quantisation of them.
 
 ## Known against hypothesised
 
@@ -62,9 +69,13 @@ A model with ≥ 512 experts serves on one card with routing-aware expert
 execution: only the routed experts computed per token, a GPU LRU cache
 holding the hot set, misses fed from the host pool. Prüfstand 10/10;
 greedy output byte-identical across two cold starts (§3.4); decode t/s
-and hit-rate reported at the reference cell. Sub-4-bit cache headroom
-measured as a separate row (int4 vs int3 at the same resident capacity),
-win or lose — not a pass/fail gate.
+and hit-rate reported at the reference cell; and the KLD against the
+model's own capture within the bar re-derived from this model's own
+reference round-trip — which, measured 2026-09-18, the u4 repack cannot
+reach (0.73 nats): the experts must be computed from the checkpoint's own
+blocks. Sub-4-bit cache headroom is then a measured row (the native
+format's bytes against the u4 repack's at the same resident capacity),
+win or lose.
 
 ## Entry criteria
 
