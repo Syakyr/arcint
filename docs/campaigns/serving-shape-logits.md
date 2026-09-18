@@ -142,3 +142,11 @@ it is mechanism, not an answer.
   depth-4 re-export through all three fixes, its cut ladder against
   llama.cpp's l_last-0..3 (the PLE and the first attention layer included),
   then full depth and the KLD gate.
+- 2026-09-18, 02:07 — **the served-shape graph agrees with llama.cpp at
+  every cut of a depth-4 re-export** (`measured-here`, B60, f16, the paged
+  pass, France ids; whole tensors on both sides): layer0/out corr 0.99924,
+  after the PLE 0.99942, layer1/out 0.99918, layer3/out 0.99873 (through
+  the first full-attention layer). The GDN, the PLE, the hyper-connections,
+  the fused MoE route and the attention layer are all right on the card.
+  Full-depth re-export running; the gate (the KLD replay, the Paris line)
+  follows on it.
