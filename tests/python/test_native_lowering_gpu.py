@@ -46,7 +46,14 @@ class _RandomNativeFiller:
         block, nbytes = nb.BLOCK_BYTES[fmt]
         rows, nblk = e * out, inn // block
         raw = self.rng.integers(0, 256, size=(rows, nblk, nbytes), dtype=np.uint8)
-        d = self.rng.uniform(0.01, 0.2, size=(rows, nblk)).astype(np.float32) / (31.0 if fmt == "IQ4_XS" else 1.0)
+        # the block scale keeps every decoded weight below ~0.3 whatever the
+        # format's code range (IQ4_NL table 127, IQ3_XXS grid 62 x sub-scale
+        # 7.75, IQ4_XS 127 x 32, Q8_0 128): the fused block runs in f16 on the
+        # card, and random 0.2-scale blocks overflowed it (NaN on GPU.1,
+        # 2026-09-18) -- the same magnitude the affine control's 0.001..0.02
+        # scales over 0..15 codes give
+        max_mag = {"IQ4_NL": 127.0, "IQ3_XXS": 62.0 * 7.75, "IQ4_XS": 127.0 * 32.0, "Q8_0": 128.0}[fmt]
+        d = (self.rng.uniform(0.05, 1.0, size=(rows, nblk)).astype(np.float32) * (0.3 / max_mag))
         raw[:, :, 0:2] = d.astype("<f2").view(np.uint8).reshape(rows, nblk, 2)
         return fmt, nb.SPLIT[fmt](raw.reshape(rows, nblk * nbytes))
 
@@ -135,11 +142,13 @@ def test_the_native_block_lowers_to_the_fused_primitive_and_matches_the_cpu_plug
     d = np.abs(got.astype(np.float64) - want.astype(np.float64))
     # per token: the block's output is a top-2 sum of expert rows, so a wrong
     # expert (or a wrong sign table in one) moves elements by the order of
-    # the row's RMS; the f16 hidden/output path moves them by ~1e-3 of it.
-    # The band is 1% of the element plus 0.5% of its row's RMS -- not a
-    # fraction of the tensor's peak applied everywhere (review, 2026-09-18).
+    # the row's RMS. The band is 2% of the element plus 1% of its row's RMS
+    # -- not a fraction of the tensor's peak applied everywhere (review,
+    # 2026-09-18). Calibrated on the stock control (A770, f16 path): its
+    # max diff was 0.6% of the row RMS at 1e-2 + 5e-3, so this band sits at
+    # 2x the measured f16 noise and 1/100 of a wrong expert.
     rms_row = np.sqrt((want.astype(np.float64) ** 2).mean(axis=-1, keepdims=True))
-    band = 1e-2 * np.abs(want) + 5e-3 * rms_row
+    band = 2e-2 * np.abs(want) + 1e-2 * rms_row
     print(f"\n[native-lowering] {_DEV} {gate_up_fmt}/{down_fmt}: moe-typed primitives {moe_typed}; native nodes {native_nodes}; "
           f"max|diff| {d.max():.4e} vs max|want| {np.abs(want).max():.4e}; max diff/band {(d / band).max():.3f}; "
           f"corr {np.corrcoef(got.ravel(), want.ravel())[0, 1]:.6f}")
