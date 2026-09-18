@@ -841,16 +841,24 @@ def _native_expert(arena, e, out, inn, name, fmt, parts):
     decode is expressed in ops the CPU plugin runs exactly (the suite's
     oracle) and the GPU plugin's matcher will lower to native kernels:
 
-      IQ4_NL   codes u4 [E,out,inn] -> Convert(i32) -> Gather(table[16] f32)
-               -> Reshape [E,out,inn/32,32] * scales f32 [E,out,inn/32,1]
-               -> Reshape [E,out,inn]
-      IQ3_XXS  gridix u8 [E,out,inn/4] -> Convert(i32) -> Gather(grid[256,4])
-               -> Reshape [E,out,inn]  (the magnitudes)
-               signix u8 [E,out,inn/8] -> Convert(i32) -> Gather(ksigns[128])
+      IQ4_NL   codes u4 [E,out,inn/32,32] -> Convert(i32) -> Gather(table[16] f32)
+               * scales f32 [E,out,inn/32,1] -> Reshape [E,out,inn]
+      IQ3_XXS  gridix u8 [E,out,inn/32,8] -> Convert(i32) -> Gather(grid[256,4])
+               -> Reshape [E,out,inn/32,32]  (the magnitudes)
+               signix u8 [E,out,inn/32,4] -> Convert(i32) -> Gather(ksigns[128])
                -> Unsqueeze -> BitwiseAnd(masks[8]) -> Greater(0)
-               -> Select(-1, +1) -> Reshape [E,out,inn]  (the signs)
-               magnitudes * signs -> Reshape [E,out,inn/32,32] * scales
-               f32 [E,out,inn/32,1] -> Reshape [E,out,inn]
+               -> Select(-1, +1) -> Reshape [E,out,inn/32,32]  (the signs)
+               magnitudes * signs * scales f32 [E,out,inn/32,1] -> Reshape [E,out,inn]
+
+    THE CONSTANTS' SHAPES ARE THE FUSED OP'S OWN (design note 2.3c): the
+    plugin's MOECompressed takes every expert weight as rank-4 [E, out,
+    groups, group_size] with a scale [E, out, groups, 1] and an optional
+    zero-point [E, out, groups, 1]. Both formats fit at group 32 -- IQ4_NL
+    as u4 codes plus a table and no zero-point; IQ3_XXS as 8 grid indices
+    per 32 values in the weight slot, 4 sign indices per 32 values in the
+    zero-point slot, and the per-32 scale -- so the plugin patch lowers
+    these Constants as they are, and the offload path copies one expert's
+    bytes exactly as it does for the u4 route.
 
     The arithmetic is f32 (exact against numpy's decode); the fusing u4 chain
     is f16 with a trailing Convert because its matcher demands direct f16
@@ -866,42 +874,42 @@ def _native_expert(arena, e, out, inn, name, fmt, parts):
     from q4e import native_blocks as nb
     from q4e.expert_fill import pack_u4
     rows = e * out
+    groups = inn // 32
+    g4 = op.constant(np.array([e, out, groups, 32], np.int64))
     if fmt == "IQ4_NL":
         codes, scales = parts
-        assert codes.shape == (rows, inn) and scales.shape == (rows, inn // 32), (codes.shape, scales.shape)
-        w = arena.constant([e, out, inn], Type.u4, fill=pack_u4(codes), name=name + "/codes_u4")
+        assert codes.shape == (rows, inn) and scales.shape == (rows, groups), (codes.shape, scales.shape)
+        w = arena.constant([e, out, groups, 32], Type.u4, fill=pack_u4(codes), name=name + "/codes_u4")
         w.set_friendly_name(name + "/codes_u4")
         table = op.constant(nb.KVALUES_IQ4NL.astype(np.float32))
-        vals = op.gather(table, op.convert(w, Type.i32), op.constant(np.int64(0)))
-        vals.set_friendly_name(name + "/iq4nl_table")
-        x = op.reshape(vals, op.constant(np.array([e, out, inn // 32, 32], np.int64)), special_zero=False)
+        x = op.gather(table, op.convert(w, Type.i32), op.constant(np.int64(0)))     # [E,out,groups,32]
+        x.set_friendly_name(name + "/iq4nl_table")
     elif fmt == "IQ3_XXS":
         gridix, signix, scales = parts
         assert gridix.shape == (rows, inn // 4) and signix.shape == (rows, inn // 8), (gridix.shape, signix.shape)
-        assert scales.shape == (rows, inn // 32), scales.shape
-        gi = arena.constant([e, out, inn // 4], Type.u8, fill=np.ascontiguousarray(gridix, np.uint8),
+        assert scales.shape == (rows, groups), scales.shape
+        gi = arena.constant([e, out, groups, 8], Type.u8, fill=np.ascontiguousarray(gridix, np.uint8),
                             name=name + "/gridix_u8")
         gi.set_friendly_name(name + "/gridix_u8")
         grid = op.constant(nb.IQ3XXS_GRID.astype(np.float32))                      # [256, 4]
-        mag = op.gather(grid, op.convert(gi, Type.i32), op.constant(np.int64(0)))    # [E,out,inn/4,4]
-        mag = op.reshape(mag, op.constant(np.array([e, out, inn], np.int64)), special_zero=False)
+        mag = op.gather(grid, op.convert(gi, Type.i32), op.constant(np.int64(0)))    # [E,out,groups,8,4]
+        mag = op.reshape(mag, g4, special_zero=False)
         mag.set_friendly_name(name + "/iq3xxs_grid")
-        si = arena.constant([e, out, inn // 8], Type.u8, fill=np.ascontiguousarray(signix, np.uint8),
+        si = arena.constant([e, out, groups, 4], Type.u8, fill=np.ascontiguousarray(signix, np.uint8),
                             name=name + "/signix_u8")
         si.set_friendly_name(name + "/signix_u8")
         ks = op.constant(nb.KSIGNS_IQ2XS.astype(np.int32))                          # [128]
-        masks = op.gather(ks, op.convert(si, Type.i32), op.constant(np.int64(0)))    # [E,out,inn/8]
+        masks = op.gather(ks, op.convert(si, Type.i32), op.constant(np.int64(0)))    # [E,out,groups,4]
         bits = op.bitwise_and(op.unsqueeze(masks, op.constant(np.int64(-1))),
-                              op.constant(nb.KMASK_IQ2XS.astype(np.int32)))         # [E,out,inn/8,8]
+                              op.constant(nb.KMASK_IQ2XS.astype(np.int32)))         # [E,out,groups,4,8]
         neg = op.greater(bits, op.constant(np.int32(0)))
         sign = op.select(neg, op.constant(np.float32(-1.0)), op.constant(np.float32(1.0)))
-        sign = op.reshape(sign, op.constant(np.array([e, out, inn], np.int64)), special_zero=False)
+        sign = op.reshape(sign, g4, special_zero=False)
         sign.set_friendly_name(name + "/iq3xxs_sign")
-        x = op.reshape(op.multiply(mag, sign),
-                       op.constant(np.array([e, out, inn // 32, 32], np.int64)), special_zero=False)
+        x = op.multiply(mag, sign)
     else:
         raise ValueError(f"{name}: unsupported native expert format {fmt!r} (IQ4_NL or IQ3_XXS)")
-    sc = arena.f32_filled(np.ascontiguousarray(scales, np.float32).reshape(e, out, inn // 32, 1))
+    sc = arena.f32_filled(np.ascontiguousarray(scales, np.float32).reshape(e, out, groups, 1))
     sc.set_friendly_name(name + "/block_scale")
     arena.scales[name + "/block_scale"] = np.ascontiguousarray(scales, np.float32)
     x = op.multiply(x, sc)
