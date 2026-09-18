@@ -113,14 +113,28 @@ def test_the_native_block_lowers_to_the_fused_primitive_and_matches_the_cpu_plug
         gpu = core.compile_model(core.read_model(xml), _DEV, props)
         got = gpu({"x": x})[gpu.output(0)]
         types = {}
+        native_nodes = []
         for n in gpu.get_runtime_model().get_ordered_ops():
             t = n.get_rt_info()["layerType"].astype(str) if "layerType" in n.get_rt_info() else n.get_type_name()
             types[t] = types.get(t, 0) + 1
+            if "MOECompressedNative" in n.get_friendly_name():
+                native_nodes.append(n.get_friendly_name())
     finally:
         arena.close()
     moe_typed = {k: v for k, v in types.items() if "moe" in k.lower()}
     d = np.abs(got.astype(np.float64) - want.astype(np.float64))
-    print(f"\n[native-lowering] {_DEV} {gate_up_fmt}/{down_fmt}: moe-typed primitives {moe_typed}; max|diff| {d.max():.4e} "
-          f"vs max|want| {np.abs(want).max():.4e}; corr {np.corrcoef(got.ravel(), want.ravel())[0, 1]:.6f}")
-    assert moe_typed, f"no MoE-typed primitive in the runtime graph: the native lowering did not fire ({sorted(types)[:12]})"
-    assert np.allclose(got, want, rtol=2e-2, atol=2e-2 * float(np.abs(want).max())), f"max|diff| {d.max():.4e}"
+    # per token: the block's output is a top-2 sum of expert rows, so a wrong
+    # expert (or a wrong sign table in one) moves elements by the order of
+    # the row's RMS; the f16 hidden/output path moves them by ~1e-3 of it.
+    # The band is 1% of the element plus 0.5% of its row's RMS -- not a
+    # fraction of the tensor's peak applied everywhere (review, 2026-09-18).
+    rms_row = np.sqrt((want.astype(np.float64) ** 2).mean(axis=-1, keepdims=True))
+    band = 1e-2 * np.abs(want) + 5e-3 * rms_row
+    print(f"\n[native-lowering] {_DEV} {gate_up_fmt}/{down_fmt}: moe-typed primitives {moe_typed}; native nodes {native_nodes}; "
+          f"max|diff| {d.max():.4e} vs max|want| {np.abs(want).max():.4e}; max diff/band {(d / band).max():.3f}; "
+          f"corr {np.corrcoef(got.ravel(), want.ravel())[0, 1]:.6f}")
+    assert moe_typed, f"no MoE-typed primitive in the runtime graph: the lowering did not fire ({sorted(types)[:12]})"
+    if gate_up_fmt != "affine":
+        # the native pass names its op; the stock fusion never produces this name
+        assert native_nodes, "a MoE primitive exists but none carries the native pass's name: the stock fusion took it"
+    assert (d <= band).all(), f"max diff/band {(d / band).max():.3f}, max|diff| {d.max():.4e}"

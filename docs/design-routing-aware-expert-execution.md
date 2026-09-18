@@ -226,9 +226,12 @@ shapes exactly, so the plugin patch's matcher lowers them as they are, the
 offload path copies one expert's bytes as it does today (tensor bytes ÷
 experts, nine slots), and a `weight_format` per projection in
 `MOECompressed::Config` (visited as an attribute, so it serialises) tells
-the kernels how to read the three slots. The validation relaxes at two
-places under a native format: the weight's last dimension (8 for IQ3_XXS,
-not the group size) and the zero-point's (4, not 1). Per expert-layer the
+the kernels how to read the three slots. The validation relaxes at one
+place under a native format: the weight's last dimension (8 for IQ3_XXS,
+not the group size); the zero-point check (`check_zp`) only pins the
+element type against `has_zp` and never looked at the shape, so the
+`[E, out, K/32, 4]` sign indices pass it as it is (`code`, corrected after
+review 2026-09-18: the first draft of this note promised two). Per expert-layer the
 bytes are 2 × (640 × 80 × 8 + 640 × 80 × 4 + 640 × 80 × 4) + 2560 × 20 ×
 16 + 2560 × 20 × 4 = 1,638,400 + 1,024,000 = 2,662,400 B — 8% more than
 the u4 repack's 2,457,600 B (the f32 per-32 scales; f16 scales would put
