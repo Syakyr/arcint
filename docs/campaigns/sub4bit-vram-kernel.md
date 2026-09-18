@@ -517,4 +517,29 @@ fusion-impact profile, not a kernel micro-benchmark) applies.
   on-card — the control cell, the native cells, the depth-4 cut ladder,
   the served native reading and the KLD gate — waits for the dev host's
   reboot (the operator's call).
+- 2026-09-18 (evening, after the host reboot) — **the native path on the
+  cards, measured.** The lowering cell passes on both cards (A770 and
+  B60): the stock-affine control fuses at corr 0.999999 against the CPU
+  plugin, both native pairs lower to `MOECompressedNative` and match at
+  corr 1.000000 (`measured-here`, tree dffd272, plugin 5a6968ec). The
+  depth-4 native cut ladder against llama.cpp's whole tensors: layer 0/1
+  out corr **0.99991 / 0.99989** — where the exact f32 reference itself
+  sits against llama.cpp (0.99991 at layer 0), so the u4 repack's error is
+  gone from the routed experts; layer 2/3 at 0.99970 / 0.99953 (the u4
+  artifact: 0.99924 / 0.99918 / – / 0.99873), a steady per-layer growth
+  that a KV-f16 control did not move (bit-identical), consistent with f16
+  accumulation plus llama.cpp's own Q8 activation noise; the exact
+  reference at depth 3 (the three-way at layer 2) still owed (its first
+  run OOM'd at a 36 GiB fence). The full-depth native artifact
+  (`qwen3.8-flash-next-d48n`, registered) compiles on the B60 through the
+  boot driver (48 fused native ops, 21.7 s, 6.86 GiB device) and through
+  the served binary (26.7 s, 8.06 GiB) — and the tier then CRAWLS: every
+  (token, expert) pair decodes its rows on the scalar reference path,
+  ~2 min per 512-token chunk, so the served KLD gate needs an hour-scale
+  window (running) and the designed step 3, the OpenCL decode of the
+  native formats in the fused kernels, is now the rate lever, not a
+  quality one. Three served attempts before that were my harness's
+  fault (the offload flags live in an `EXTRA` variable the driver did not
+  set — full residency, 60 GB of USM host, the watchdog), recorded as
+  such.
 
