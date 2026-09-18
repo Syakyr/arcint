@@ -842,17 +842,17 @@ def _native_expert(arena, e, out, inn, name, fmt, parts):
     oracle) and the GPU plugin's matcher will lower to native kernels:
 
       IQ4_NL   codes u4 [E,out,inn/32,32] -> Convert(i32) -> Gather(table[16] f32)
-               * scales f32 [E,out,inn/32,1] -> Reshape [E,out,inn]
+               * Convert(f32)(scales f16 [E,out,inn/32,1]) -> Reshape [E,out,inn]
       IQ4_XS   the IQ4_NL chain over the IQ4_NL layout (sub-block scales folded
                into the f32 scale by the split)
       Q8_0     codes i8 [E,out,inn/32,32] -> Convert(f32)
-               * scales f32 [E,out,inn/32,1] -> Reshape [E,out,inn]
+               * Convert(f32)(scales f16) -> Reshape [E,out,inn]
       IQ3_XXS  gridix u8 [E,out,inn/32,8] -> Convert(i32) -> Gather(grid[256,4])
                -> Reshape [E,out,inn/32,32]  (the magnitudes)
                signix u8 [E,out,inn/32,4] -> Convert(i32) -> Gather(ksigns[128])
                -> Unsqueeze -> BitwiseAnd(masks[8]) -> Greater(0)
                -> Select(-1, +1) -> Reshape [E,out,inn/32,32]  (the signs)
-               magnitudes * signs * scales f32 [E,out,inn/32,1] -> Reshape [E,out,inn]
+               magnitudes * signs * Convert(f32)(scales f16) -> Reshape [E,out,inn]
 
     THE CONSTANTS' SHAPES ARE THE FUSED OP'S OWN (design note 2.3c): the
     plugin's MOECompressed takes every expert weight as rank-4 [E, out,
@@ -925,10 +925,20 @@ def _native_expert(arena, e, out, inn, name, fmt, parts):
     else:
         raise ValueError(f"{name}: unsupported native expert format {fmt!r} "
                          f"({sorted(nb.SPLIT)})")
-    sc = arena.f32_filled(np.ascontiguousarray(scales, np.float32).reshape(e, out, groups, 1))
+    # the block scale is an f16 Constant like every stock scale: an f32 scale
+    # Constant is wrapped in a Convert(f16) by the plugin's precision pass,
+    # which the offload series cannot fold (file-backed Constants), and the
+    # op translation then refuses the non-Constant input (measured on GPU.0,
+    # 2026-09-18). IQ4_NL's and Q8_0's d IS an f16, so those stay exact;
+    # IQ3_XXS's d*(0.5+s)*0.5 and IQ4_XS's d*(ls-32) round once to f16
+    # (<= 2^-11 relative, test_native_expert_chain). The exact f32 stays in
+    # arena.scales; the chain's arithmetic stays f32 (Convert after the
+    # Constant), which the plugin's pattern accepts as an optional Convert.
+    sc16 = np.ascontiguousarray(scales, np.float16).reshape(e, out, groups, 1)
+    sc = arena.constant([e, out, groups, 1], Type.f16, fill=sc16, name=name + "/block_scale")
     sc.set_friendly_name(name + "/block_scale")
     arena.scales[name + "/block_scale"] = np.ascontiguousarray(scales, np.float32)
-    x = op.multiply(x, sc)
+    x = op.multiply(x, op.convert(sc, Type.f32))
     x = op.reshape(x, op.constant(np.array([e, out, inn], np.int64)), special_zero=False)
     x.set_friendly_name(name + "/native_f32")
     return x

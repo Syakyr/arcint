@@ -51,7 +51,18 @@ def test_the_chain_decodes_random_blocks_exactly(fmt, inn):
     e, out, T = 3, 5, 7
     raw = _random_raw(rng, e * out, inn, fmt)
     parts = nb.SPLIT[fmt](raw)
-    w_ref = nb.DECODE[fmt](*parts).reshape(e, out, inn)
+    # the chain carries the block scale as f16 (serving_shape._native_expert):
+    # the reference decodes with the same rounding, and the rounding itself
+    # is bounded below
+    *codes, scales = parts
+    scales16 = scales.astype(np.float16).astype(np.float32)
+    w_ref = nb.DECODE[fmt](*codes, scales16).reshape(e, out, inn)
+    w_exact = nb.DECODE[fmt](*codes, scales).reshape(e, out, inn)
+    rel = np.abs(w_ref - w_exact) / np.maximum(np.abs(w_exact), 1e-30)
+    if fmt in ("IQ4_NL", "Q8_0"):
+        assert np.array_equal(w_ref, w_exact), f"{fmt}: d is an f16, the f16 scale must be exact"
+    else:
+        assert rel.max() <= 2.0 ** -11, f"{fmt}: f16 scale rounding {rel.max():.3e} above 2^-11"
     # not alike: every row differs from every other, and no row is constant
     assert len({r.tobytes() for r in w_ref.reshape(e * out, inn)}) == e * out
     assert (w_ref.reshape(e * out, inn).std(axis=1) > 0).all()
@@ -113,8 +124,10 @@ def test_two_real_experts_through_the_native_filler_match_gguf_py(layer, kind, f
     finally:
         arena.close()
     want = np.einsum("tk,eok->eto", x[0], ref)
+    bound = np.einsum("tk,eok->eto", np.abs(x[0]), np.abs(ref))
     d = np.abs(y - want)
-    print(f"\n[native-chain real] {kind} {fmt}: max|diff| {d.max():.3e} vs max|want| {np.abs(want).max():.3e}; "
-          f"census {filler.census()}")
-    assert np.allclose(y, want, rtol=1e-4, atol=1e-4), f"{kind}: max|diff| {d.max():.3e}"
+    print(f"\n[native-chain real] blk.{layer} {kind} {fmt}: max|diff| {d.max():.3e} vs max|want| {np.abs(want).max():.3e}; "
+          f"max diff/bound {(d / bound).max():.2e}; census {filler.census()}")
+    # the f16 block scale (exact for IQ4_NL / Q8_0) plus f32 summation order
+    assert (d <= (2.0 ** -11 + 1e-5) * bound + 1e-6).all(), f"{kind}: max diff/bound {(d / bound).max():.2e}"
     assert filler.census()["bodies"] == 1 and filler.census()["format"] == "native"
