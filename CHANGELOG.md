@@ -63,6 +63,24 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
   on native bytes; fixed, with three host-only decoder cells in the
   plugin's tier tests.
 
+- **The first native serve, and the gate's reading** (B60, ratio 99 +
+  tier, KV u8, f16): the full-depth native artifact answers Paris and
+  continues coherently, at 0.5–0.8 t/s on the scalar tier (every routed
+  expert decoded per token pair on the CPU; the OpenCL decode is the next
+  patch). KLD against the model's own llama.cpp capture, window 0: mean
+  0.42 / median 0.20 nats, argmax 0.79 — the u4 artifact on the same
+  window 0.54 / 0.24 / 0.73; an f16 KV cache changes nothing (0.40 /
+  0.21). The remainder is measured to its mechanism, not a defect: this
+  model's router is nearly flat (the top-10 hold 6–27% of the mass at
+  margins of 1e-4…1e-6), and the ~1% activation difference any forward
+  has against llama.cpp's Q8-activation arithmetic re-routes specific
+  tokens to a different expert — exact experts with llama's own input
+  match llama's routed sums at 1%, a 2% input perturbation moves them
+  15–29% on exactly the tokens the artifact gets wrong. The block-level
+  arithmetic (GDN, hyper-connections, the native experts) sits at that
+  1% floor everywhere; the gate's 0.06-nat bar needs a reference that
+  shares this model's routing noise.
+
 ### The serving-shape MoE block fuses (campaign: sub4bit-vram-kernel)
 
 - **Emitter** (`tools/q4e/serving_shape.py`): the MoE block now carries the

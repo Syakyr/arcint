@@ -9292,6 +9292,67 @@ is what the KLD gate waits on. The retracted reading in
 §7.0.2by's campaign ("44 layers missing") stands retracted: the depth rungs
 could never have shown this.
 
+#### 7.0.2ca The native expert formats served, and the KLD residual measured to its mechanism: a flat router under the ~1% activation floor (2026-09-18)
+
+Campaign: `docs/campaigns/sub4bit-vram-kernel.md`; design note
+`docs/design-routing-aware-expert-execution.md` §2.3a–d; plugin patch
+0043 (`marfrit-openvino +p19`). Tools: `tools/q4e/native_blocks.py`,
+`serving_shape._native_expert`, `tools/kld_position.py`,
+`tools/boot_serving_shape.py --cut` at block-level node names,
+llama.cpp's `llama-eval-dump` of the same GGUF.
+
+**What was built.** The checkpoint's expert blocks — IQ3_XXS / IQ4_XS
+gate-up and IQ4_NL / Q8_0 down, per layer as the GGUF ships them (43
+layers IQ3_XXS/IQ4_NL, layer 2 IQ4_XS/Q8_0, four layers IQ3_XXS/Q8_0;
+read, not assumed) — are carried in the fused op's rank-4 group-32 layout
+with an f16 per-32 scale, decoded in standard ops for the CPU plugin and
+lowered by the GPU plugin straight to `MOECompressed` with a
+`weight_format` per projection; every routed expert runs on the CPU tier
+through three row decoders. Measured on both cards: the stock control fuses
+at corr 0.999999, both native pairs match the CPU plugin at 1.000000.
+
+**What it removed.** The u4 grouped-affine repack of the experts, 7.0.2bz's
+named residual: the depth-4 cut ladder against llama.cpp's own tensors now
+reads layer 0/1 out at corr 0.99991 / 0.99989 — where the exact f32
+reference itself sits — against the u4 artifact's 0.99924 / 0.99918. The
+first native serve at depth 48 (B60, ratio 99 + tier, KV u8, f16) answers
+Paris and continues coherently; the KLD against the model's own capture on
+window 0 moves from 0.54 / 0.24 (mean / median, u4) to 0.42 / 0.20 nats,
+argmax 0.73 → 0.79; an f16 KV cache does not move it (0.40 / 0.21). The
+rate is 0.5–0.8 t/s: the tier decodes an expert's rows for every (token,
+expert) pair on the scalar path — the OpenCL decode of the native formats
+in the fused kernels is the rate lever and the next patch.
+
+**What remains, and why it is not a defect.** The remaining 0.2 nats per
+token is flat in position past ~1,300 tokens and history-dependent within
+a prompt (token 0 stays at the floor at every depth, token 4 grows). Block
+cuts inside layers 1–3 put the GDN and hyper-connection paths at the ~1%
+floor at every token and the routed-expert sums 15–28% off on specific
+tokens with exact weights. The router reproduces llama's probabilities to
+1e-8 on llama's own input; its top-10 holds 6–27% of the mass at margins
+of 1e-4…1e-6. An exact numpy recompute of a routed sum from the GGUF with
+llama's input and weights matches llama at 0.8–1.1% (llama's Q8-activation
+floor); a 2% input perturbation moves it 1–2% on four tokens and 15% mean
+/ 29% max on the token the artifact gets 18.5% wrong. So any forward that
+differs from llama.cpp's Q8-activation arithmetic by ~1% re-routes specific
+tokens to a different expert, and that whole-expert-sized change compounds
+token-wise through the GDN state and the attention. The gate's 0.06-nat
+bar, carried over from a model with a less flat router, cannot be met
+against this capture by an implementation that does not replicate llama's
+activation quantisation; the reference for this model has to share its
+routing noise. Evidence class throughout: `measured-here`.
+
+**Recorded beside it.** Three served attempts were killed by the host
+watchdog before the reading: the served-leg driver had not forwarded the
+offload flags (full residency, 60 GB of USM host) — my harness, attributed
+as such. The B60 wedge of the afternoon (a kernel oops in the xe
+scheduler's timeout path) happened with the patch's first form, whose
+executing impl ran the fused GEMV over native-layout bytes (the clone
+field list lacked the format members — patch 0038's defect one patch
+earlier, found in review); it has not recurred since the fix on either
+card. The plugin's tier cells run standalone in seconds without an
+`ENABLE_TESTS` build.
+
 #### 7.0.3 KV precision on the paged path — u8 is the lever, u4 is a tax
 
 The plugin accepts f16/u8/i8/u4/i4 for `KV_CACHE_PRECISION` on the paged path,
