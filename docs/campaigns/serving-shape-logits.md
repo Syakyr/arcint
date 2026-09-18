@@ -156,3 +156,18 @@ it is mechanism, not an answer.
   coherent 64-token continuation, the chat form reasoning in the model's
   own voice. The KLD replay (2 × 2,735 ids of the llama.cpp capture) is
   running for the gate number.
+- 2026-09-18, 04:27 — **the KLD gate on the corrected full-depth artifact**
+  (`measured-here`, B60, d48g from the NVMe, +p18, ratio 99 + tier, KV u8,
+  f16, one lane, chunk 512; the llama.cpp capture's 2 × 2,735 ids replayed):
+  mean KL(reference‖served) 0.635 / 0.437 (window 0, below / above the 2051
+  boundary), 0.829 / 0.922 (window 1); ALL 0.732 / 0.680; argmax agreement
+  0.73 / 0.71; prefill 846 s and 1,066 s. Against last night's 12.4 nats and
+  0.000: the model. Against the bar (0.0599, another model's number) and
+  against what a faithful f16 serve of the same GGUF should read: an order
+  of magnitude of residual. Position-resolved: median ≈ 0.2 per row in every
+  128-token bucket, no rise with position, no chunk-boundary staircase,
+  below ≈ above the QSA boundary, no turn-boundary token in either window —
+  a uniform per-token discrepancy. Suspect: the f16 inference precision
+  compounding over 48 layers (the card's layer-3 cut sits at corr 0.9987 ≈
+  5% RMS against llama.cpp where the CPU f32 reference reads 0.9999 ≈ 1.3%).
+  The precision leg (f32 / KV f16 cuts at depth 4) measures it next.

@@ -78,7 +78,13 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
   only the ports it reaches, so a layer-0 cut binds no 26.8 GiB table).
 - Measured on the dev host against llama.cpp's whole tensors (France ids,
   layer 0): the three fixes take the layer's output from corr 0.80 to
-  0.9999. DESIGN §7.0.2bz.
+  0.9999; the depth-4 re-export agrees at every cut on the card (layer 3
+  corr 0.9987). DESIGN §7.0.2bz.
+- **Registry**: `qwen38-flash-next-d48g-ov` (the full-depth re-export)
+  supersedes d48f. Served on one 24 GB card at `--offload-ratio 99
+  --moe-cpu-tier` it answers the Paris line; its KLD against the model's own
+  llama.cpp capture reads 0.73 nats (from 12.4), with a uniform per-token
+  residual still under measurement.
 
 ### Fit ledger and pre-warm lever (campaign: static-partition-cold-start)
 

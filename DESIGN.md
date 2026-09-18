@@ -9271,11 +9271,21 @@ options to the transcription's
 (`test_the_emitter_follows_the_configured_output_gate`,
 `test_the_emitter_follows_the_configured_key_head_pairing`).
 
-**Standing.** Three defects localised and fixed at layer 0; the layers
-after it (the PLE, the attention layer, the MoE at depth) are measured next
-on a re-exported artifact against the same tap, then the full depth and the
-KLD gate. The retracted reading in §7.0.2by's campaign ("44 layers
-missing") stands retracted: the depth rungs could never have shown this.
+**Standing (updated the same night).** A depth-4 re-export through the three
+fixes agrees with llama.cpp at every cut on the card (layer 0 corr 0.9992,
+after the PLE 0.9994, layer 1 0.9992, layer 3 — through the first attention
+layer — 0.9987). The full-depth re-export (`qwen38-flash-next-d48g-ov`,
+which supersedes d48f in the registry) SERVES THE PARIS LINE: "The capital
+of France is" → " Paris. Paris is a city in France", cold and warm
+byte-identical, a coherent 64-token continuation (B60, ratio 99 + tier, KV
+u8, f16). The KLD gate on it: mean KL 0.73 nats below / 0.68 above the 2051
+boundary, argmax agreement 0.73 / 0.71 — the model, with a uniform
+per-token residual an order of magnitude above the (provisional, borrowed)
+0.0599 bar; the residual does not grow with position, does not step at the
+chunk boundaries or the QSA boundary, and is under measurement as the f16
+inference precision compounding over 48 layers. The retracted reading in
+§7.0.2by's campaign ("44 layers missing") stands retracted: the depth rungs
+could never have shown this.
 
 #### 7.0.3 KV precision on the paged path — u8 is the lever, u4 is a tax
 
