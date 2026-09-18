@@ -431,22 +431,21 @@ std::vector<ModelEntry> build_registry() {
     }
 
     {
-        // FULL DEPTH IN THE FUSED SHAPE (2026-09-17): the 48-layer
-        // serving-shape IR exported with the emitter that carries the GPU
-        // plugin's tiled-MoE anchors (two Reshapes, a one-input Swish, an
-        // f16 dequant chain with a trailing Convert; tree da52858, real
-        // weights from the UD-Q3_K_XL shards). The first full-depth artifact
-        // that compiles to moe_3gemm_fused_compressed (x48): on the 24 GiB
-        // card at --offload-ratio 99 with the CPU tier, 8.06 GiB
-        // device-resident, 119 s, host 2.5 GiB (campaign sub4bit-vram-kernel,
-        // status 2026-09-17). Hashes read off the export log and
-        // --inspect-artifact. No forward at full depth on the record: the
-        // tier faults on that card, and its host pool exceeds RAM at 48
-        // layers until the residency stream exists.
-        ModelEntry e;
-        e.id                      = "qwen3.8-flash-next-d48f";
+        // FULL DEPTH IN THE FUSED SHAPE, THROUGH THE CORRECTED FILL
+        // (2026-09-18): the 48-layer serving-shape IR re-exported from tree
+        // f91ea73 after the fill's three provenance defects were found and
+        // fixed against llama.cpp's own tensors of the same GGUF (DESIGN
+        // 7.0.2bz: the converter's folded norm gammas and -exp(A_log)
+        // undone at the feed, the sigmoid output gate, the tiled key-head
+        // pairing). Its depth-4 sibling agrees with llama.cpp at every cut
+        // (layer 3 out corr 0.9987, campaign serving-shape-logits). The
+        // first full-depth artifact (d48f, tree da52858, xml f89a1623) is
+        // superseded: it served logits with no information about the model
+        // (KL 12.4 nats against the model's own capture) and is not admitted
+        // any more. Hashes read off the export log.
+        e.id                      = "qwen3.8-flash-next-d48g";
         e.family                  = "qwen3.8";
-        e.artifact_aliases        = {"qwen38-flash-next-d48f-ov"};
+        e.artifact_aliases        = {"qwen38-flash-next-d48g-ov"};
         e.ov_arch                 = "Qwen4ExpForConditionalGeneration";
         e.model_type              = "qwen4_exp";
         e.moe                     = true;
@@ -459,12 +458,12 @@ std::vector<ModelEntry> build_registry() {
         e.n_layer                 = 48;
         e.n_ctx_train             = 262144;
         e.quants                  = {Quant::Q4};
-        e.arch_hash               = "f89a162348b13d18";
+        e.arch_hash               = "a077e6e4bfa9b847";
         e.template_hash           = "12827f24b742ea4e";
         e.tokenizer_hash          = "87a7830d63fcf43b";
-        e.weights_bytes           = 80061287237ull;
-        e.status                  = "full-depth fused-MoE artifact: compiles on one card at 8.06 GiB "
-                                    "device (ratio 99 + tier); no forward on the record yet";
+        e.weights_bytes           = 80061287197ull;
+        e.status                  = "full-depth fused-MoE artifact through the corrected fill; "
+                                    "the KLD gate against the model's own capture is its acceptance";
         e.sampler = qwen_card_defaults();
         split_layers(e);
         r.push_back(std::move(e));

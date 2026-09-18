@@ -25,8 +25,9 @@ TEST(registry_holds_exactly_the_target_models) {
     // own xml hash; no forward on the record yet.
     const auto ids = model_ids();
     CHECK_EQ(ids.size(), 12u);
-    CHECK(find_model("qwen3.8-flash-next-d48f") != nullptr);
-    CHECK(find_by_artifact("qwen38-flash-next-d48f-ov") == find_model("qwen3.8-flash-next-d48f"));
+    CHECK(find_model("qwen3.8-flash-next-d48g") != nullptr);
+    CHECK(find_by_artifact("qwen38-flash-next-d48g-ov") == find_model("qwen3.8-flash-next-d48g"));
+    CHECK(find_model("qwen3.8-flash-next-d48f") == nullptr);   // superseded, not admitted
     CHECK(find_model("qwen3.8-flash-next-d12r") != nullptr);
     CHECK(find_by_artifact("qwen38-flash-next-d12r-ov") == find_model("qwen3.8-flash-next-d12r"));
     CHECK(find_model("qwen3.8-flash-next-d12") != nullptr);

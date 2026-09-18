@@ -147,8 +147,8 @@
     "mtp_num_hidden_layers": 1,
     "mtp_head_exported": false
   },
-  "qwen38-flash-next-d48f-ov": {
-    "_note": "2026-09-17: the serving-shape IR at ALL 48 layers in the shape the GPU plugin's tiled MoE matcher accepts (tools/export_serving_artifact.py --layers 48, tree da52858; two Reshapes, a one-input Swish, an f16 dequant chain with a trailing Convert), real weights from the UD-Q3_K_XL shards. The first full-depth artifact that compiles to moe_3gemm_fused_compressed (x48): on the 24 GiB card at --offload-ratio 99 with the CPU tier, 8.06 GiB device-resident, 119 s, host 2.5 GiB (campaign sub4bit-vram-kernel, status 2026-09-17). Hashes read off the export log and --inspect-artifact. A forward at full depth still waits for the residency stream (the tier's host pool exceeds RAM) and for the B60 tier fault; its answers are not on the record.",
+  "qwen38-flash-next-d48g-ov": {
+    "_note": "2026-09-18: the 48-layer serving-shape IR re-exported from tree f91ea73 through the corrected fill (DESIGN 7.0.2bz: the GGUF converter's folded norm gammas and -exp(A_log) undone at the feed, the sigmoid output gate, the tiled key-head pairing), after the fill's three defects were found against llama.cpp's own tensors of the same GGUF. Its depth-4 sibling agrees with llama.cpp at every cut (layer 3 out corr 0.9987). Supersedes d48f (tree da52858, xml f89a162348b13d18), which served logits with no information about the model (KL 12.4 nats against the model's own capture). Hashes read off the export log.",
     "arch": [
       "Qwen4ExpForConditionalGeneration"
     ],
@@ -160,9 +160,9 @@
     "full_attention_interval": 4,
     "template_sha": "12827f24b742ea4e",
     "tokenizer_sha": "87a7830d63fcf43b",
-    "lm_xml_sha": "f89a162348b13d18",
-    "lm_bin_bytes": 80061287237,
-    "status": "full-depth fused-MoE artifact: compiles on one card at 8.06 GiB device (ratio 99 + tier); no forward on the record yet",
+    "lm_xml_sha": "a077e6e4bfa9b847",
+    "lm_bin_bytes": 80061287197,
+    "status": "full-depth fused-MoE artifact through the corrected fill; the KLD gate against the model's own capture is its acceptance",
     "mtp_num_hidden_layers": 1,
     "mtp_head_exported": false
   },
