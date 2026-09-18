@@ -9,10 +9,11 @@ plugin's exact run of the same IR. The census asserts the fused primitive
 exists (the lowering fired) -- a silent fall-through to generic ops would
 still compute the right numbers here and would be the wrong mechanism.
 
-Runs only with Q4E_GPU_DEVICE set (e.g. GPU.0) and the patched runtime on
-PYTHONPATH; the SOP card window applies (docs/sop-card-window.md).
+Runs only with the suite's recorded GPU gate set (`Q4E_GPU=GPU.0`, see
+tests/python/q4e_device.py; a new gate would be a new axis in the count
+space, test_suite_guards) and the patched runtime on PYTHONPATH; the SOP
+card window applies (docs/sop-card-window.md).
 """
-import os
 import sys
 from pathlib import Path
 
@@ -22,11 +23,13 @@ import pytest
 from openvino import Type, opset13 as op
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from q4e import native_blocks as nb  # noqa: E402
 from q4e import serving_shape as ss  # noqa: E402
+from q4e_device import device_params  # noqa: E402
 
-_DEV = os.environ.get("Q4E_GPU_DEVICE", "")
-_skip = pytest.mark.skipif(not _DEV, reason="Q4E_GPU_DEVICE unset (a card window)")
+_GPUS = [d for d in device_params() if d != "CPU"]
+_skip = pytest.mark.skipif(not _GPUS, reason="Q4E_GPU unset (a card window)")
 
 
 class _RandomNativeFiller:
@@ -98,8 +101,10 @@ def _build(tmp_path, T, gate_up_fmt, down_fmt):
 
 
 @_skip
+@pytest.mark.parametrize("dev", _GPUS)
 @pytest.mark.parametrize("gate_up_fmt,down_fmt", [("affine", "affine"), ("IQ3_XXS", "IQ4_NL"), ("IQ4_XS", "Q8_0")])
-def test_the_native_block_lowers_to_the_fused_primitive_and_matches_the_cpu_plugin(tmp_path, gate_up_fmt, down_fmt):
+def test_the_native_block_lowers_to_the_fused_primitive_and_matches_the_cpu_plugin(tmp_path, dev, gate_up_fmt, down_fmt):
+    _DEV = dev
     T = 6
     arena, cfg = _build(tmp_path, T, gate_up_fmt, down_fmt)
     try:
