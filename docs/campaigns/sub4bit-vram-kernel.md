@@ -616,4 +616,16 @@ fusion-impact profile, not a kernel micro-benchmark) applies.
   submission after a long idle since boot while back-to-back legs never
   wedge — a runtime-PM resume suspect, unmeasured, recorded for the next
   boot. The control stays owed with the term it would split.
+- 2026-09-19 (late morning) — **the chunks are not the term.** The
+  capture's 2,735 ids in ONE forward through the native artifact (B60,
+  ratio 99 + tier, KV u8, f16) read mean 0.380 / median 0.191 / argmax
+  0.792 against the f32 reference; the 512-token chunked serve read
+  0.369 / 0.181 / 0.827 (`measured-here`). The artifact's long-context
+  floor is therefore in the f16 recurrent GDN state or the f16 attention
+  over thousands of keys (with the dense-for-sparse price above 2,051);
+  the split — reference taps at long context against boot-driver cuts at
+  layers 3 and 23 on the same ids, or an f32-state emitter option — is
+  the next leg. Beside it: the B60's first job after an idle hour
+  survived with runtime suspend disabled (one event; three wedges before
+  it at the default).
 
