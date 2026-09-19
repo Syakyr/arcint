@@ -19,6 +19,20 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
 
 ## Unreleased
 
+- **The exact reference at full depth** (`tools/ref_forward_stream.py`,
+  run on a GB10): the pin's own model with every weight from the GGUF,
+  the experts streamed per layer and the n-gram table gathered lazily;
+  writes captures in llama.cpp's own format (`tools/kld_vs_capture.py`,
+  `tools/capture_vs_capture.py` read them). Against the model's own f32
+  arithmetic the native artifact is exact to 0.2% through 24 layers and
+  its short-prompt logits sit at KL 0.017 nats (llama.cpp: 0.053); at long
+  context the served artifact reads mean 0.37 / median 0.18 / argmax 0.83
+  on the capture's window 0 where llama.cpp itself reads 0.34 / 0.065 /
+  0.80. The remaining term is the artifact's own long-context floor, with
+  the f16 recurrent state, the prefill chunks and the long-context f16
+  attention as the candidates; the sparse-attention boundary now shows
+  its dense-for-sparse price (0.28 below, 0.45 above).
+
 ### The native expert formats (campaign: sub4bit-vram-kernel)
 
 - **The residual, named**: with the fill's three provenance defects fixed

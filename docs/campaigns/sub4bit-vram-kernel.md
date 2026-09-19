@@ -580,4 +580,33 @@ fusion-impact profile, not a kernel micro-benchmark) applies.
   the 5 tokens to a different expert at layer 0 (at the two smallest
   margins, 3.9e-5 and 5.2e-5). No implementation short of llama's own
   arithmetic matches this capture's routing.
+- 2026-09-19 (morning) — **the exact reference at full depth, on the
+  Sparks, and the gate re-read against the model's own arithmetic.**
+  `tools/ref_forward_stream.py`: the pin's own model, every weight from the
+  GGUF, the experts streamed per layer, the n-gram table gathered lazily,
+  the two 7.0.2bz corrections from the config, the sparse-attention
+  indexer mapped in the feed for it; 48 layers in f32 on a GB10 in 741 s
+  (the numpy dequant of the experts is the whole cost). Against it
+  (`measured-here`): the native artifact is exact to 0.2% at every token
+  through 24 layers (corr 1.00000) where llama.cpp is at 3.9–6.8%; its
+  last-token logits sit at KL 0.017 nats where llama.cpp's sit at 0.053;
+  from layer 24–27 on two of the five tokens drift (13–16% by layer 43),
+  the near-tie flip at the artifact's own 0.2% (f16) difference. The KLD
+  gate re-read on window 0 against the f32 reference capture: native
+  **mean 0.369 / median 0.181 / argmax 0.827** (below the QSA boundary
+  0.283, above 0.455 — the dense-for-sparse price, visible for the first
+  time), f16 KV the same, the u4 artifact 0.603 / 0.264 / 0.718; and
+  llama.cpp's own capture against the same reference **0.339 / 0.065 /
+  0.802**. So the artifact and llama.cpp are equally far from the model in
+  the mean and the artifact agrees on the argmax more often, but their
+  errors differ in shape: llama's is heavy-tailed (most tokens at
+  0.02–0.06), the artifact's is a broad ~0.18-nat floor at every long-
+  context token — its own term, absent at 5 tokens, saturated by position
+  1,367, not the KV precision, not the experts. Candidates: the f16
+  recurrent GDN state (llama keeps it f32), the 512-token chunks' state
+  carry (the single-chunk control is running), the f16 attention over
+  thousands of keys. The 0.06-nat bar is llama.cpp's own per-token floor
+  against the model; reaching it means fixing that long-context term, and
+  the quality question of this campaign now has a yardstick that is the
+  model, not another implementation.
 

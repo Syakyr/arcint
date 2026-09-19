@@ -9345,6 +9345,22 @@ forward differs from llama's layer-0 router input by 1.7–2.2% and already
 routes two of the five tokens to a different expert at layer 0. Evidence
 class throughout: `measured-here`.
 
+**The yardstick, replaced (2026-09-19).** `tools/ref_forward_stream.py`
+runs the pin's own model at full depth on a 128 GB unified-memory host
+(the experts streamed per layer, the n-gram table gathered from the
+shard's rows, the sparse-attention indexer fed) and writes captures in
+llama.cpp's format. Against the model's own f32 arithmetic the native
+artifact is exact to 0.2% at every token through 24 layers (llama.cpp:
+3.9–6.8%), its 5-token logits sit at KL 0.017 nats (llama.cpp: 0.053), and
+on the capture's window 0 it reads mean 0.369 / median 0.181 / argmax
+0.827 where llama.cpp reads 0.339 / 0.065 / 0.802. The residual that is
+the artifact's own is a broad ~0.18-nat floor at long context, born past
+layer 24 and saturated by position ~1,400 — not the experts, not the KV
+precision; the f16 recurrent state, the prefill chunks and the f16
+long-context attention are the candidates. The bar of 0.06 nats is
+llama.cpp's per-token floor against the model; a serving artifact reaches
+it by matching that error shape, not by any expert format.
+
 **Recorded beside it.** Three served attempts were killed by the host
 watchdog before the reading: the served-leg driver had not forwarded the
 offload flags (full residency, 60 GB of USM host) — my harness, attributed
