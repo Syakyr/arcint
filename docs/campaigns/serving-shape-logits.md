@@ -189,9 +189,26 @@ it is mechanism, not an answer.
   the gate, the pairing) plus once for the residual; the residual's remedy
   is `sub4bit-vram-kernel`'s own goal, the native sub-4-bit expert kernel.
 
+- 2026-09-19 — **closed.** The residual's remedy landed in
+  `sub4bit-vram-kernel` (patch 0043, the native expert formats: 0.54 → 0.42
+  mean on window 0 against llama.cpp's capture), and the question this
+  campaign could not settle against that capture — what is ours and what is
+  llama.cpp's — is settled by a better yardstick: the pin's own full-depth
+  f32 forward (`tools/ref_forward_stream.py`, run on a Spark). Against it
+  the served artifact reads mean 0.37 / median 0.18 / argmax 0.83 on window
+  0 where llama.cpp reads 0.34 / 0.065 / 0.80 (`measured-here`); the
+  block-level arithmetic is exact to 0.2% through 24 layers. The remaining
+  term is a long-context floor (the f16 recurrent state or the f16
+  long-context attention; chunks and KV precision excluded) and lives on in
+  `sub4bit-vram-kernel`'s status. Every instrument this campaign built
+  (`llama-eval-dump`, `llama_tap_compare.py`, the cut ladder, the KLD replay
+  and its position-resolved reading) stays in use.
+
 ## Gate, re-read
 
-The Paris line is served at depth 48. The KLD number (0.73 nats) is the u4
-repack's price on top of a graph that is otherwise the model's; the bar it is
-read against stays provisional and borrowed. The next KLD that can move is
-the one after the expert kernel reads the checkpoint's own blocks.
+The Paris line is served at depth 48. The KLD number against llama.cpp's
+capture (0.73 nats u4, 0.42 native) is bounded below by llama.cpp's own
+distance from the model (mean 0.34 on the same rows), so it is no longer the
+gate; the gate is the reading against the model's own f32 reference capture
+(`/models/ov/_kld/ref/` on the dev host), where the artifact stands at 0.37
+/ 0.18 with its long-context term named as the next work.

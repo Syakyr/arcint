@@ -93,3 +93,10 @@ exporter or the plugin has never lowered.
 
 - 2026-09-05 — recorded; nothing started. Independent of 0.4.0 unless the
   checkpoint ships only as GGUF.
+- 2026-09-13 — shipped as v0.5.0, the mechanism release (CHANGELOG "0.5.0");
+  the Paris line moved to 0.5.1 by the operator's change request.
+- 2026-09-19 — the 0.5.1 continuation is recorded in
+  `docs/campaigns/sub4bit-vram-kernel.md` (status log) and DESIGN §7.0.2bz–ca:
+  the full-depth artifact serves on one 24 GB card in two expert formats,
+  the quality is measured against the model's own f32 forward, the rate
+  lever and the long-context term are named.
