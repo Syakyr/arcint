@@ -609,4 +609,11 @@ fusion-impact profile, not a kernel micro-benchmark) applies.
   against the model; reaching it means fixing that long-context term, and
   the quality question of this campaign now has a yardstick that is the
   model, not another implementation.
+  The single-chunk control (the window's 2,735 ids in one boot-driver
+  forward, to separate the prefill chunks' state carry from the f16 state
+  and the long-context attention) did NOT run: the B60 wedged at the
+  compile's first job, the third such event, each at the card's first
+  submission after a long idle since boot while back-to-back legs never
+  wedge — a runtime-PM resume suspect, unmeasured, recorded for the next
+  boot. The control stays owed with the term it would split.
 
