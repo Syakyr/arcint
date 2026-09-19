@@ -141,9 +141,16 @@ _LAYER_MAP = {
     # part; the dense projections below feed the emitted attention block
     # tools/q4e/attention.py on the pin's own GGUF attn_q/k/v/output names,
     # reached via the `self_attn.` prefix (distinct from the GDN input
-    # projections, which land on attn_qkv/attn_gate). The indexer's weights
-    # (indexer.q_proj/k_proj/q_norm/k_norm) are deliberately NOT mapped: the
-    # selection branch is not emitted.
+    # projections, which land on attn_qkv/attn_gate). The indexer -- the
+    # sparse-attention selection branch -- is NOT emitted by the serving-shape
+    # graph (dense attention), but the full-depth exact reference
+    # (tools/ref_forward_stream.py) runs the pin's own sparse path past the
+    # QSA boundary and needs it (2026-09-19): the pin fuses q|k into one
+    # `index_qk_proj` (q rows first, pin `torch.split`), its two norms are
+    # the (1 + w) RMSNorm like every other gamma.
+    "self_attn.indexer.index_qk_proj.weight": (("indexer.q_proj.weight", "indexer.k_proj.weight"), "fuse_qk"),
+    "self_attn.indexer.q_layernorm.weight": ("indexer.q_norm.weight", "gamma1"),
+    "self_attn.indexer.k_layernorm.weight": ("indexer.k_norm.weight", "gamma1"),
     "self_attn.q_proj.weight": ("attn_q.weight", "direct2d"),
     "self_attn.k_proj.weight": ("attn_k.weight", "direct2d"),
     "self_attn.v_proj.weight": ("attn_v.weight", "direct2d"),
@@ -374,8 +381,15 @@ class GgufFeed:
         # rows slices the leading axis only for kinds whose pin leading axis IS
         # the GGUF leading axis; vec/row/conv are small and their leading axes
         # differ, so they dequant whole.
-        row_kinds = ("direct2d", "expert3d", "fuse_gate_up")
+        row_kinds = ("direct2d", "expert3d", "fuse_gate_up", "fuse_qk")
         r = rows if kind in row_kinds else None
+        if kind == "fuse_qk":                          # [q_out, H] ++ [k_out, H] -> [(q+k)_out, H]
+            qname, kname = gname
+            q = _dequant(self._index[qname]); k = _dequant(self._index[kname])
+            if q.ndim != 2 or k.ndim != 2 or q.shape[1] != k.shape[1]:
+                raise ValueError(f"fuse_qk: {qname} {q.shape} and {kname} {k.shape} do not stack on axis 0")
+            fused = np.concatenate([q, k], axis=0)
+            return np.ascontiguousarray(fused if r is None else fused[:r])
         if kind == "fuse_gate_up":
             gate = self.dequant(gname[0], rows=r)      # [E, ff, in]
             up = self.dequant(gname[1], rows=r)        # [E, ff, in]

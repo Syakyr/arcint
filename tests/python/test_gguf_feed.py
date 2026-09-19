@@ -119,6 +119,25 @@ def _layer_keys(sd_keys, layer, leaf):
 
 # --------------------------------------------------------------------------- #
 @_skip
+def test_the_indexer_is_fed_fused_q_over_k_with_its_norms(feed):
+    """The sparse-attention indexer (2026-09-19): the pin's one
+    `index_qk_proj` is the GGUF's `indexer.q_proj` stacked over
+    `indexer.k_proj` on the output axis (the pin splits q first), and its
+    two norms are (1 + w) gammas. Red first: the three keys raised
+    "no GGUF map entry" and the full-depth reference could not build."""
+    q = feed.dequant("blk.3.indexer.q_proj.weight")
+    k = feed.dequant("blk.3.indexer.k_proj.weight")
+    fused = feed.pin_tensor("layers.3.self_attn.indexer.index_qk_proj.weight")
+    assert fused.shape == (q.shape[0] + k.shape[0], q.shape[1]), (fused.shape, q.shape, k.shape)
+    assert np.array_equal(fused[:q.shape[0]], q) and np.array_equal(fused[q.shape[0]:], k)
+    for suffix, gname in (("q_layernorm", "indexer.q_norm"), ("k_layernorm", "indexer.k_norm")):
+        g = feed.pin_tensor(f"layers.3.self_attn.indexer.{suffix}.weight")
+        stored = feed.dequant(f"blk.3.{gname}.weight")
+        assert g.shape == stored.shape and np.allclose(g, stored - 1.0), suffix   # gamma1: stored (1 + w) -> w
+    print(f"\n[indexer] fused {fused.shape}: q rows {q.shape[0]}, k rows {k.shape[0]}; norms {g.shape}")
+
+
+@_skip
 def test_map_covers_causal_keys(feed):
     """Every tiny-config pin key the causal backbone consumes resolves to a
     GGUF tensor that exists in the file (or is a derived buffer we do not feed).
@@ -636,6 +655,11 @@ _EXPECTED_LAYER = {
     "self_attn.k_proj.weight": ("attn_k.weight", "direct2d"),
     "self_attn.v_proj.weight": ("attn_v.weight", "direct2d"),
     "self_attn.o_proj.weight": ("attn_output.weight", "direct2d"),
+    # the sparse-attention indexer (2026-09-19, for the full-depth exact
+    # reference): the pin's fused q|k projection and its two (1 + w) norms
+    "self_attn.indexer.index_qk_proj.weight": (("indexer.q_proj.weight", "indexer.k_proj.weight"), "fuse_qk"),
+    "self_attn.indexer.q_layernorm.weight": ("indexer.q_norm.weight", "gamma1"),
+    "self_attn.indexer.k_layernorm.weight": ("indexer.k_norm.weight", "gamma1"),
     "self_attn.q_norm.weight": ("attn_q_norm.weight", "gamma1"),
     "self_attn.k_norm.weight": ("attn_k_norm.weight", "gamma1"),
     # PLE
@@ -674,7 +698,7 @@ def _blk_of(suffix):
     return 0
 
 
-_ROW_KINDS = ("direct2d", "expert3d", "fuse_gate_up")
+_ROW_KINDS = ("direct2d", "expert3d", "fuse_gate_up", "fuse_qk")
 _GATE_ROWS = 2   # leading-axis rows to compare; enough to separate any two tensors
 
 
@@ -715,6 +739,11 @@ def _expected_array(raw_index, gname, kind, rows):
         gate = _raw_dequant(raw_index, gname[0], rows=r)
         up = _raw_dequant(raw_index, gname[1], rows=r)
         return np.concatenate([gate, up], axis=1)
+    if kind == "fuse_qk":                # q rows over k rows on the output axis (pin torch.split order)
+        q = _raw_dequant(raw_index, gname[0])
+        k = _raw_dequant(raw_index, gname[1])
+        fused = np.concatenate([q, k], axis=0)
+        return fused if r is None else fused[:r]
     arr = _raw_dequant(raw_index, gname, rows=r)
     if kind in ("direct2d", "vec", "expert3d"):
         return arr
