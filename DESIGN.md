@@ -9372,6 +9372,76 @@ earlier, found in review); it has not recurred since the fix on either
 card. The plugin's tier cells run standalone in seconds without an
 `ENABLE_TESTS` build.
 
+#### 7.0.2cb The served path's run-to-run floor is a per-card defect: bit-identical on Alchemist, nondeterministic in the B60's GDN arithmetic (2026-09-20)
+
+**What was measured.** [measured-here] The served Flash-Next path (depth 48,
+native artifact, ratio 99 + host tier, KV u8, f16, chunk 512) is **not run-to-run
+deterministic on the B60/Xe2**: two forwards of the same 2,735-token window
+differ by `KL(A‖B)` mean **0.1361 (w0) / 0.1512 (w1)**, max |logit diff|
+13.2 / 17.8, argmax agreement **0.850 / 0.902** — ~10–15 % of scored positions
+flip their top token. The decided bound (3.0905e-03 below 2051, 2.6946e-02 at or above it)
+sits ~44x under that floor, so clause (d) of window-051 read **UNREADABLE on that card**.
+
+**The card is the variable.** [measured-here] The same bytes, request and
+harness on the **A770** (`acm-g12`, OpenVINO `GPU.1`) are **bit-identical**: at
+depth 48, r0↔r1 mean **-0.000000**, **0/1367** rows moved, argmax **1.0000**,
+max |diff| **0.000**. So `F_served = 0` there, the bound sits **above** the
+floor, and clause (d) closes with the **A770 as the measurement card**, while
+the B60's row stands as a per-card caveat, not a property of the served path.
+Caveat recorded rather than smoothed: the A770 arm is **×2**, not the x8/x12 of
+the d4/d12 evidence, and window-050 §4.11's *"the A770 steps once at an
+unpredictable forward"* is not refuted by two forwards — a repeat-8 arm was
+queued the same day.
+
+**Everything else is excluded.** [measured-here, code] Warm-up is not the
+cause (0.072601 ≈ 0.073234); the GPU/host expert-residency mix is not
+(force-the-tier, every expert on the host kernel, leaves **0.081553**);
+chunking is not — the unchunked prefill is **worse** (**0.095497 / 0.202143**
+against 0.072601 / 0.073234), so §3.2's chunk non-exactness does not explain
+the floor and neither a single-chunk mode nor a bit-exact chunk-carry is the
+fix; launch geometry is ruled out from code (`get_dispatch_data_func` derives
+GWS/LWS from static shapes plus the arch subgroup width, and
+`!params.is_dynamic()` is asserted); the kernel source has no
+`atomic`/`barrier`/`__local`/`volatile`; the lowered `sub_group_reduce_add` is
+a fixed register-halving tree at both widths; the JIT is byte-identical
+(`ocloc` twice on the captured bucket: sha `be20f259…dc78`, 64,712 B); inter-kernel ordering changes nothing
+(a `clFinish` after each of **233** enqueues); and the upstream dense GEMM is
+clean (minimal same-shape f16 MatMul bit-identical ×8).
+
+**What remains.** [measured-here] A **within-kernel nondeterminism in the GDN
+arithmetic on Xe2**, at execution level below the kernel-choice level.
+Location: `layer0/mixer_out`, with the request's nine input ports
+bit-identical across 8 repeats (both state tables the all-zero hash after
+`zero_state`) while the output differs every forward; the co-resident conv
+state is stable every repeat. Fingerprint: `dim0 = row 0`, heads
+**[3,5,6,7,10,13,17,22,31,39,41,42,43,47]**, one f16 ulp (**9.7656e-4**),
+flip count **2423..3924**, head set invariant. The GDN state digest is
+stochastic (5 distinct hashes in one process; 1–4 among repeats in cold
+processes), and the **first** forward is reproducible across cold processes —
+which the serialization test proved is not a JIT or overlap effect.
+
+**The subgroup width is a correlate, not the mechanism.** [code, measured-here] The plugin
+JITs one GDN source and specializes the width per arch (`get_subgroup_size`:
+8 for gen9/gen11/xe_lp/xe_hp/xe_hpg, **16 for xe2/xe3/default**). But `xe2`
+**requires** 16 — `intel_reqd_sub_group_size(8)` fails to compile on
+`bmg-g21`, `bmg-g31`, `lnl-m`, `ptl-h` — so **no one-line pin exists**, and
+the width explains the card-to-card *value* difference, not the run-to-run
+variance.
+
+**Consequences.** [code, measured-here] (1) Clause (d) closes on the A770; the
+B60 needs the real mechanism or an upstream fix. (2) **In-tree selection is
+blocked:** `OV_GPU_FORCE_IMPLEMENTATIONS` requires `ENABLE_DEBUG_CAPS`, absent
+from the shipped plugin, so testing `ref` as a workaround needs a debug-caps
+build — the vendored packaging script was extended for exactly that (and made
+to refuse to install over the measurement plugin's prefix). (3) The defect is
+reported upstream as a **sibling** of #38099 — same chunked-GatedDeltaNet
+family, different failure mode (run-to-run at execution level vs
+deterministic-wrong at chunk ≥ 2) — with the fingerprint and the negatives
+(`openvinotoolkit/openvino#38099`, `issuecomment-5751935449`). (4) The campaign
+is `docs/campaigns/served-prefill-determinism.md`; its handoff documents carry
+the reproducer plan, the floor-read rule (name the transition: `#1↔#2`,
+`#2↔#3`, …) and the paid-for traps.
+
 #### 7.0.3 KV precision on the paged path — u8 is the lever, u4 is a tax
 
 The plugin accepts f16/u8/i8/u4/i4 for `KV_CACHE_PRECISION` on the paged path,
