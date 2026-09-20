@@ -480,7 +480,7 @@ F_served is unreadable and the row says UNREADABLE, not PASS. The inherited
 | quantity | predicted | measured |
 |---|---|---|
 | F_ref (uint16 reconstruction error at 248,320-wide, mean over the capture's rows) | between 2.9e-6 (the 257-wide cell) and 8/65535 = 1.2e-4 nats | **3.0905e-05 nats** mean over 816 served rows (max 1.0533e-02, min 2.5e-10), `RUN@c00500f` A770 d4 f16 T=816, 2026-09-13 22:03Z — C6 holds on the mean; the per-row max is the clamp-tail term (below) |
-| F_served at depth 48 (KL(A‖B) mean, ≥ 2 replays, both windows) | of the order of depth 4's 2.1e-4, per-window event | EMPTY at depth 48; at depth 4 on the rows above: **bit-identical ×3** (KL(A‖B) 1.0e-18, max \|diff\| 0), the observed floor pair of that process |
+| F_served at depth 48 (KL(A‖B) mean, ≥ 2 replays, both windows) | of the order of depth 4's 2.1e-4, per-window event | **MEASURED 2026-09-19** (`RUN@b6dbca5`, B60 GPU.0, d48n, ratio 99 + tier, chunk 512, 14:04–18:44Z, dump `d48n-fserv.bin`, 4 replays of both windows): KL(A‖B) **mean 0.1361 (w0) / 0.1512 (w1)**, max 4.425 / 9.648, argmax agreement 0.850 / 0.902, max \|logit diff\| 13.22 / 17.81; 2 of 2 window pairs moved. **The decided bar (3.0905e-03) sits ~44x BELOW this floor, so this row is UNREADABLE, not PASS.** At depth 4 on the rows above: **bit-identical ×3** (KL(A‖B) 1.0e-18, max \|diff\| 0), the observed floor pair of that process. |
 | bar_0.5.1 below 2051 = 100 × F_ref | 3e-4 .. 1.2e-2 nats | **3.0905e-03 nats** (PROVISIONAL: derived from served f16 rows, see the note) |
 | bar_0.5.1 at/above 2051 = bar + QSA price | + 2.385560e-02 | **2.6946e-02 nats** |
 | mean KL(P_ref‖P_served) below 2051 | not predicted (the first full-depth number) | EMPTY |
@@ -492,6 +492,71 @@ F_served is unreadable and the row says UNREADABLE, not PASS. The inherited
 > [AMENDED 2026-09-14, A.2: **C6 did not price the clamp-tail term.** The writer clamps the row's minimum at max−16, so every logit further down reconstructs to exactly max−16, and at 248,320-wide those entries carry e^-16 each — a tail the half-step bound never counts. `tests/python/test_kld_bar.py` found it red-first (40-nat synthetic rows: F_ref a decade over the step bound) and pins it as its own cell; on the served rows the MEAN stays inside C6's band (3.09e-5) while the per-row maximum (1.05e-2) does not. C6 stands as written for the mean; its bound is not a per-row bound.]
 
 > [AMENDED 2026-09-14, A.2: the inherited **0.0599** (window-050 §7, another model's number) is SUPERSEDED BY LINEAGE by bar_0.5.1 = 3.0905e-03 below / 2.6946e-02 above 2051 wherever this document reads a bar; it stays printed beside every verdict for continuity and decides nothing — mark, not erasure. The new bar is itself PROVISIONAL on the f16-rows caveat above.]
+
+> [AMENDED 2026-09-19, REVIEW: **bar_0.5.1 is an INSTRUMENT-RESOLUTION BOUND, not an acceptance bar**, and the record now says so. Three measured facts decide it. (1) It is unmeetable by the reference implementation: llama.cpp's own error against the same f32 reference is **mean 0.3387 / median 0.0649** on window 0 — ~110x the 3.0905e-03 bound. (2) Its own tail defeats its own mean: `F_ref`'s **per-row max is 1.0533e-02**, ~3.4x `bar_below`, so one row can carry more reconstruction error than the bound; it is a MEAN bound only, which C6's own amendment already conceded. (3) The READABLE acceptance candidate is the floor between implementations — llama.cpp vs the same reference, median **0.0649 (w0) / 0.0283 (w1)**, mean 0.3387 / 0.4415 — and above both of these sits the served path's own **`F_served` at depth 48**, which is still EMPTY and is the actual gate-blocking gap, not the 100x. The tooling was wired to match: `tools/kld_bar.py` marks the bound `bound_is_acceptance: false` and flags the clamp tail per run; `tools/kld_served.py` prints the decided bound, the between-implementations floor and the superseded literal together, so no reader can see only the 0.0599. Cells: `tests/python/test_kld_bar.py`, `tests/python/test_kld_served.py` (15 passed, 2026-09-19). No measured column here changes.]
+
+> [MEASURED 2026-09-19, the one column that did change: **clause (d)'s `F_served` is filled.** The depth-48 served path's own run-to-run floor is **KL(A‖B) mean 0.1361 (w0) / 0.1512 (w1)**, max 4.425 / 9.648, argmax agreement 0.850 / 0.902, max |logit diff| 13.22 / 17.81 — from four replays of both 2,735-token windows (`RUN@b6dbca5`, B60 GPU.0, d48n, ratio 99 + tier, chunk 512, 14:04–18:44Z, dump `d48n-fserv.bin`). That floor is **~44x ABOVE the decided bound (3.0905e-03)**, so clause (d)'s own rule applies and **the row reads UNREADABLE, not PASS**. The indeterminism is the chunk-boundary non-exactness the loader already warns about (DESIGN.md 3.2): 2,735 tokens over 6 chunks at chunk 512, 2 of 2 window pairs moved. Consequence for BERLIN: the artifact's own KL-vs-reference means (0.51 below / 0.32 above on window 0) are read to no better than ~0.14 nats, i.e. dominated by this floor, not by model fidelity — so closing the gate needs **determinism first** (a single-chunk prefill, or a bit-exact chunk-carry), not a tighter bar. Upstream: openvinotoolkit/openvino **#38099** (OPEN, acknowledged by Intel 2026-09-16, self-contained reproducer supplied the same day, no fix) is the same GPU chunked-GatedDeltaNet unroll family — deterministic wrong values for chunk ≥ 2 on both cards; and **#37607** (CLOSED 2026-09-18 as COMPLETED with **no upstream fix**, only the operator's workaround `CACHE_MODE=OPTIMIZE_SPEED`) governs the cached warm start. The defect now owns its campaign: `docs/campaigns/served-prefill-determinism.md`.]
+
+> [CORRECTED 2026-09-20, REVIEW: **this amendment's chunk-boundary attribution
+> is refuted.** An unchunked arm on the same served config (`--prefill-chunk 0`,
+> B60 GPU.0, ratio 99 + tier, dump `d48n-d4-unchunked.bin`, all three forwards
+> complete 13:37:30Z) gives a floor **higher** than the chunked one: warmup vs
+> replay 0 mean **0.095497** (143/1367 moved), **replay 0 vs replay 1 mean
+> 0.202143** (**284/1367 moved**, argmax **0.7922**) — against chunk-512's
+> 0.072601 / 0.073234. Removing the chunk boundaries does not remove the
+> divergence, so the depth-48 served floor is the **B60/Xe2 per-forward step
+> this document's cut table already isolates** (layer 0, one f16 ulp at or
+> after row 32; the A770 bit-identical), **not** §3.2's chunk non-exactness.
+> The fix named above ("a single-chunk prefill, or a bit-exact chunk-carry")
+> is superseded: determinism comes from a **different measurement card
+> (A770)** or from **naming and pinning the kernel**. Campaign,
+> design note and handoff updated the same day.]
+
+> [MEASURED 2026-09-20, **the row turns READABLE — on a named card**: on the
+> **A770 the depth-48 served path is bit-identical.** `RUN@b6dbca5`, A770
+> (GPU.1), d48n, ratio 99 + tier, chunk 512, served path, `WARMUP=0 REPEAT=2`,
+> dump `d48n-a770-d48.bin`, two forwards r0<->r1 read with `floor_pair` over
+> the tool's own 1367-row subset: mean **-0.000000**, max 0.000, **0/1367 rows
+> moved**, argmax **1.0000**, max |diff| **0.000**, `bit-identical True`. So
+> `F_served = 0`, the decided bar (3.0905e-03) sits ABOVE that floor, and
+> clause (d)'s `F_served` requirement — "a bar below F_served is unreadable" —
+> is **satisfied on the A770 as the measurement card**: the artifact's own
+> KL-vs-reference means can now be read. The B60's floor (0.1361 / 0.1512 here,
+> and every arm since: D2 0.072601 / 0.073234, force-the-tier 0.081553, D4
+> unchunked 0.095497 / 0.202143) is therefore a **per-CARD defect**, not a
+> property of the served path. **CORRECTED 2026-09-20 (same day, after the ISA
+> test): the width is NOT the mechanism and the pin is DEAD.** `xe2`
+> *requires* subgroup size 16 — a kernel with `intel_reqd_sub_group_size(8)`
+> fails to compile on every Xe2 target (`bmg-g21`, `bmg-g31`, `lnl-m`,
+> `ptl-h`) with *"Kernel compiled with required subgroup size 8, which is
+> unsupported on this platform"* (it compiles for `acm-g12`, the A770) — so
+> `get_subgroup_size`->16 is **forced by the platform**, not a choice we can
+> flip. And the disassembled reduction is a **fixed deterministic tree at both
+> widths** (`add(8)+add(4)+add(1)+add(1)` at 16 on `bmg-g21`;
+> `add(4)+add(1)+add(1)` at 8 on `acm-g12`; no SLM, no barrier). So the width
+> explains the **card-to-card VALUE difference**, not the **run-to-run
+> variance**; it is a correlate of the card, not the mechanism. **The
+> mechanism is OPEN**, and after this amendment the peer session **refuted the
+> ordering-race shape** (a `clFinish` after each of 233 enqueues leaves the
+> repeats differing) and the JIT shape (`ocloc` twice -> byte-identical
+> binaries), so what remains is a **within-kernel nondeterminism in the GDN
+> arithmetic at execution level**, witnessed by the state digest being
+> stochastic while the co-resident conv state is stable. What remains pinned is only the location: `layer0/mixer_out`
+> with input-bit-identity across 8 repeats (nine ports bit-identical, both
+> state tables exactly the all-zero hash) while the output differs every
+> forward, and the A770 bit-identical.
+>
+> **Caveats, stated rather than smoothed.** (1) This is **x2**, not the
+> x8/x12 of the d4/d12 evidence, and §4.11's amendment *"the A770 steps once
+> at an unpredictable forward; settle is defined by the observed FLOOR pair"*
+> is **not refuted by two forwards** — a repeat-8 A770 arm is the follow-on
+> and should be run before clause (d) is quoted as settled. (2) The A770 is
+> the **measurement** card, not the product's target card: the B60 remains the
+> deployment card. [CORRECTED 2026-09-20: the width pin is **DEAD** (`xe2`
+> *requires* subgroup size 16), so the B60's row cannot be made readable that
+> way; it stays a per-card caveat until the within-kernel mechanism is found or
+> upstream fixes it. The honest sentence is *"the gate is readable on the A770
+> now; the B60 is a per-card caveat."*]
 
 ### (e) THE PARIS LINE — EMPTY, with its falsifiable clause
 

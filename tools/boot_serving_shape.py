@@ -144,6 +144,15 @@ def main(argv=None):
                          "so nothing is bound for a graph that never reads "
                          "it); the default keeps every port declared, as the "
                          "reviewed instrument does")
+    ap.add_argument("--stub", action="append", default=[],
+                    help="NAME=FILE.npy: KNOWN-GOOD SUBSTITUTION -- replace "
+                         "the named node's output with a fixed f32 tensor from "
+                         "the .npy (a [T,C] or [1,T,C] array) BEFORE --cut, so "
+                         "everything downstream runs on identical bytes every "
+                         "repeat. If a downstream cut still varies, the "
+                         "variance is generated between the stub and the cut; "
+                         "if it goes stable, the variance was upstream. "
+                         "Repeatable; the stored tensor fixes T on that branch.")
     ap.add_argument("--capture", default=None,
                     help="prompt = the first --take ids of window --window of "
                          "this llama.cpp --kl-divergence-base capture (the KLD "
@@ -170,6 +179,25 @@ def main(argv=None):
                          "the pinned plugin's own switch for the asynchronous "
                          "static-shape kernel swap); a key the plugin refuses "
                          "fails the compile by name")
+    ap.add_argument("--kernel-names", action="store_true",
+                    help="enable PERF_COUNT and, after the first forward, print "
+                         "the plugin's own per-node profiling: node name -> "
+                         "exec_type (the kernel) -> device time. This is the "
+                         "node-to-kernel map for a cut graph -- the localiser "
+                         "that names WHICH kernel runs at the divergent node.")
+    ap.add_argument("--digest-ports", action="store_true",
+                    help="INPUT-BIT-IDENTITY CONTROL: before every forward, print "
+                         "a sha256 of the request's own input ports (inputs_embeds, "
+                         "conv_mask, the GDN paging ports and the two state tables). "
+                         "If these are bit-identical across repeats while the cut "
+                         "output differs, the divergence is provably INTERNAL to "
+                         "the kernel and no upstream-producer or state-ramp "
+                         "explanation survives. Pairs with --cut.")
+    ap.add_argument("--dump-state", default=None,
+                    help="DIRECTORY: with --digest-ports, also save every state "
+                         "table as <label>_<port>.npy so the post-forward state "
+                         "can be diffed ROW BY ROW across repeats (which rows are "
+                         "stochastic, not just one sha256 of the whole table).")
     ap.add_argument("--dump-logits", default=None,
                     help="DIRECTORY: every forward's f32 logits rows are saved "
                          "as forward_K.npy ([T, vocab]) -- the rows the KLD "
@@ -350,6 +378,54 @@ def main(argv=None):
             if tn.startswith("Paged"):
                 hist[tn] = hist.get(tn, 0) + 1
         say("pass", f"paged ops {hist}")
+    stub_feeds = {}
+    stub_param_nodes = []
+    if args.stub:
+        # THE KNOWN-GOOD SUBSTITUTION (campaign served-prefill-determinism,
+        # 2026-09-20): replace a node's output with bytes fixed on disk, so the
+        # sub-block downstream is fed the SAME tensor on every repeat. A
+        # variance that survives below the stub is generated there; one that
+        # disappears was made upstream. CORRECTED 2026-09-20: this substitution
+        # is NOT kernel-neutral -- the Parameter stub measured the compiled
+        # kernel set change (device_resident 1.37 -> 5.72 GiB), so a stub arm
+        # carries the "a different kernel was selected" confound and must be
+        # read together with the kernel-set sizes, not as a clean
+        # upstream/downstream split.
+        #
+        # The replacement MUST be a Parameter, not a Constant: with a Constant
+        # the whole downstream is a pure function of it and the compiler
+        # constant-folds every MoE/gather op away (measured 2026-09-20: 133 ops
+        # remain, 0 parameters, compile fails in the plugin's ProgramBuilder).
+        # A Parameter keeps the ops alive and the driver feeds the bytes.
+        for spec in args.stub:
+            name, _, path = spec.partition("=")
+            hits = [n for n in model.get_ordered_ops()
+                    if n.get_friendly_name() == name]
+            if len(hits) != 1:
+                say("stub", f"{name!r} names {len(hits)} node(s); nothing stubbed")
+                continue
+            arr = np.load(path)
+            if arr.ndim == 2:
+                arr = arr[None]                     # the emitter's rank-3 shape
+            pname = "stub_" + name.replace("/", "_")
+            p = ov.opset13.parameter(list(arr.shape), ov.Type.f32)
+            p.set_friendly_name(pname)
+            p.output(0).set_names({pname})
+            before = dims(hits[0].output(0))
+            hits[0].output(0).replace(p.output(0))
+            stub_feeds[pname] = np.ascontiguousarray(arr, dtype=np.float32)
+            stub_param_nodes.append(p)
+            say("stub", f"{name}: output(0) {before} replaced by PARAMETER "
+                        f"{pname} {tuple(arr.shape)} fed from {path}; "
+                        f"everything upstream is now unreachable")
+        if stub_param_nodes:
+            # a Parameter inserted with Output.replace is not auto-registered;
+            # rebuild the model so the stub is a DECLARED parameter (measured:
+            # without this, Model() refuses with "references undeclared
+            # parameters", and compile_model would too).
+            model = ov.Model(model.get_results(),
+                             list(model.get_parameters()) + stub_param_nodes,
+                             "stubbed")
     if args.cut:
         hits = [n for n in model.get_ordered_ops() if n.get_friendly_name() == args.cut]
         if len(hits) != 1:
@@ -395,6 +471,8 @@ def main(argv=None):
         for kv in args.plugin_prop:
             k, _, v = kv.partition("=")
             props[k] = v
+        if args.kernel_names:
+            props["PERF_COUNT"] = "YES"
     say("compile", f"props {props}")
     t0 = time.time()
     try:
@@ -686,10 +764,20 @@ def main(argv=None):
             ("la.cache_interval", i32([0])),
         ]
         first = None
+        skipped = []
         for name, t in served:
+            if name not in declared:
+                # a --cut leg: the port was pruned with the layers that read
+                # it; feeding it would throw and end the leg before a single
+                # forward. Feed only what the cut graph declares.
+                skipped.append(name)
+                continue
             exc = feed(name, t)
             if exc is not None and first is None:
                 first = (name, exc)
+        if skipped:
+            say("forward", f"cut leg: {len(skipped)} served feed(s) not declared "
+                           f"after the cut, skipped: {skipped}")
         if first is not None:
             say("forward", f"SERVED PATH VERDICT: first refusal at set_tensor("
                            f"{first[0]}): {one_line(first[1])}")
@@ -706,7 +794,13 @@ def main(argv=None):
                            f"{table_rows0:,} rows/chunk; plus conv_mask=ones. "
                            f"THE DRIVER'S FEEDS, not the runtime's")
         for name, t in extras.items():
-            feed(name, t)
+            if name in declared:
+                feed(name, t)
+        for nm, arr in stub_feeds.items():
+            if nm in declared:
+                exc = feed(nm, ov.Tensor(arr))
+                if exc is not None and first is None:
+                    first = (nm, exc)
 
     unfed = sorted(set(declared) - set(fed))
     say("forward", f"fed {len(fed)}: {fed}")
@@ -723,6 +817,41 @@ def main(argv=None):
     # first forward is the served path's.
     state_names = [nm for nm in declared
                    if nm.startswith(("conv_state_table.", "gated_delta_state_table."))]
+
+    def digest_inputs(rq, label):
+        """INPUT-BIT-IDENTITY (campaign served-prefill-determinism, 2026-09-20,
+        reviewer request): hash the request's own input ports before a forward,
+        so 'inputs identical, output differs' is auditable rather than inferred."""
+        if not args.digest_ports:
+            return
+        import hashlib
+        names = [nm for nm in declared
+                 if nm in ("inputs_embeds", "conv_mask", "subsequence_begins")
+                 or nm.startswith(("conv_state_table.", "gated_delta_state_table.", "la."))]
+        for nm in names:
+            try:
+                t = rq.get_tensor(nm)
+            except Exception:                                     # noqa: BLE001
+                continue
+            try:
+                arr = np.asarray(t.data)
+            except Exception:                                     # noqa: BLE001
+                try:
+                    host = ov.Tensor(t.get_element_type(), t.get_shape())
+                    t.copy_to(host)
+                    arr = np.asarray(host.data)
+                except Exception as exc:                          # noqa: BLE001
+                    say("digest", f"{label} {nm}: unavailable ({one_line(exc)})")
+                    continue
+            d = hashlib.sha256(np.ascontiguousarray(arr).tobytes()).hexdigest()[:12]
+            if args.dump_state and nm.startswith(("conv_state_table.",
+                                                  "gated_delta_state_table.")):
+                from pathlib import Path as _P
+                dd = _P(args.dump_state); dd.mkdir(parents=True, exist_ok=True)
+                safe = label.replace(" ", "_").replace("#", "")
+                np.save(dd / f"{safe}_{nm}.npy", np.ascontiguousarray(arr))
+            say("digest", f"{label} {nm}: {d} shape {tuple(arr.shape)} "
+                          f"{arr.dtype} (stored bytes, no re-render)")
 
     def zero_state(rq, label):
         n_z = 0
@@ -750,6 +879,7 @@ def main(argv=None):
                      f"(copy_from a zero host tensor, as zero_paged_rows does)")
 
     zero_state(req, "forward #1")
+    digest_inputs(req, "forward #1")
     t0 = time.time()
     try:
         req.infer()
@@ -765,6 +895,16 @@ def main(argv=None):
                    f"finite={bool(np.isfinite(lg).all())} "
                    f"absmax={float(np.abs(lg).max()):.4e}")
     say("forward", f"argmax per position: {[int(r.argmax()) for r in rows]}")
+    digest_inputs(req, "post-forward #1")
+    if args.kernel_names:
+        try:
+            for pi in req.get_profiling_info():
+                et = getattr(pi, "exec_type", "?")
+                if et and et != "undef":
+                    say("kernel", f"{pi.node_name} | {pi.node_type} | exec {et} | "
+                                  f"{pi.real_time} | status {pi.status}")
+        except Exception as exc:                                  # noqa: BLE001
+            say("kernel", "profiling unavailable: " + one_line(exc))
 
     def dump_rows(k, arr):
         if not args.dump_logits:
@@ -821,6 +961,7 @@ def main(argv=None):
     for k in range(2, int(args.repeat) + 1):
         rk = fresh_request() if args.fresh else req
         zero_state(rk, f"repeat #{k}")
+        digest_inputs(rk, f"repeat #{k}")
         t0 = time.time()
         try:
             rk.infer()
@@ -829,6 +970,7 @@ def main(argv=None):
             break
         dt = time.time() - t0
         outk = rk.get_output_tensor(0).data if args.cut else rk.get_tensor("logits").data
+        digest_inputs(rk, f"post-repeat #{k}")
         cur = np.array(outk, dtype=np.float32).reshape(-1, outk.shape[-1])
         dump_rows(k, cur)
         if cur.shape != base.shape:
