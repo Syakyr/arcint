@@ -9372,7 +9372,7 @@ earlier, found in review); it has not recurred since the fix on either
 card. The plugin's tier cells run standalone in seconds without an
 `ENABLE_TESTS` build.
 
-#### 7.0.2cb The served path's run-to-run floor is a per-card defect: bit-identical on Alchemist, nondeterministic in the B60's GDN arithmetic (2026-09-20)
+#### 7.0.2cb The served path's run-to-run floor is a per-card defect: bit-identical on Alchemist, nondeterministic at the GDN state output on the B60 (2026-09-20)
 
 **What was measured.** [measured-here] The served Flash-Next path (depth 48,
 native artifact, ratio 99 + host tier, KV u8, f16, chunk 512) is **not run-to-run
@@ -9389,7 +9389,8 @@ max |diff| **0.000**. So `F_served = 0` there, the bound sits **above** the
 floor, and clause (d) closes with the **A770 as the measurement card**, while
 the B60's row stands as a per-card caveat, not a property of the served path.
 Caveat recorded rather than smoothed: the A770 arm is **×2**, not the x8/x12 of
-the d4/d12 evidence, and window-050 §4.11's *"the A770 steps once at an
+the **depth-4** evidence (both A770 rows in window-051's cut table are depth
+4; no A770 depth-12 leg exists on the record), and window-050 §4.11's *"the A770 steps once at an
 unpredictable forward"* is not refuted by two forwards — a repeat-8 arm was
 queued the same day.
 
@@ -9417,8 +9418,12 @@ state is stable every repeat. Fingerprint: `dim0 = row 0`, heads
 **[3,5,6,7,10,13,17,22,31,39,41,42,43,47]**, one f16 ulp (**9.7656e-4**),
 flip count **2423..3924**, head set invariant. The GDN state digest is
 stochastic (5 distinct hashes in one process; 1–4 among repeats in cold
-processes), and the **first** forward is reproducible across cold processes —
-which the serialization test proved is not a JIT or overlap effect.
+processes), and the **first** forward is reproducible across cold processes.
+[CORRECTED 2026-09-21: the serialization test refutes **overlap**, and the
+`ocloc` two-build diff refutes a **JIT** difference; neither explains why the
+first forward alone is reproducible — that remains OPEN, and the heading's
+"GDN arithmetic" is stronger than the evidence, which localises to the GDN
+STATE OUTPUT with its in-graph q/k/v producers never digested.]
 
 **The subgroup width is a correlate, not the mechanism.** [code, measured-here] The plugin
 JITs one GDN source and specializes the width per arch (`get_subgroup_size`:
@@ -9432,8 +9437,9 @@ variance.
 B60 needs the real mechanism or an upstream fix. (2) **In-tree selection is
 blocked:** `OV_GPU_FORCE_IMPLEMENTATIONS` requires `ENABLE_DEBUG_CAPS`, absent
 from the shipped plugin, so testing `ref` as a workaround needs a debug-caps
-build — the vendored packaging script was extended for exactly that (and made
-to refuse to install over the measurement plugin's prefix). (3) The defect is
+build — the vendored packaging script was extended for exactly that, with a
+guard that requires an explicit `OV_BUILD_PREFIX` (it does not itself reject
+the default install path; naming a distinct prefix is the caller's part). (3) The defect is
 reported upstream as a **sibling** of #38099 — same chunked-GatedDeltaNet
 family, different failure mode (run-to-run at execution level vs
 deterministic-wrong at chunk ≥ 2) — with the fingerprint and the negatives

@@ -31,7 +31,7 @@ so the gate closes there instead — see §3.
 | GPU/host residency mix is NOT the cause [measured-here] | force-the-tier floor **0.081553**, 137/1367 moved | `d48n-tieronly.bin` |
 | chunking is NOT the cause [measured-here] | unchunked `--prefill-chunk 0` is **worse**: **0.095497 / 0.202143** | `d48n-d4-unchunked.bin` |
 | **the A770 d48 served floor is ZERO** [measured-here] | r0↔r1 **-0.000000**, **0/1367 moved**, argmax 1.0000, `bit-identical True` (×2) | `d48n-a770-d48.bin` |
-| the defect is card-dependent [measured-here, code] | B60/Xe2 steps; **A770/acm is bit-identical** (×8/×12 at d4/d12, ×2 at d48) | `window-051.md` cut table |
+| the defect is card-dependent [measured-here, code] | B60/Xe2 steps; **A770/acm is bit-identical** (×8/×12 at **depth 4**, ×2 at depth 48) | `window-051.md` cut table |
 | depth brackets it [measured-here] | present at **depth 4** (layer2/out, logits) and **depth 12** (layer0/out, ple/out) | `window-051.md` cut table |
 | location, input-bit-identity proven [measured-here] | `layer0/mixer_out`; nine input ports bit-identical across 8 repeats, both state tables the all-zero hash, output differs every forward | peer session, `2026-09-20` |
 | **fingerprint** [measured-here] | `dim0 = row 0`; heads `[3,5,6,7,10,13,17,22,31,39,41,42,43,47]`; one f16 ulp `9.7656e-4`; flip count 2423..3924; head set invariant | peer session, `2026-09-20` |
@@ -65,7 +65,8 @@ clean) or upstream. A debug-caps rebuild is the only in-tree route to testing
 ## 2. The job: turn hours into seconds
 
 The 3,600 s per forward is **not the kernel under test** — it is 48 layers ×
-512 experts × the host tier × 2,735 tokens, plus an 80-minute artifact load.
+512 experts × the host tier × 2,735 tokens, plus a ~37-minute artifact load
+(the A770 leg, 2026-09-20: launch 14:22:12Z to its first counted forward).
 One block at the same shape is milliseconds. So build a **standalone graph of
 the suspect block** and run it twice, bit-exact-compared.
 

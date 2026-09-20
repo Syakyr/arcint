@@ -58,8 +58,9 @@ invariants below, not merely a measurement artefact.
 Against it, every bar in force is unreadable:
 `bar_0.5.1 = 3.0905e-03` (below 2051) sits **~44x under the floor**; even
 llama.cpp's own median error against the f32 reference (0.0649 w0 /
-0.0283 w1) is ~2x under it. Clause (d)'s own rule therefore fires: the row
-reads **UNREADABLE, not PASS**.
+0.0283 w1) is ~2x under it on window 0 and ~5x under it on window 1. Clause
+(d)'s own rule therefore fires: the row reads **UNREADABLE, not PASS** on the
+B60.
 
 ## Known against hypothesised
 
@@ -269,7 +270,7 @@ for a number does not close.
   (a) the **A770 as the measurement card** (bit-identical, a decision, zero
   code), or (b) the layer-0 **kernel named and pinned** (emitter cut names,
   then the seconds-scale reproducer in the handoff).
-- 2026-09-20 (peer session `01a0be61`, **one level deeper — the mechanism is
+- 2026-09-20 (the **peer session**, **one level deeper — the mechanism is
   named**): the B60-vs-A770 difference is the **GDN subgroup width**. The
   plugin JITs ONE source and specializes per arch:
   `ocl_v2/paged_gated_delta_net.cpp::get_subgroup_size()` returns 8 for
@@ -331,11 +332,14 @@ for a number does not close.
   B60's floors (0.1361/0.1512 headline, D2 0.072601/0.073234, force-the-tier
   0.081553, D4 unchunked 0.095497/0.202143) are therefore a **per-card
   defect**, and the width localisation above says which card and why.
-  Caveats kept: **×2 only** (the d4/d12 evidence is ×8/×12; §4.11's "A770
-  steps once at an unpredictable forward" is not refuted by two forwards — a
-  repeat-8 A770 arm is the follow-on), and the A770 is the **measurement**
-  card, not the deployment card: the B60 becomes readable only if the one-line
-  `SUBGROUP_SIZE 8` pin for `xe2` makes it deterministic. Peers' arms are open:
+  Caveats kept: **×2 only** (the **depth-4** evidence is ×8/×12 — both A770
+  rows in window-051's cut table are depth 4, no A770 depth-12 leg exists;
+  §4.11's "A770 steps once at an unpredictable forward" is not refuted by two
+  forwards — a repeat-8 A770 arm is the follow-on), and the A770 is the
+  **measurement** card, not the deployment card. [CORRECTED 2026-09-20: the
+  width pin is **DEAD** (`xe2` requires 16), so the B60 is not made readable
+  that way — it is a per-card caveat until the within-kernel mechanism is
+  found or upstream fixes it.] Peers' arms are open:
   width-only `xe2` disasm, `--digest-ports` repeat-8, `FORCE_IMPLEMENTATIONS`,
   width-pin rebuild + B60 r0↔r1.
 - 2026-09-20 (**CORRECTION — the width is not the mechanism, and the pin is
@@ -696,7 +700,9 @@ for a number does not close.
   own input ports (`inputs_embeds`, `conv_mask`, `subsequence_begins`, `la.*`,
   both state tables) before each forward, giving the INPUT-BIT-IDENTITY proof:
   if those are identical across repeats while the cut output differs, the
-  divergence is provably internal to the kernel. To run on the deferred B60
+  divergence is provably internal to the kernel. [CORRECTED 2026-09-21: the
+  primary read path is `t.data` on the request's own tensor; `copy_to` is the
+  fallback for a remote one. Same bytes either way.] To run on the deferred B60
   arms behind the A770 gate leg.
 - 2026-09-20 — **two refinements to the controls [code + measured-here]**: (a)
   `--digest-ports` hashes the STORED bytes of each port (a host tensor of the

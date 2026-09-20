@@ -19,7 +19,7 @@
 set -euo pipefail
 
 PIN=71640275
-PATCHLEVEL=marfrit-p19         # appended to the version string, so a loaded
+PATCHLEVEL=marfrit-p19-debugcaps  # appended to the version string, so a loaded
                               # runtime says out loud that it is patched.
                               # The build-number FIELD must stay numeric:
                               # ov_parse_ci_build_number wants -([0-9]+)- and
@@ -37,6 +37,10 @@ PREFIX=${OV_BUILD_PREFIX:-$HOME/ovinstall}
 # configure flips ENABLE_*DEBUG_CAPS in that build dir in place.
 if [ -z "${OV_BUILD_PREFIX:-}" ]; then
     echo "refusing to run: export OV_BUILD_PREFIX (and preferably OV_SRC) to a path that is NOT the measurement plugin's install prefix" >&2
+    exit 2
+fi
+if [ "$OV_BUILD_PREFIX" = "$HOME/ovinstall" ]; then
+    echo "refusing to run: OV_BUILD_PREFIX is the measurement plugin's default install path ($HOME/ovinstall); name a distinct prefix" >&2
     exit 2
 fi
 HERE=$(dirname "$(readlink -f "$0")")
@@ -94,4 +98,4 @@ case "$V" in
     *"$PATCHLEVEL"*) log "Version string names the patch level, good" ;;
     *) echo "Version string does not name the patch level: $V" >&2; exit 1 ;;
 esac
-log "Installed to $PREFIX — now run build-deb.sh"
+log "Installed to $PREFIX — a DEBUG-CAPS variant; do NOT package it with build-deb.sh (it exists only to make debug options selectable)"

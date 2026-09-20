@@ -55,6 +55,10 @@ differ between replays.
   is internally consistent.
 - **H2 — kernel/config selection.** GPU kernel or tuning selection varying
   between forwards, or the `ocl:ref` fallback path mixing with the fast path.
+  [CORRECTED 2026-09-20: **REFUTED** — the JIT output is byte-identical
+  (`ocloc` twice on the captured bucket) and the dispatch geometry is derived
+  from static shapes only (`!params.is_dynamic()` asserted), so neither kernel
+  selection nor tuning varies between forwards.]
 - **H3 — thread order.** The tier's worker threads reordering a reduction.
   Weak by construction: 0011's kernel accumulates each expert's dot in a
   **fixed** chain per column (multiple accumulators combined in a fixed
@@ -79,8 +83,10 @@ tolerance gate). D1 therefore measures the *floor*, not an equality.
 
 `F_served ≤ bar_0.5.1` on both capture windows, by the existing floor
 instrument (`KL(A‖B)` over ≥ 2 replays), with the decided bound printed beside
-it. Today the floor is ~44x the bound, so the gate is RED by clause (d)'s
-UNREADABLE rule. **The gate is about reproducibility, not fidelity.**
+it. Today the floor is ~44x the bound **on the B60**, so the gate is RED there
+by clause (d)'s UNREADABLE rule. [CORRECTED 2026-09-20: on the **A770** the
+floor is **0** (bit-identical r0↔r1), so the gate **READS** on that card; the
+floor is per-card.] **The gate is about reproducibility, not fidelity.**
 
 ## Entry criteria
 
@@ -94,12 +100,15 @@ UNREADABLE rule. **The gate is about reproducibility, not fidelity.**
 
 ## Scope — in / out
 
-**In:** the determinism of *which* numeric path an expert takes (residency /
-slot-pool state); a single-chunk gate arm; a red-first cell that fails when
-two forwards of the same ids differ.
-**Out:** the tier kernel's arithmetic (fixed and deliberate); the model-quality
-term (inside the floor); the f16-state/attention hypotheses (falsified by the
-artifact IR); #37607's cache path (closed-not-fixed, its own workaround).
+**In:** [CORRECTED 2026-09-20: the residency/slot-pool determinism and the
+single-chunk gate arm are **REFUTED** — force-the-tier leaves 0.081553 and the
+unchunked arm is WORSE at 0.095497/0.202143.] a red-first cell that fails when
+two forwards of the same ids differ; the within-kernel GDN nondeterminism on
+Xe2 (location and fingerprint in the campaign).
+**Out:** the tier kernel's arithmetic (fixed and deliberate) as a *cause*;
+the model-quality term (inside the floor); the f16-state/attention hypotheses
+(falsified by the artifact IR); #37607's cache path (closed-not-fixed, its own
+workaround).
 
 ## Where it lives
 
@@ -192,8 +201,10 @@ different class (`[code]`, `[paper]`).
 - 2026-09-20 (**A770 floor = 0** [measured-here]): the A770 depth-48 served
   path is bit-identical (r0↔r1, 0/1367 moved, argmax 1.0000, maxdiff 0.000),
   so `F_served = 0` there and BERLIN-001 clause (d) reads READABLE on the A770
-  as the measurement card. Caveats kept: it is **×2** (the d4/d12 evidence is
-  x8/x12) and §4.11's "A770 steps once" is not refuted by two forwards — a
+  as the measurement card. Caveats kept: it is **×2** (the depth-4 evidence is
+  x8/x12 — both A770 rows in window-051's cut table are depth 4; no A770
+  depth-12 leg exists on the record) and §4.11's "A770 steps once" is not
+  refuted by two forwards — a
   repeat-8 A770 arm is queued.
 - 2026-09-20 (**CORRECTION: the width is a correlate, the pin is DEAD**
   [code, measured-here]): `xe2` requires subgroup size 16

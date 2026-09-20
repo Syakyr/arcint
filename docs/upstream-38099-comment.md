@@ -8,7 +8,7 @@ Offered as a **sibling** of this issue, not a duplicate. #38099 reports **determ
 - IGC **2.38.2** (`libigc.so.2.38.2+1782393643`), `ocloc` from `/usr/bin`
 - Kernel **7.0.14-12-pve** (Debian 13), `xe` driver (`srcversion 898B416572903DCE3B55D5E`)
 - Device: **Arc Pro B60 = `bmg-g21` = OpenVINO `GPU.0`**, f16, `ocl::paged_gated_delta_net::opt`, prefill chunk 512
-- Model: a 48-layer hybrid whose remaining 12 layers are GDN (linear) attention; T = 1024 in the cut arms below
+- Model: a 48-layer hybrid with **36 GDN (linear-attention) layers and 12 full-attention layers** (full attention every 4th layer); the cut arms below are **single 1024-token forwards** (unchunked), not the served chunk-512 prefill
 - **Control:** the same bytes, the same request and the same harness on an **Arc A770 (`acm-g12`, `GPU.1`)** are **bit-identical** across repeats. The defect is Xe2-specific.
 
 ### Observation
