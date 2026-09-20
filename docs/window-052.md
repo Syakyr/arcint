@@ -25,9 +25,21 @@ selection from an expert-access census; eviction/refresh discipline.
   (`campaigns/serving-shape-logits.md:30`), not a d48g decode rate — no d48g
   decode rate is on the record, and the 48-layer tier measures 0.5-0.8 t/s.
   Re-pin G from a measured d48 rate before stating it.] The native
-  scalar-tier route is 0.6 t/s (`d48n`); G is a multiple of a host-bound
+  scalar-tier route is 0.6 t/s (`d48n`) [2026-09-21: that 0.6 t/s point lies
+  inside the measured 0.5–0.8 t/s band — it is not a third baseline]; G is a
+  multiple of a host-bound
   baseline and is
   stated here before measuring.
+  [CORRECTED 2026-09-21: the host-bound baseline is now FIXED at the measured
+  `d48n` host-tier rate, **0.5–0.8 t/s** (B60, ratio 99 + tier, KV u8, f16,
+  chunk 512; `measured-here`). **G itself stays UNPINNED**, and the speed row
+  stays EMPTY rather than PASS, because the native artifact runs every routed
+  expert on the scalar host tier (patch 0043: the fused kernels refuse the
+  native formats), so residency alone moves no compute. G is pinned in a dated
+  prediction commit before the speed leg, once a measured resident-compute rate
+  exists — named dependency `sub4bit-vram-kernel` step 3, the OpenCL decode.
+  Campaign: `docs/campaigns/expert-hot-set-lru.md`. No measured row is filled
+  here.]
 
 ## The bar in force
 
@@ -43,7 +55,7 @@ nothing here. Any KL reading must print `F_served` beside it; a bar below
 
 | quantity | predicted | measured |
 |---|---|---|
-| warm-up decode vs the host-bound baseline | ≥ G × (23.6 t/s), G stated before the run | EMPTY |
+| warm-up decode vs the host-bound baseline | ≥ G × (measured d48n 0.5–0.8 t/s), G stated before the run; G UNPINNED today (see Entry criteria) | EMPTY |
 | stale-byte zero proof | digest(host-bound bytes of expert E) == digest(card-bound bytes of the same E), every E in the hot set | EMPTY |
 | convergence | rounds-to-plateau printed with the census | EMPTY |
 | quality under policy | no greedy digest change vs the pre-policy served answer | EMPTY |
@@ -81,3 +93,12 @@ nothing here. Any KL reading must print `F_served` beside it; a bar below
 - 2026-09-19: drafted as VENICE-001's acceptance commit; every measured row
   EMPTY. **NOT committed** — `CLAUDE.md` requires Fable review before every
   commit, and the tag path is the operator's.
+- 2026-09-21: registered the campaign `docs/campaigns/expert-hot-set-lru.md`
+  (row added to `docs/campaigns/README.md`) and the census-instrument design
+  `docs/design-expert-hot-set-lru.md`. Corrected the host-bound baseline in
+  place to the measured `d48n` rate (0.5–0.8 t/s) and marked **G UNPINNED**
+  until a resident-compute path exists (patch 0043 runs every native-format
+  expert on the host tier). This document was committed as `eaa7a06`
+  (2026-09-19) — the 2026-09-19 entry's "NOT committed" is superseded by
+  that commit, recorded here rather than rewritten. **No measured row filled;
+  no policy code.**

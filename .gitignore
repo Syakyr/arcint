@@ -7,6 +7,7 @@ CLAUDE.local.md
 *.local.md
 .claude/*
 !.claude/settings.json
+.pi/*
 *.local.md.tmp.*
 *.local.md.bak*
 review.md
