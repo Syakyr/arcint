@@ -433,7 +433,8 @@ def layer_key_index_map(layer_keys, explicit=None):
     return inv
 
 
-def call_trace_to_v1(call_rows, layer_key_map=None, skip_batched=False):
+def call_trace_to_v1(call_rows, layer_key_map=None, skip_batched=False,
+                     from_seq=0):
     """Convert a patch-0044 per-call trace to format v1.
 
     Decode (T=1) rows: every call carries exactly one `top_k` chunk. Tokens are
@@ -449,18 +450,24 @@ def call_trace_to_v1(call_rows, layer_key_map=None, skip_batched=False):
     in which *every* call was batched is REFUSED rather than converted to an
     empty census. An empty call list stays an empty conversion.
 
+    `from_seq` drops every call with `call_seq < from_seq` before conversion.
+    It is the corpus floor: a served process records the load-time plateau /
+    activation probes too (they route experts through the same provider), and
+    those calls are not the corpus. The caller passes the call count recorded
+    at the instant the corpus request was posted.
+
     A skipped prefill that ended mid-sequence is undetectable from the trace
     alone, so token labels after it are a reconstruction: aggregate counts do
     not depend on them, the LRU/plateau do.
     """
-    keys = [r[1] for r in call_rows]
-    lk_index = layer_key_index_map(keys, layer_key_map)
+    selected = [r for r in call_rows if r[0] >= from_seq]
+    lk_index = layer_key_index_map([r[1] for r in selected], layer_key_map)
     rows = []
     tok = 0
     seen = set()
     skipped_calls = 0
     skipped_tokens = 0
-    for _seq, lk, top_k, ids in sorted(call_rows, key=lambda r: r[0]):
+    for _seq, lk, top_k, ids in sorted(selected, key=lambda r: r[0]):
         chunks = split_topk_chunks(ids, top_k)
         if len(chunks) != 1:
             if not skip_batched:
@@ -476,7 +483,7 @@ def call_trace_to_v1(call_rows, layer_key_map=None, skip_batched=False):
             seen = set()
         seen.add(lk)
         rows.append((tok, lk_index[lk], sorted(chunks[0])))
-    if call_rows and not rows:
+    if selected and not rows:
         raise ValueError(
             f"no decode rows in the call trace: all {skipped_calls} call(s) "
             f"carried more than one token's ids; refusing to emit an empty "
@@ -484,8 +491,91 @@ def call_trace_to_v1(call_rows, layer_key_map=None, skip_batched=False):
     rows.sort(key=lambda r: (r[0], r[1]))
     return rows, {"tokens": (tok + 1) if rows else 0, "layer_keys": len(lk_index),
                   "calls": len(call_rows),
+                  "calls_selected": len(selected),
+                  "from_call_seq": from_seq,
                   "batched_calls_skipped": skipped_calls,
                   "batched_tokens_skipped": skipped_tokens}
+
+
+def census_from_call_trace(call_rows, layer_key_map=None, from_seq=0):
+    """[(layer, expert, count)] over EVERY routed id of every selected call.
+
+    This is the aggregate census, and it is derived from the call trace
+    itself, NOT from the decode-only v1 rows: a batched prefill call carries
+    many tokens' ids and the aggregate needs no token label, so every id of
+    every call with `call_seq >= from_seq` is one routed access. `call_trace_
+    to_v1` remains the decode-only converter for the row-level consumers
+    (LRU replay, rounds-to-plateau), whose token labels are a reconstruction.
+
+    Returns `(summary, meta)`; `summary` is sorted by `(layer, expert)` in the
+    trace's decoder-layer space (ascending export order by default).
+    """
+    calls = len(call_rows)
+    selected_rows = [r for r in call_rows if r[0] >= from_seq]
+    if not selected_rows:
+        what = ("the call trace is empty" if calls == 0
+                else f"call_seq >= {from_seq} selects none of the {calls} "
+                     f"call(s)")
+        raise ValueError(
+            f"{what}; refusing to emit an empty census (not a census)")
+    lk_index = layer_key_index_map([r[1] for r in selected_rows], layer_key_map)
+    hist = defaultdict(int)
+    selected = batched = decode = tokens = accesses = 0
+    for _seq, lk, top_k, ids in selected_rows:
+        selected += 1
+        chunks = split_topk_chunks(ids, top_k)
+        if len(chunks) > 1:
+            batched += 1
+        else:
+            decode += 1
+        tokens += len(chunks)
+        li = lk_index[lk]
+        for e in ids:
+            hist[(li, e)] += 1
+            accesses += 1
+    summary = [(lay, e, hist[(lay, e)]) for (lay, e) in sorted(hist)]
+    meta = {"calls": calls, "calls_selected": selected,
+            "batched_calls": batched, "decode_calls": decode,
+            "tokens_observed": tokens, "accesses": accesses,
+            "from_call_seq": from_seq, "layers": len(lk_index)}
+    return summary, meta
+
+
+def join_plugin_to_call_trace(call_rows, plugin_rows, from_seq=0):
+    """Cross-check patch 0013's CSV against the call-trace census on
+    `(weight_offset, expert)`.
+
+    The call trace already carries the raw `layer_key` (patch 0018's
+    weight-file offset, the same value patch 0013 writes as `weight_offset`),
+    so this join needs no export-order assumption and no decoder-index map.
+    Returns `(plugin_counts, trace_counts, mismatches)` keyed by
+    `(layer_key, expert)`; a mismatch is a key whose counts differ or which is
+    absent on one side.
+    """
+    plugin = defaultdict(int)
+    for _lay, off, e, c in plugin_rows:
+        plugin[(off, e)] += c
+    trace = defaultdict(int)
+    for seq, lk, _top_k, ids in call_rows:
+        if seq < from_seq:
+            continue
+        for e in ids:
+            trace[(lk, e)] += 1
+    keys = sorted(set(plugin) | set(trace))
+    mismatches = [(k, plugin.get(k, 0), trace.get(k, 0))
+                  for k in keys if plugin.get(k, 0) != trace.get(k, 0)]
+    return plugin, trace, mismatches
+
+
+def require_attribution(prov):
+    """Refuse a provenance dict missing a non-empty artifact and card."""
+    artifact = prov.get("artifact_sha256") or prov.get("artifact")
+    if not artifact or not prov.get("card"):
+        raise ValueError(
+            "provenance must carry a non-empty artifact_sha256= (or artifact=) "
+            "and card= -- the plugin cannot know either, so the harness "
+            "injects them; refusing to write an unattributable census")
+    return artifact
 
 
 def read_provenance_file(path):
@@ -585,6 +675,57 @@ def _cmd_plateau(args):
     return 0
 
 
+def _cmd_census_from_call_trace(args):
+    call_rows = parse_call_trace(args.call_trace)
+    layer_keys = None
+    if args.layer_keys:
+        with open(args.layer_keys, encoding="utf-8") as f:
+            raw = json.load(f)
+        layer_keys = {int(k): int(v) for k, v in raw.items()}
+    prov = read_provenance_file(args.provenance)
+    require_attribution(prov)
+    summary, meta = census_from_call_trace(call_rows, layer_keys, args.from_call_seq)
+    lines = ["# census summary (patch 0044 call trace; batched calls counted)"]
+    for k, v in prov.items():
+        lines.append(f"# {k}={v}")
+    for k, v in meta.items():
+        lines.append(f"# {k}={v}")
+    lines.append("layer,expert,count")
+    total = 0
+    for lay, e, c in summary:
+        lines.append(f"{lay},{e},{c}")
+        total += c
+    lines.append(f"# total,{total}")
+    text = "\n".join(lines) + "\n"
+    if args.out:
+        with open(args.out, "w", encoding="utf-8") as f:
+            f.write(text)
+        print(f"wrote {args.out}: {len(summary)} cells, total {total}, "
+              f"{meta['calls_selected']} call(s) selected of {meta['calls']} "
+              f"({meta['batched_calls']} batched, {meta['decode_calls']} decode)")
+    else:
+        sys.stdout.write(text)
+    return 0
+
+
+def _cmd_join_plugin_call_trace(args):
+    call_rows = parse_call_trace(args.call_trace)
+    plugin_rows = read_plugin_csv(args.csv)
+    plugin, trace, mismatches = join_plugin_to_call_trace(
+        call_rows, plugin_rows, args.from_call_seq)
+    print(f"# join on (weight_offset=layer_key, expert); from_call_seq={args.from_call_seq}")
+    print("# mismatches are keys where patch 0013's ALL-call CSV and the floored "
+          "call-trace census disagree (the pre-floor/probe share when "
+          "--from-call-seq > 0), not an instrument fault")
+    print(f"plugin_keys={len(plugin)} trace_keys={len(trace)} "
+          f"mismatches={len(mismatches)}")
+    for (lk, e), pc, tc in mismatches[:40]:
+        print(f"{lk},{e},{pc},{tc}")
+    if len(mismatches) > 40:
+        print(f"... ({len(mismatches) - 40} more)")
+    return 0
+
+
 def _cmd_plugin_csv(args):
     rows = read_plugin_csv(args.csv)
     print(f"rows={len(rows)} total={sum(r[3] for r in rows)}")
@@ -603,18 +744,15 @@ def _cmd_from_call_trace(args):
             raw = json.load(f)
         layer_keys = {int(k): int(v) for k, v in raw.items()}
     prov = read_provenance_file(args.provenance)
-    artifact = prov.get("artifact_sha256") or prov.get("artifact")
-    if not artifact or not prov.get("card"):
-        raise ValueError(
-            f"provenance file {args.provenance} must carry a non-empty "
-            f"artifact_sha256= (or artifact=) and card= -- the plugin cannot "
-            f"know either, so the harness injects them; refusing to write an "
-            f"unattributable census")
+    require_attribution(prov)
     rows, rep = call_trace_to_v1(call_rows, layer_keys,
-                                 skip_batched=args.skip_batched)
+                                 skip_batched=args.skip_batched,
+                                 from_seq=args.from_call_seq)
     prov = OrderedDict(list(prov.items()) + [
         ("source", "plugin-0044-call-trace"),
         ("calls", rep["calls"]),
+        ("calls_selected", rep["calls_selected"]),
+        ("from_call_seq", rep["from_call_seq"]),
         ("batched_calls_skipped", rep["batched_calls_skipped"]),
         ("batched_tokens_skipped", rep["batched_tokens_skipped"]),
         ("tokens", rep["tokens"]),
@@ -689,10 +827,34 @@ def build_parser():
     p.add_argument("--skip-batched", action="store_true",
                    help="skip (and report) a batched prefill call instead of refusing; "
                         "an all-batched trace is still refused")
+    p.add_argument("--from-call-seq", type=int, default=0,
+                   help="drop calls with call_seq below this floor (the corpus start; "
+                        "excludes the load-time probe calls)")
     p.add_argument("--out", default="")
     p.add_argument("--layer-keys", default="",
                    help="JSON decoder-index -> layer_key map; default is ascending export order")
     p.set_defaults(func=_cmd_from_call_trace)
+
+    p = sub.add_parser("census-from-call-trace",
+                       help="the aggregate census (every call's ids, batched included) "
+                            "from patch 0044's per-call trace")
+    p.add_argument("--call-trace", required=True)
+    p.add_argument("--provenance", required=True,
+                   help="harness-written key=value file; must carry a NON-EMPTY "
+                        "artifact_sha256= (or artifact=) and card=")
+    p.add_argument("--from-call-seq", type=int, default=0,
+                   help="count only calls with call_seq >= this floor")
+    p.add_argument("--out", default="")
+    p.add_argument("--layer-keys", default="")
+    p.set_defaults(func=_cmd_census_from_call_trace)
+
+    p = sub.add_parser("join-plugin-call-trace",
+                       help="join patch 0013's CSV to the call-trace census on "
+                            "(weight_offset=layer_key, expert)")
+    p.add_argument("--call-trace", required=True)
+    p.add_argument("--csv", required=True)
+    p.add_argument("--from-call-seq", type=int, default=0)
+    p.set_defaults(func=_cmd_join_plugin_call_trace)
     return ap
 
 

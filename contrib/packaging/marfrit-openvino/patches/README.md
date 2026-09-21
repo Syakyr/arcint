@@ -946,7 +946,8 @@ string. NOTE: that stamp is deliberately left at `p19`, which the packaging
 record already uses for patches 0003-0043, so the stamp alone cannot tell a
 0044 build from a 0043 one; the trace build is identified by its
 `routing_trace` symbol, and a future window must cite the symbol, not only
-the version string. The offline cells are 52 green (`tools/test_hot_set_census.py`).
+the version string. The offline cells are 66 green (`tools/test_hot_set_census.py`,
+including the corpus-split census and the raw-`layer_key` join).
 OWED: the served card window (the census's own authority) and its
 stability statement; the measurement plugin and the debug-caps install are
 untouched, the new plugin lives in its own prefix.

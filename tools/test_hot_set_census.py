@@ -520,6 +520,202 @@ class TestCallTrace(unittest.TestCase):
             self.assertEqual(len(hc.parse_trace(out)), 3)
 
 
+class TestCallTraceCensus(unittest.TestCase):
+    """The aggregate census is derived from the CALL TRACE, not the
+    decode-only v1 rows: batched prefill ids count, and the load-time probe
+    calls are excluded by a call_seq floor."""
+
+    ROWS = [(0, 100, 2, [1, 2, 3, 4]),   # batched prefill, 2 tokens
+            (1, 100, 2, [5, 6]),         # decode
+            (2, 200, 2, [7, 8])]         # decode
+
+    def test_census_counts_every_batched_id(self):
+        # A census that kept only the first chunk of the batched call (the
+        # `call_trace_to_v1` behaviour) would count 6 accesses, not 8; ids 3
+        # and 4 are the second chunk and MUST be present.
+        summary, meta = hc.census_from_call_trace(self.ROWS)
+        self.assertEqual(meta["accesses"], 8)
+        self.assertEqual(meta["tokens_observed"], 4)
+        self.assertEqual(meta["batched_calls"], 1)
+        self.assertEqual(meta["decode_calls"], 2)
+        counts = {(lay, e): c for lay, e, c in summary}
+        self.assertEqual(counts[(0, 3)], 1)
+        self.assertEqual(counts[(0, 4)], 1)
+        self.assertEqual(counts[(0, 5)], 1)
+        self.assertEqual(counts[(0, 6)], 1)
+        # layer 200 is decoder index 1 (export order of the observed keys)
+        self.assertEqual(counts[(1, 7)], 1)
+        self.assertEqual(counts[(1, 8)], 1)
+
+    def test_census_from_seq_excludes_the_probe_calls(self):
+        # call_seq 0 is the load-time probe call; from_seq=1 drops it, and the
+        # dropped ids must be ABSENT from the summary -- a share the corpus
+        # census must not inherit.
+        summary, meta = hc.census_from_call_trace(self.ROWS, from_seq=1)
+        self.assertEqual(meta["calls"], 3)
+        self.assertEqual(meta["calls_selected"], 2)
+        self.assertEqual(meta["accesses"], 4)
+        self.assertEqual(meta["batched_calls"], 0)
+        ids = {e for _l, e, _c in summary}
+        self.assertEqual(ids, {5, 6, 7, 8})
+
+    def test_census_and_v1_summary_diverge_when_a_batched_call_is_present(self):
+        # The census counts the batched call's ids 1..4; the decode-only v1
+        # summary (skip_batched) does not. An implementation that derived the
+        # census from the v1 rows would wrongly AGREE here, so this cell is
+        # red against exactly that implementation.
+        summary, _meta = hc.census_from_call_trace(self.ROWS)
+        v1, _rep = hc.call_trace_to_v1(self.ROWS, skip_batched=True)
+        self.assertNotEqual(summary, hc.canonical_summary(v1))
+        self.assertLess(sum(c for _l, _e, c in hc.canonical_summary(v1)),
+                        sum(c for _l, _e, c in summary))
+
+    def test_census_floor_beyond_all_calls_is_refused_not_written_empty(self):
+        # A one-too-high harness call_seq floor must fail loudly, not write a
+        # `# total,0` "census" -- the same rule the converter applies to an
+        # all-batched trace.
+        with self.assertRaises(ValueError):
+            hc.census_from_call_trace(self.ROWS, from_seq=99)
+
+    def test_census_on_an_empty_call_trace_is_refused(self):
+        # An emitter that wrote nothing is not a census; refuse rather than
+        # exit 0 with `# total,0`.
+        with self.assertRaises(ValueError):
+            hc.census_from_call_trace([])
+
+    def test_join_plugin_to_call_trace_matches_on_layer_key(self):
+        plugin_rows = [(0, 100, 1, 1), (0, 100, 2, 1), (0, 100, 3, 1),
+                       (0, 100, 4, 1), (0, 100, 5, 1), (0, 100, 6, 1),
+                       (1, 200, 7, 1), (1, 200, 8, 1)]
+        _p, _t, mismatches = hc.join_plugin_to_call_trace(self.ROWS, plugin_rows)
+        self.assertEqual(mismatches, [])
+
+    def test_join_plugin_to_call_trace_fires_on_one_wrong_count(self):
+        plugin_rows = [(0, 100, 1, 1), (0, 100, 2, 1), (0, 100, 3, 1),
+                       (0, 100, 4, 1), (0, 100, 5, 1), (0, 100, 6, 1),
+                       (1, 200, 7, 1), (1, 200, 8, 2)]   # perturbed
+        _p, _t, mismatches = hc.join_plugin_to_call_trace(self.ROWS, plugin_rows)
+        self.assertEqual(len(mismatches), 1)
+        self.assertEqual(mismatches[0][0], (200, 8))
+
+    def test_join_plugin_to_call_trace_from_seq_shows_the_probe_delta(self):
+        # With the corpus floor on, the probe-only ids are on the CSV side
+        # only: the mismatch is exactly the probe's share, by key.
+        plugin_rows = [(0, 100, 1, 1), (0, 100, 2, 1), (0, 100, 3, 1),
+                       (0, 100, 4, 1), (0, 100, 5, 1), (0, 100, 6, 1),
+                       (1, 200, 7, 1), (1, 200, 8, 1)]
+        _p, _t, mismatches = hc.join_plugin_to_call_trace(
+            self.ROWS, plugin_rows, from_seq=1)
+        self.assertEqual(sorted(k for k, _pc, _tc in mismatches),
+                         [(100, 1), (100, 2), (100, 3), (100, 4)])
+
+    def test_census_from_call_trace_cli_writes_a_summary(self):
+        with tempfile.TemporaryDirectory() as d:
+            calls = os.path.join(d, "c.trace")
+            out = os.path.join(d, "census.csv")
+            prov = os.path.join(d, "prov.txt")
+            with open(calls, "w") as f:
+                f.write("0 100 2 1 2 3 4\n1 100 2 5 6\n2 200 2 7 8\n")
+            with open(prov, "w") as f:
+                f.write("# artifact=d48n card=A770 kv=u8\n")
+            rc = hc.main(["census-from-call-trace", "--call-trace", calls,
+                          "--provenance", prov, "--out", out])
+            self.assertEqual(rc, 0)
+            text = open(out).read()
+            self.assertIn("layer,expert,count", text)
+            self.assertIn("# total,8", text)
+            self.assertIn("# batched_calls=1", text)
+            self.assertIn("# calls_selected=3", text)
+
+    def test_census_from_call_trace_cli_refuses_missing_attribution(self):
+        with tempfile.TemporaryDirectory() as d:
+            calls = os.path.join(d, "c.trace")
+            prov = os.path.join(d, "prov.txt")
+            with open(calls, "w") as f:
+                f.write("0 100 2 3 4\n")
+            with open(prov, "w") as f:
+                f.write("# artifact=d48n\n")          # no card=
+            with self.assertRaises(ValueError):
+                hc.main(["census-from-call-trace", "--call-trace", calls,
+                         "--provenance", prov])
+
+    def test_from_call_trace_cli_from_call_seq_drops_a_pre_floor_decode_call(self):
+        # The pre-floor call (seq 0) is a DECODE call, so --skip-batched does
+        # not remove it; only the floor does. An implementation that ignored
+        # from_seq in call_trace_to_v1 would emit three rows here, not two.
+        with tempfile.TemporaryDirectory() as d:
+            calls = os.path.join(d, "c.trace")
+            out = os.path.join(d, "v1.trace")
+            prov = os.path.join(d, "prov.txt")
+            with open(calls, "w") as f:
+                f.write("0 100 2 1 2\n1 100 2 3 4 5 6\n2 100 2 7 8\n3 200 2 9 10\n")
+            with open(prov, "w") as f:
+                f.write("# artifact=d48n card=A770\n")
+            rc = hc.main(["from-call-trace", "--call-trace", calls,
+                          "--provenance", prov, "--skip-batched",
+                          "--from-call-seq", "1", "--out", out])
+            self.assertEqual(rc, 0)
+            self.assertEqual(hc.parse_trace(out), [(0, 0, [7, 8]), (0, 1, [9, 10])])
+            self.assertEqual(hc.read_provenance(out)["from_call_seq"], "1")
+
+    def test_census_from_call_trace_cli_from_call_seq_reports_the_floor(self):
+        with tempfile.TemporaryDirectory() as d:
+            calls = os.path.join(d, "c.trace")
+            out = os.path.join(d, "census.csv")
+            prov = os.path.join(d, "prov.txt")
+            with open(calls, "w") as f:
+                f.write("0 100 2 1 2 3 4\n1 100 2 5 6\n2 200 2 7 8\n")
+            with open(prov, "w") as f:
+                f.write("# artifact=d48n card=A770\n")
+            rc = hc.main(["census-from-call-trace", "--call-trace", calls,
+                          "--provenance", prov, "--from-call-seq", "1",
+                          "--out", out])
+            self.assertEqual(rc, 0)
+            text = open(out).read()
+            self.assertIn("# total,4", text)
+            self.assertIn("# calls_selected=2", text)
+            self.assertIn("# from_call_seq=1", text)
+            self.assertNotIn("0,3,1", text)          # the probe ids are gone
+
+    def test_join_plugin_call_trace_cli_reports_zero_mismatches(self):
+        with tempfile.TemporaryDirectory() as d:
+            calls = os.path.join(d, "c.trace")
+            csv = os.path.join(d, "hist.csv")
+            with open(calls, "w") as f:
+                f.write("0 100 2 1 2 3 4\n1 100 2 5 6\n2 200 2 7 8\n")
+            with open(csv, "w") as f:
+                f.write("layer,weight_offset,expert,count\n")
+                for e in (1, 2, 3, 4, 5, 6):
+                    f.write(f"0,100,{e},1\n")
+                f.write("1,200,7,1\n1,200,8,1\n# total,8\n")
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = hc.main(["join-plugin-call-trace", "--call-trace", calls,
+                              "--csv", csv])
+            self.assertEqual(rc, 0)
+            self.assertIn("mismatches=0", buf.getvalue())
+
+    def test_join_plugin_call_trace_cli_flags_the_floor_delta(self):
+        # With the corpus floor on, the probe ids sit only on the CSV side:
+        # the CLI must report a nonzero mismatch count, not a silent agree.
+        with tempfile.TemporaryDirectory() as d:
+            calls = os.path.join(d, "c.trace")
+            csv = os.path.join(d, "hist.csv")
+            with open(calls, "w") as f:
+                f.write("0 100 2 1 2 3 4\n1 100 2 5 6\n2 200 2 7 8\n")
+            with open(csv, "w") as f:
+                f.write("layer,weight_offset,expert,count\n")
+                for e in (1, 2, 3, 4, 5, 6):
+                    f.write(f"0,100,{e},1\n")
+                f.write("1,200,7,1\n1,200,8,1\n# total,8\n")
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = hc.main(["join-plugin-call-trace", "--call-trace", calls,
+                              "--csv", csv, "--from-call-seq", "1"])
+            self.assertEqual(rc, 0)
+            self.assertIn("mismatches=4", buf.getvalue())
+
+
 class TestCli(unittest.TestCase):
     def test_summary_subcommand_writes_a_file(self):
         with tempfile.TemporaryDirectory() as d:

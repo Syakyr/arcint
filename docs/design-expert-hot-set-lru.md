@@ -226,7 +226,7 @@ code inspection.
 
 ## §7 — red-first cells (device-free first)
 
-1. `tools/test_hot_set_census.py` (**landed 2026-09-21**, 52 cells; stdlib,
+1. `tools/test_hot_set_census.py` (**landed 2026-09-21**, 66 cells; stdlib,
    no card) — parser accepts format v1 and refuses a malformed row; the
    canonical summary is sorted, total-preserving and pure of row order;
    selection is budgeted and tie-breaks on the ASCENDING id; coverage clears
@@ -243,7 +243,15 @@ code inspection.
    (never an empty census), and the CLI refuses a missing, incomplete or
    empty-valued provenance file (`artifact_sha256=`/`artifact=` and `card=`
    required) while both §2 spellings are accepted and the stdout path still
-   emits a parseable v1 trace.
+   emits a parseable v1 trace. The corpus-split cells pin the aggregate
+   census: `census_from_call_trace` counts EVERY id of every selected call
+   (batched prefill included), which MUST differ from the decode-only v1
+   summary on a trace carrying a batched call; `join_plugin_to_call_trace`
+   joins patch 0013's CSV on the RAW `layer_key`; `--from-call-seq` is wired
+   through the census, the converter and the join, and a floor that selects
+   none of the calls is REFUSED rather than written as an empty census. Both
+   new CLI paths (`census-from-call-trace`, `join-plugin-call-trace`) have a
+   cell.
 2. **Stale-byte digest cell — not started.** It needs the engine-side
    host/card readback of §6, which does not exist yet; per §6 it is **not
    asserted from code inspection**. Forcing it device-free would be measuring

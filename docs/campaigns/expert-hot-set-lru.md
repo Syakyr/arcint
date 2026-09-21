@@ -293,5 +293,50 @@ and the campaign stops. Every disposition carries an evidence class
   decode stream at layer 0. Either way the token labels are a reconstruction,
   now stated in the header (`# token_labels=reconstructed`); aggregate counts
   do not depend on them, the LRU/plateau do. The served-path trace cell (§7.3)
-  still needs the A770 window and is run against `/models/ov/ov-venice` (patch
-  0044 built there); the speed row stays EMPTY and G UNPINNED.
+  still needs the A770 window and is run against the VENICE plugin prefix
+  (patch 0044 built there; the operator-local prefix path is recorded in
+  `CLAUDE.local.md`); the speed row stays EMPTY and G UNPINNED.
+- 2026-09-21: **corpus-split decision, stated BEFORE the served window.**
+  [decision, not a measurement] Two attributions have to be separated before a
+  number is read, and both are stated here rather than inferred from the
+  result.
+
+  **1. Batched prefill vs decode rows.** The census is the aggregate histogram
+  of routed-expert accesses over the long fixed corpus. A served trace opens
+  with BATCHED prefill calls (one call per layer, each carrying many tokens'
+  ids, `top_k`-flattened token-major), and `from-call-trace --skip-batched`
+  drops exactly those. A census derived from the converted v1 rows would
+  therefore UNDER-COUNT the corpus it claims to measure. Decision: the census
+  (the canonical `layer,expert,count` aggregate) is derived DIRECTLY from the
+  patch-0044 call trace, counting every id of every call including the batched
+  prefill calls — an aggregate needs no token label. The converted v1 decode
+  rows are reserved for the ROW-LEVEL consumers only (LRU replay,
+  rounds-to-plateau, token labels), which are explicitly a reconstruction.
+
+  **2. Corpus calls vs load-time probe calls.** With `--offload-ratio > 0` the
+  engine runs a distinct-token plateau probe (up to 8 forwards of
+  `probe_floor_c` tokens) at load, before the served request (`code`,
+  `src/exec/backend_ov.cpp` Phase B), and those forwards route experts through
+  the same provider, so the emitter records them too. They are calibration of
+  the slot pool, not the corpus. Decision: the census for the hot-set seed is
+  taken over CORPUS calls only, selected by `call_seq >= <the trace's call
+  count at the instant the corpus request is posted>`; the harness records
+  that `call_seq_start` in its provenance file. The FULL-process census is
+  still computed and printed, because patch 0013's CSV counts every call
+  (probes included) and the `weight_offset` agreement check must join
+  like-for-like; the corpus census and the full-process census are both
+  reported with their difference (the probe's share) named.
+
+  **Consequence for the instrument.** `tools/hot_set_census.py` gains
+  `census_from_call_trace` (count every call's ids; the `layer,expert,count`
+  summary in decoder-layer space), a `weight_offset` join on the RAW
+  `layer_key` (patch 0013's key, no export-order assumption for the
+  cross-check), and a `--from-call-seq` floor on both the census and
+  `from-call-trace`, with red-first cells (the ladder is now **66 cells**,
+  was 52; design §7.1 and the patch README carry the new count). The corpus
+  itself is the pinned KLD capture's window 0 (2735 token ids, a fixed
+  published-in-digest document set) posted as a TOKEN-ID prompt with a greedy
+  continuation, one A770 window, the VENICE plugin, kv u8, offload 99 + tier.
+  The harness must pass `--no-logits-slice`: a load-time probe forward trips
+  the default logits slice and the executor refuses to come up (a harness
+  fact recorded when the first attempt of this leg failed at load).
