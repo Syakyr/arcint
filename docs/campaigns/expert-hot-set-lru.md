@@ -198,3 +198,18 @@ and the campaign stops. Every disposition carries an evidence class
   host-tier path in the meantime. The speed row stays EMPTY, and G stays
   UNPINNED, until the resident-compute path exists. Recorded here so no
   window is spent measuring a tier that cannot carry the policy.
+- 2026-09-21: **the device-free census instrument landed.**
+  `tools/hot_set_census.py` (format-v1 parser, canonical summary, frequency
+  rank, budgeted selection, rounds-to-plateau, patch-0013 four-column parser
+  and join, seed emission) and `tools/ref_forward_stream.py --router-trace`
+  (the device-free reference-router source, sharing the writer). Cells:
+  `tools/test_hot_set_census.py`, **31 green, no card**. A census over the
+  committed 400-token fixture **does not plateau** (S = 10 per layer:
+  coverage 0.636 at prefix 2 falling to 0.356 at prefix 400, and the selected
+  set changed at every power-of-two prefix), which confirms entry criterion
+  (2) as a measurement — the corpus is too short to threshold "hot" — not an
+  assumption. **Not started:** the
+  served-path trace (one B60 card window) and the stale-byte digest proof
+  (it needs the engine-side host/card readback; per the design it is not
+  asserted from code). Outputs on persistent paths under the operator's
+  census directory.

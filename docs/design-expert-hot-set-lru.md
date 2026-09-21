@@ -154,10 +154,11 @@ same corpus can be replayed after the policy lands.
 3. **Rounds-to-plateau.** The replay is run over trace prefixes of length
    `1, 2, 4, ...` tokens; plateau is the first prefix length `r` at which
    the selected hot set per layer is **unchanged** for two consecutive
-   prefixes and the per-layer hit rate moves by less than the stated
-   epsilon. `r` is printed with the census. In the served run the same
-   quantity is observed as the first forward after which the resident set
-   stops changing.
+   prefixes and the aggregate **hot-set coverage** (the fraction of routed
+   accesses in a layer's selected set -- the static-partition fraction, not
+   the LRU hit rate) moves by less than the stated epsilon. `r` is printed
+   with the census. In the served run the same quantity is observed as the
+   first forward after which the resident set stops changing.
 
 ## §6 — stale-byte zero proof
 
@@ -185,22 +186,22 @@ code inspection.
 
 ## §7 — red-first cells (device-free first)
 
-1. `test_hot_set_census.py` — trace parser accepts format v1, rejects a
-   malformed row, and derives the canonical summary from a committed fixture
-   trace deterministically (the summary is a pure function of the trace).
-   A separate cell parses patch 0013's four-column plugin CSV (skips `#`,
-   reads `# total,`) and joins it to the trace on `weight_offset` from an
-   exported offset map.
-2. `test_hot_set_selection.py` — frequency rank with the id tie-break is
-   deterministic; the selected set has exactly `S` experts per layer; a
-   synthetic trace with one clearly hot expert selects it over the random
-   seed.
-3. `test_rounds_to_plateau.py` — a fixture whose hot set is stable from
-   prefix `k` returns `k`; one that never stabilises returns "no plateau in
-   the predicted rounds" (the failing cell V3).
-4. `test_stale_byte_digest.py` — the red-first mutation of §6.
-5. served-path trace cell — one card window, provenance header verified,
-   histogram/trace agreement checked.
+1. `tools/test_hot_set_census.py` (**landed 2026-09-21**, 31 cells; stdlib,
+   no card) — parser accepts format v1 and refuses a malformed row; the
+   canonical summary is sorted, total-preserving and pure of row order;
+   selection is budgeted and tie-breaks on the ASCENDING id; coverage clears
+   the random baseline; plateau returns the first stable prefix and refuses
+   one for a never-stabilising ranking; patch 0013's four-column CSV parses,
+   refuses a three-column row and a wrong `# total,`, and joins the trace on
+   `weight_offset`; `write_router_trace` emits token-major rows with ids
+   ascending.
+2. **Stale-byte digest cell — not started.** It needs the engine-side
+   host/card readback of §6, which does not exist yet; per §6 it is **not
+   asserted from code inspection**. Forcing it device-free would be measuring
+   the host against itself, not host against card.
+3. **Served-path trace cell — not started.** One card window (the B60 while
+   the A770 leg runs), provenance header verified, the trace/histogram
+   agreement checked.
 
 ## §8 — evidence classes
 

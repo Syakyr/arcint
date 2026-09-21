@@ -39,6 +39,7 @@ set by the numpy dequant of each layer's experts (~1 min per layer on
   PLE); --dtype bf16 halves the weights and is NOT the exact reference.
 """
 import argparse
+import datetime
 import struct
 import sys
 import time
@@ -47,6 +48,8 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from hot_set_census import write_router_trace  # noqa: E402
 
 
 def _lazy_table_class(torch, nn):
@@ -238,6 +241,9 @@ def main(argv=None):
     ap.add_argument("--windows", type=int, nargs="*", default=None, help="which capture windows (default all)")
     ap.add_argument("--out", default=None, help="directory for logits.npy / taps")
     ap.add_argument("--taps", action="store_true", help="save every layer's output ([T, hc, H]) and the final norm")
+    ap.add_argument("--router-trace", default=None,
+                    help="write a format-v1 routed-expert trace of every layer's router "
+                         "top-k for the prompt of --ids (device-free reference router)")
     ap.add_argument("--layers", type=int, default=None, help="truncate to the first N layers (smoke tests)")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--dtype", default="f32", choices=("f32", "bf16"))
@@ -285,6 +291,28 @@ def main(argv=None):
         else:
             log("[taps] the text model has no `norm` attribute; final_norm not tapped")
 
+    router_by_layer = {}
+    if args.router_trace:
+        def make_router_hook(i):
+            def hook(mod, inp, out):
+                # the pin's TopKRouter returns (logits, routing_weights,
+                # selected_experts); the SparseMoeBlock unpacks output[2].
+                if isinstance(out, (tuple, list)) and len(out) >= 3:
+                    sel = out[2]
+                else:
+                    raise RuntimeError(
+                        "router hook: expected the TopKRouter's (logits, weights, "
+                        f"experts) tuple, got {type(out).__name__}")
+                router_by_layer[i] = sel.detach().to(torch.long).cpu().numpy()
+            return hook
+        n = 0
+        for i, layer in enumerate(model.model.layers):
+            gate = getattr(getattr(layer, "mlp", None), "gate", None)
+            if gate is not None:
+                gate.register_forward_hook(make_router_hook(i))
+                n += 1
+        log(f"[router] {n} router hook(s) registered; trace -> {args.router_trace}")
+
     def forward(ids):
         T = len(ids)
         input_ids = torch.tensor([ids], dtype=torch.long, device=device)
@@ -316,6 +344,21 @@ def main(argv=None):
             log(f"[tap] {k:<14} {str(a.shape):<16} sum {a.sum():+.6f} absmax {np.abs(a).max():.4f}")
         top = torch.topk(logits[-1], 5).indices.tolist()
         log(f"[done] logits under {out}; last-token top-5 {top}")
+        if args.router_trace:
+            provenance = {
+                "artifact_sha256": "none",
+                "source": "reference-f32-router",
+                "card": "none",
+                "device": "cpu",
+                "depth": str(len(router_by_layer)),
+                "dtype": args.dtype,
+                "ids": str(len(ids)),
+                "utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "tool": "ref_forward_stream.py",
+            }
+            write_router_trace(args.router_trace, router_by_layer, len(ids), provenance)
+            log(f"[router] wrote {args.router_trace}: {len(ids)} tokens x "
+                f"{len(router_by_layer)} layers")
         return 0
 
     if args.capture:
