@@ -546,7 +546,8 @@ F_served is unreadable and the row says UNREADABLE, not PASS. The inherited
 > state tables exactly the all-zero hash) while the output differs every
 > forward, and the A770 bit-identical.
 >
-> **Caveats, stated rather than smoothed.** (1) This is **x2**, not the
+> **Caveats, stated rather than smoothed.** [DISCHARGED 2026-09-21 — see the
+> MEASURED 2026-09-21 amendment below.] (1) This is **x2**, not the
 > x8/x12 of the **depth-4** evidence (both A770 rows in this document's cut
 > table are depth 4; no A770 depth-12 leg exists), and §4.11's amendment *"the A770 steps once
 > at an unpredictable forward; settle is defined by the observed FLOOR pair"*
@@ -558,6 +559,17 @@ F_served is unreadable and the row says UNREADABLE, not PASS. The inherited
 > way; it stays a per-card caveat until the within-kernel mechanism is found or
 > upstream fixes it. The honest sentence is *"the gate is readable on the A770
 > now; the B60 is a per-card caveat."*]
+
+> [MEASURED 2026-09-21 [measured-here], REVIEW: **the ×2 caveat is DISCHARGED — the repeat-8
+> A770 arm landed and every pair is bit-identical.** `RUN@b6dbca5`, A770
+> (GPU.1), d48n, ratio 99 + tier, KV u8, chunk 512, served path, `WARMUP=0
+> REPEAT=8`, dump `d48n-a770-rep8.bin`, eight forwards at 3,563-3,593 s each
+> (replay done 2026-09-21T05:41:50Z): all seven consecutive pairs
+> `win0↔win1 … win6↔win7` read KL(A‖B) mean **-0.000000**, **0/1367 moved**,
+> argmax **1.0000**, max |diff| **0.000**, `bit-identical True`. So
+> `F_served(A770, d48) = 0` at the **same repeat count as the depth-4 ×8/×12
+> evidence**, and clause (d) is settled **on the A770 as the measurement
+> card**. No A770 depth-12 leg exists on the record; the ×8 here is depth 48.]
 
 ### (e) THE PARIS LINE — EMPTY, with its falsifiable clause
 

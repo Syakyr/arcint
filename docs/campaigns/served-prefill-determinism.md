@@ -332,7 +332,8 @@ for a number does not close.
   B60's floors (0.1361/0.1512 headline, D2 0.072601/0.073234, force-the-tier
   0.081553, D4 unchunked 0.095497/0.202143) are therefore a **per-card
   defect**, and the width localisation above says which card and why.
-  Caveats kept: **×2 only** (the **depth-4** evidence is ×8/×12 — both A770
+  Caveats kept: **×2 only** [DISCHARGED 2026-09-21 — see the entry below]
+  (the **depth-4** evidence is ×8/×12 — both A770
   rows in window-051's cut table are depth 4, no A770 depth-12 leg exists;
   §4.11's "A770 steps once at an unpredictable forward" is not refuted by two
   forwards — a repeat-8 A770 arm is the follow-on), and the A770 is the
@@ -930,3 +931,16 @@ for a number does not close.
   patches through `0043`, applied by `git apply` at build time), with the two
   `-DENABLE_*DEBUG_CAPS` flags flipped ON. The built plugin tree is not a git
   tree (`git` exits 128), so it cannot reproduce the series by hand-cmake.
+- 2026-09-21 (**the A770 repeat-8 arm lands — clause (d) is settled at the
+  depth-4 evidence's own repeat count**). [measured-here] `RUN@b6dbca5`, A770
+  (GPU.1), d48n, ratio 99 + tier, KV u8, chunk 512, served path, `WARMUP=0
+  REPEAT=8`, dump `d48n-a770-rep8.bin`, eight forwards at 3,563-3,593 s each
+  (replay done 2026-09-21T05:41:50Z): **all seven consecutive pairs read
+  KL(A‖B) mean -0.000000, 0/1367 moved, argmax 1.0000, max |diff| 0.000,
+  `bit-identical True`**. So the **×2 caveat in the 2026-09-20 entry is
+  discharged**, `F_served(A770, d48) = 0` at the same repeat count as the
+  depth-4 ×8/×12 evidence, and BERLIN-001 clause (d) is settled **on the A770
+  as the measurement card**. No A770 depth-12 leg exists; the ×8 here is
+  depth 48. Recorded in window-051's clause (d), DESIGN §7.0.2cb and the
+  handoffs. The next city (0.5.2 VENICE) is open in its own campaign,
+  `docs/campaigns/expert-hot-set-lru.md`.

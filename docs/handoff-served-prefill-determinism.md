@@ -30,8 +30,8 @@ so the gate closes there instead — see §3.
 | warm-up is NOT the cause [measured-here] | warmup↔r0 **0.072601** ≈ r0↔r1 **0.073234** | `d48n-d2-warm.bin` |
 | GPU/host residency mix is NOT the cause [measured-here] | force-the-tier floor **0.081553**, 137/1367 moved | `d48n-tieronly.bin` |
 | chunking is NOT the cause [measured-here] | unchunked `--prefill-chunk 0` is **worse**: **0.095497 / 0.202143** | `d48n-d4-unchunked.bin` |
-| **the A770 d48 served floor is ZERO** [measured-here] | r0↔r1 **-0.000000**, **0/1367 moved**, argmax 1.0000, `bit-identical True` (×2) | `d48n-a770-d48.bin` |
-| the defect is card-dependent [measured-here, code] | B60/Xe2 steps; **A770/acm is bit-identical** (×8/×12 at **depth 4**, ×2 at depth 48) | `window-051.md` cut table |
+| **the A770 d48 served floor is ZERO** [measured-here] | eight forwards: all seven consecutive pairs **-0.000000**, **0/1367 moved**, argmax 1.0000, maxdiff 0.000, `bit-identical True` (×2 on 09-20, ×8 on 09-21) | `d48n-a770-d48.bin`, `d48n-a770-rep8.bin` |
+| the defect is card-dependent [measured-here, code] | B60/Xe2 steps; **A770/acm is bit-identical** (×8/×12 at **depth 4**, ×2 then ×8 at depth 48) | `window-051.md` cut table |
 | depth brackets it [measured-here] | present at **depth 4** (layer2/out, logits) and **depth 12** (layer0/out, ple/out) | `window-051.md` cut table |
 | location, input-bit-identity proven [measured-here] | `layer0/mixer_out`; nine input ports bit-identical across 8 repeats, both state tables the all-zero hash, output differs every forward | peer session, `2026-09-20` |
 | **fingerprint** [measured-here] | `dim0 = row 0`; heads `[3,5,6,7,10,13,17,22,31,39,41,42,43,47]`; one f16 ulp `9.7656e-4`; flip count 2423..3924; head set invariant | peer session, `2026-09-20` |

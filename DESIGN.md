@@ -9372,7 +9372,7 @@ earlier, found in review); it has not recurred since the fix on either
 card. The plugin's tier cells run standalone in seconds without an
 `ENABLE_TESTS` build.
 
-#### 7.0.2cb The served path's run-to-run floor is a per-card defect: bit-identical on Alchemist, nondeterministic at the GDN state output on the B60 (2026-09-20)
+#### 7.0.2cb The served path's run-to-run floor is a per-card defect: bit-identical on Alchemist, nondeterministic at the GDN state output on the B60 (2026-09-20; ×8 repeat discharged 2026-09-21)
 
 **What was measured.** [measured-here] The served Flash-Next path (depth 48,
 native artifact, ratio 99 + host tier, KV u8, f16, chunk 512) is **not run-to-run
@@ -9388,11 +9388,13 @@ depth 48, r0↔r1 mean **-0.000000**, **0/1367** rows moved, argmax **1.0000**,
 max |diff| **0.000**. So `F_served = 0` there, the bound sits **above** the
 floor, and clause (d) closes with the **A770 as the measurement card**, while
 the B60's row stands as a per-card caveat, not a property of the served path.
-Caveat recorded rather than smoothed: the A770 arm is **×2**, not the x8/x12 of
-the **depth-4** evidence (both A770 rows in window-051's cut table are depth
-4; no A770 depth-12 leg exists on the record), and window-050 §4.11's *"the A770 steps once at an
-unpredictable forward"* is not refuted by two forwards — a repeat-8 arm was
-queued the same day.
+Caveat recorded rather than smoothed, and **discharged 2026-09-21**: the first
+A770 arm was **×2**; the queued **repeat-8** arm then ran (`d48n-a770-rep8.bin`,
+eight forwards at 3,563-3,593 s) and **all seven consecutive pairs are
+bit-identical** (mean -0.000000, 0/1367 moved, argmax 1.0000, max |diff|
+0.000), so clause (d) is settled at the same repeat count as the **depth-4**
+×8/×12 evidence (both A770 rows in window-051's cut table are depth 4; no
+A770 depth-12 leg exists).
 
 **Everything else is excluded.** [measured-here, code] Warm-up is not the
 cause (0.072601 ≈ 0.073234); the GPU/host expert-residency mix is not
