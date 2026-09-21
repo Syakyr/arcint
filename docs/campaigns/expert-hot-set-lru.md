@@ -103,6 +103,9 @@ Copied from `ROADMAP-0.5.x.local.md` 0.5.2 and `docs/window-052.md`
   resident-compute path exists G is **UNPINNED** and the row reads EMPTY,
   not PASS. No stale figure (the 23.6 t/s HF-exported 35B control) is
   inherited.
+- **Speed hold (operator decision, 2026-09-21):** the speed row waits for
+  `sub4bit-vram-kernel` step 3, the OpenCL decode. Census + policy land
+  first; the speed measurement is not attempted on the host-compute tier.
 - **Stale-byte zero:** `digest(host-bound bytes of expert E) ==
   digest(card-bound bytes of the same E)` for every E in the hot set, with a
   **red-first mutation on eviction** (perturb one byte in the eviction path
@@ -124,7 +127,11 @@ byte, V3 no plateau in the predicted rounds, V4 visible policy change.
    partition-seeding gap; the acceptance prompt alone is not enough.
 3. **G pinned before the speed measurement**, per above.
 4. **A resident-compute measurement path named** — the current native
-   artifact has none.
+   artifact has none. Per the operator decision of 2026-09-21, VENICE's
+   **speed leg is HELD** until `sub4bit-vram-kernel` step 3 (the OpenCL
+   decode of the native formats in the per-expert kernel) lands: the census
+   and policy paths proceed now, and **no speed measurement is taken before
+   that patch**. Until then the speed row reads EMPTY, not PASS.
 
 ## Scope — in / out
 
@@ -184,3 +191,10 @@ and the campaign stops. Every disposition carries an evidence class
   date. The census-instrument design note landed as
   `docs/design-expert-hot-set-lru.md`. **No measured row filled; no policy
   code yet.**
+- 2026-09-21: **operator decision — VENICE's speed leg is HELD for the
+  patch.** `sub4bit-vram-kernel` step 3 (the OpenCL decode of the native
+  formats) is the dependency; the census instrument, hot-set selection,
+  eviction/refresh discipline and the stale-byte digest proof proceed on the
+  host-tier path in the meantime. The speed row stays EMPTY, and G stays
+  UNPINNED, until the resident-compute path exists. Recorded here so no
+  window is spent measuring a tier that cannot carry the policy.

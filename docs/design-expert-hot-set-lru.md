@@ -5,6 +5,9 @@ Acceptance: `docs/window-052.md`.
 Gate: warm-up decode ≥ G × the host-bound baseline (G pinned before the
 speed leg); stale-byte zero proof with a red-first eviction mutation;
 rounds-to-plateau printed with the census; DESIGN §3.4 output unchanged.
+The speed leg is **HELD** for `sub4bit-vram-kernel` step 3 (the OpenCL
+decode of the native formats) per the operator decision of 2026-09-21 —
+the census instrument and the policy land on the host-tier path first.
 
 ---
 

@@ -40,6 +40,11 @@ selection from an expert-access census; eviction/refresh discipline.
   exists — named dependency `sub4bit-vram-kernel` step 3, the OpenCL decode.
   Campaign: `docs/campaigns/expert-hot-set-lru.md`. No measured row is filled
   here.]
+  [HELD 2026-09-21, operator decision: **VENICE's speed leg waits for
+  `sub4bit-vram-kernel` step 3, the OpenCL decode.** The census instrument
+  and the policy land on the host-tier path first; the speed row stays EMPTY
+  and G stays UNPINNED until the resident-compute patch exists. No speed
+  window is spent on the host-compute tier.]
 
 ## The bar in force
 
@@ -102,3 +107,8 @@ nothing here. Any KL reading must print `F_served` beside it; a bar below
   (2026-09-19) — the 2026-09-19 entry's "NOT committed" is superseded by
   that commit, recorded here rather than rewritten. **No measured row filled;
   no policy code.**
+- 2026-09-21: operator decision recorded — **VENICE's speed leg is HELD for
+  `sub4bit-vram-kernel` step 3 (the OpenCL decode)**. The census instrument,
+  hot-set selection, eviction/refresh discipline and the stale-byte digest
+  proof proceed; the speed row stays EMPTY and G UNPINNED until the
+  resident-compute patch lands. See `docs/campaigns/expert-hot-set-lru.md`.
