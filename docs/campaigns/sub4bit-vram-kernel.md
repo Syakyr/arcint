@@ -632,3 +632,28 @@ fusion-impact profile, not a kernel micro-benchmark) applies.
 - 2026-09-19 (evening) — **the f16-state and f16-attention candidates are FALSIFIED at the IR level; the quality lever is re-priced.** `openvino.Core().read_model` on `d48n`, `d48g`, `d48f` and `d4n` (CPU, no card, no compile): every `ReadValue`/`Assign` state variable is **float32** — the 36 GDN recurrent states `[1,48,128,128]`, the 36 GDN conv states `[?,10240,4]`, the 24 KV states `[?,2,?,256]`; **no op in any of the four models emits f16**; the 144 f16 constants are the expert block-scales (`layerN/moe/experts_{gate,up,down}/block_scale`), each immediately `Convert`ed to f32. So neither candidate named in the entry above is a mechanism this artifact HAS, and `tools/q4e/serving_shape.py::stateful_gdn_core` already declares the state `Type.f32` — **an "f32-state emitter option" is a NO-OP**; the exports already carry f32. f16 enters only as the plugin's **compile-time execution precision** (the main model sets no `ov::hint::inference_precision`; only the DFlash drafter has `ARCINT_DRAFT_F32`, backend_ov.cpp:1256/3095). The quality lever is therefore a **main-model f32-execution A/B** — and on the A770 that is BLOCKED: window-051.md A.2 records three f32 attempts at depth 4, three refusals (`primitive_onednn_base.h:559`, `paged_attention.cpp:72` BY_CHANNEL block size, `CL_BUILD_PROGRAM_FAILURE`), so "the f32 row of the round-trip pair is NOT AVAILABLE from the card". Any such A/B must go to the B60 or a different plugin configuration; the L3/L23 tap cuts would chase a mechanism that does not exist. The u4 artifact's worse reading (median 0.264 vs the native 0.181) is priced as **u4 expert quantisation** (`uint4_t` ×288 vs the native's u8/u4/i8 mix), not state dtype.
   **The bar line above is also corrected:** the bar is not llama.cpp's floor — it was DECIDED at BERLIN‑001 (`5d4dd59`) in `docs/window-051.md` clause (d) and MEASURED at A.2: `bar_0.5.1 = 100 × F_ref` = **3.0905e-03 nats below row 2051 / 2.6946e-02 at or above it** (`F_ref` = the capture's uint16 reconstruction error = 3.0905e-05 nats mean), the inherited 0.0599 SUPERSEDED BY LINEAGE (AMENDED 2026‑09‑14). `F_served` at depth 48 stays **EMPTY**, and no verdict is readable without it. [CORRECTED 2026-09-20: **the row is no longer EMPTY** — `F_served` at depth 48 is MEASURED: **0.1361 (w0) / 0.1512 (w1)** on the B60, where the decided bar sits below it and the row is UNREADABLE; and **0 on the A770** (r0↔r1 bit-identical, 0/1367 rows moved), where the bar sits above it and clause (d) **READS**. The floor is a per-card defect, not a property of the served path — see DESIGN §7.0.2cb and `campaigns/served-prefill-determinism.md`.]
 
+
+- 2026-09-21 (night) — **the native OpenCL decode is authored, built, and its
+  device-free ladder is green; the card leg is owed.** [code + measured-here]
+  Patch 0045 (`0045-native-expert-ocl-decode.patch`) adds IQ4_NL / IQ3_XXS /
+  Q8_0 in-kernel decode to the per-expert kernel (`expert_gate_up_native` /
+  `expert_down_native`, the same dispatch geometry and argument list as 0040's
+  affine kernels) and lifts patch 0043's refusal of native-format +
+  per-expert dispatch, so the resident routed experts compute on the card
+  while the misses keep the CPU tier — the mechanism this campaign's charter
+  names, and step 3 of design note §2.3b/§2.3c. A gate/up format other than
+  IQ4_NL/IQ3_XXS is refused at stage compile rather than decoded with the
+  wrong kernel. `measured-here` (dev build host): the patch applies on top of
+  0003–0044 and `ninja openvino_intel_gpu_plugin` is clean; the plugin carries
+  the two native symbols and the native tables; the version stamp stays
+  deliberately `marfrit-p19`, so the 0045 build is identified by its
+  `expert_gate_up_native` symbol, not the stamp. The CPU reference
+  `tools/q4e/native_expert.py` and its ladder
+  `tests/python/test_native_expert_gemv.py` are **16 green, device-free**: block
+  scale applied per format, fused-vs-materialised equality, a K that is not a
+  multiple of 32 refused, an unknown format refused, and a deliberately wrong
+  affine reading of IQ4_NL bytes caught rather than absorbed. **Not yet
+  measured** [owed]: the served native artifact through the native per-expert
+  kernels — one card window with the GPU-dispatch counter, the rate and the
+  correctness reading. No card was taken; the running served census window
+  holds the host CPU, so the measurement waits for it to clear.

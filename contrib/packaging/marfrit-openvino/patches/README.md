@@ -952,6 +952,55 @@ OWED: the served card window (the census's own authority) and its
 stability statement; the measurement plugin and the debug-caps install are
 untouched, the new plugin lives in its own prefix.
 
+### 0045-native-expert-ocl-decode.patch
+
+The OpenCL decode of the checkpoint's own expert blocks, inside the per-expert
+kernel (campaign `docs/campaigns/sub4bit-vram-kernel.md`; design
+`docs/design-routing-aware-expert-execution.md` §2.3a–d, step 3). Patch 0043
+carried IQ3_XXS / IQ4_NL / Q8_0 experts into the fused op and ran every routed
+expert on the scalar CPU tier, with an in-code assert that did so "until the
+OpenCL decode exists"; this is that decode.
+
+`moe_expert_swiglu.cl` gains the three decode tables (the ones of the
+repository's `src/core/gguf_dequant.cpp` / `tools/q4e/native_blocks.py`,
+llama.cpp `ggml-common.h` pinned clone 56b9eb28) as `__constant` arrays and two
+entry points, `expert_gate_up_native` and `expert_down_native`, with the same
+dispatch geometry and argument list as patch 0040's `expert_gate_up` /
+`expert_down`. The weight bytes are decoded per element inside the K-loop — no
+dequantised row is ever written to memory. The per-tensor slot strides are the
+tensor bytes divided by the expert count (`expert_tensor_span`), i.e.
+`INTERMEDIATE_SIZE*HIDDEN_SIZE/{2,4,1,8}` by role and format; the scales arrive
+transposed to `[groups, oc]` by `maybe_transpose_scale_zp` exactly as the
+affine path's do, while the IQ3_XXS sign indices are copied row-major (0043
+skips the native zero-point transpose).
+
+`moe_3gemm_swiglu_opt.cpp` compiles those stages for a native config, lifts
+0043's "native + per-expert dispatch not combined" refusal, and dispatches the
+native stages for the resident experts while the misses keep going to the CPU
+tier (patches 0011/0012) exactly as before — the routing-aware split patch 0040
+built. A gate/up projection is refused at stage compile unless its format is
+IQ4_NL (1) or IQ3_XXS (2), rather than silently running the IQ4_NL decode over
+Q8_0 bytes.
+
+The same arithmetic is pinned device-free in the arcint repository before any
+card: `tools/q4e/native_expert.py` is the CPU reference (decode fused with the
+dot) and `tests/python/test_native_expert_gemv.py` its ladder — block-scale
+application per format, the fused-vs-materialised equality, a K that is not a
+multiple of 32 REFUSED, an unknown format REFUSED, and a deliberately wrong
+(affine) reading of IQ4_NL's bytes that must be caught rather than silently
+absorbed.
+
+MEASURED (2026-09-21, dev build host): applied on top of the 44 patches
+against pin `71640275` and built (`ninja openvino_intel_gpu_plugin`, clean);
+the plugin carries the `expert_gate_up_native` / `expert_down_native` symbols
+and the native tables. The version stamp stays deliberate at `marfrit-p19`
+(0003–0043's stamp), so the 0045 build is identified by its
+`expert_gate_up_native` symbol, not only the version string. The device-free
+cells are **16 green** (`tests/python/test_native_expert_gemv.py`).
+OWED: the one card window (served native artifact through the native
+per-expert kernels, with the GPU-dispatch counter) and its rate and
+correctness reading; no card was taken for this patch.
+
 ## Deliberately NOT applied
 
 These live in the arcint repository's `patches/` as records of measurements.
