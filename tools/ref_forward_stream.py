@@ -349,7 +349,7 @@ def main(argv=None):
                 "artifact_sha256": "none",
                 "source": "reference-f32-router",
                 "card": "none",
-                "device": "cpu",
+                "device": str(device),
                 "depth": str(len(router_by_layer)),
                 "dtype": args.dtype,
                 "ids": str(len(ids)),

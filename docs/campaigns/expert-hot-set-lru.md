@@ -213,3 +213,26 @@ and the campaign stops. Every disposition carries an evidence class
   (it needs the engine-side host/card readback; per the design it is not
   asserted from code). Outputs on persistent paths under the operator's
   census directory.
+- 2026-09-21: **`ref_forward_stream.py --router-trace` verified, and its
+  long-corpus limit measured.** `measured-here`: smoke at 1 layer, T = 5,
+  `--device cpu`, a format-v1 trace of 5 token-major rows with top-10 ids
+  ascending (`card=none device=cpu`), parsed back by
+  `tools/hot_set_census.py shape`; trace sha256 `4659806b…49c0`, log sha256
+  `3c2404ab…fe4c`. The tool **dequantises every expert tensor** per layer
+  (`[forward] T=5 in 119.3s (expert loads 117.8s over 1 layers)`), so the
+  cost is per-LAYER and T-independent and repeats each window; the pin's own
+  expert loop is sparse (`code`, `tools/q4e/ref_moe.py:18`). The 48-layer
+  long-corpus cost is a **projection** (hours per window), not measured, so
+  the **reference trace is a short-corpus oracle only** and the long-corpus
+  census cannot come from the proxy. **Decision on 0044:** author it at
+  `OffloadExpertWeightProvider::try_acquire_simultaneous` as a per-call trace
+  (`<call_seq> <layer_key> <top_k> <ids...>`), converted offline to format v1
+  by splitting each call's flattened ids into per-token `top_k` chunks and
+  mapping `layer_key` to the decoder index by ascending weight-offset
+  (export) order (assuming export order equals decoder order, as patch 0018
+  already assumes, and that the served op's flattened ids are token-major;
+  for decode T=1 this is exact); build to a third prefix on the build host
+  against the
+  pinned tree, then take **one short B60 window** over the long corpus with
+  the emitter on. The measurement plugin stays untouched, and no card has
+  been taken yet.

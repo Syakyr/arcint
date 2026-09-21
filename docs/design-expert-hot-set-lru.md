@@ -119,6 +119,24 @@ routers (the campaign record puts the top-10 mass at 6–27 % with margins
 trace is a **proxy** for format/consumer development and an independent
 check, never the policy's calibration input.
 
+**Measured limit (2026-09-21).** The reference source **dequantises every
+expert tensor** before each layer's SparseMoeBlock runs — the pre-hook
+`ref_forward_stream.py:191-208` loads the full `[E, …]` gate/up/down tensors
+regardless of routing, while the pin's own `Qwen4ExpTextExperts` loop is
+sparse over the hit experts (`code`, transcribed in `tools/q4e/ref_moe.py`).
+A smoke run at 1 layer and T = 5 measured
+`[forward] T=5 in 119.3s (expert loads 117.8s over 1 layers)`
+(`measured-here`, `--device cpu`): the load was ~118 s in the persisted run (a
+prior run of the same smoke read ~68 s, so it is I/O-warmth dependent),
+**per layer and independent of T**, and it repeats on every forward
+call/window. The 48-layer
+long-corpus cost is therefore a **projection** (hours per window; no 48-layer
+reference run was attempted), and the reference trace is a **short-corpus**
+format/consumer oracle only. The **long-corpus census must come from the
+served emitter** (§4b), not this proxy. Smoke artifacts on a persistent path,
+for the record: trace sha256 `4659806b1544cd2d978b0ba5737c62761881efdc309a25e6915cccdc5ef449c0`,
+log sha256 `3c2404abfe4ab6e7baae9e7020e40c6276f4e1c7ac8e7f0fea79cefcb1b0fe4c`.
+
 **(b) Served-path trace — the authority.** A new opt-in dump channel
 (`MOE_OTD_ROUTING_TRACE=<path>`) beside patch 0013's histogram, emitted at
 process exit and flushed per chunk so a `SIGKILL` does not lose a window
