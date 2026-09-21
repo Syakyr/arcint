@@ -340,3 +340,64 @@ and the campaign stops. Every disposition carries an evidence class
   The harness must pass `--no-logits-slice`: a load-time probe forward trips
   the default logits slice and the executor refuses to come up (a harness
   fact recorded when the first attempt of this leg failed at load).
+- 2026-09-21: **the served-path trace cell (§7.3) is RUN: one A770 window,
+  the corpus census, the raw-key CSV agreement, and the stability statement.**
+  [measured-here] Window `venice-census-003`, Arc A770 (`GPU.1`, PCI
+  8086:56a0), served depth 48, KV u8, `--offload-ratio 99 --moe-cpu-tier`, the
+  VENICE plugin, prefill chunk 512, the pinned KLD capture's window 0 as a
+  TOKEN-ID prompt (2735 ids) with `ignore_eos` and a 512-token greedy
+  continuation (one request = the prompt plus its continuation). Trace
+  25,152 calls, 8,754,436 bytes, sha256
+  `553480b169c60d653c9892b72609fb4b22c67ed4a69a4b31141c833ce5702e77`;
+  patch 0013's CSV sha256
+  `67c70f528fe88699355cb06a82b7849ceaaf0cb360dce4c614dd7d2f55d477f5`;
+  harness provenance sha256
+  `f0e294a01aa4d40d2b3289f3742e03ec9ba5177a75fc3557e022c07638cd8fd2`;
+  `call_seq_start=288`.
+  - The trace opens with 576 batched calls (288 load-time probe calls, 288
+    corpus prefill calls across 6 chunks) followed by 24,576 decode calls
+    (512 tokens x 48 layers). Converted with `--skip-batched` and
+    `--from-call-seq 288`: 512 tokens x 48 layers, 24,576 rows.
+  - **Corpus census** (derived directly from the call trace, calls >= 288,
+    batched included): **1,558,560 routed accesses over 23,813
+    `(layer, expert)` cells** = 3247 tokens x 48 layers x top-10 exactly.
+    The full-process census is 2,172,960 accesses over 23,925 cells; the
+    difference (614,400 accesses) is the load-time plateau probe's share,
+    **not** the corpus.
+  - **Trace vs patch 0013's four-column CSV, joined on the RAW `layer_key`
+    (= `weight_offset`): 23,925 keys, mismatches = 0.** The full-process
+    totals agree exactly (2,172,960). Under the corpus floor the join shows
+    9,343 keys differing by exactly the probe's share: the CSV counts every
+    call (probes included), so the like-for-like join is the full one, and
+    the floored difference is the probe, named rather than a nuisance.
+  - **Rounds-to-plateau**: NO plateau within the 512 decode tokens at S = 6
+    or S = 10 (the selected set changed at every prefix; S = 6 coverage
+    0.600 at 1 token -> 0.178 at 512, S = 10 1.000 -> 0.259). That is clause
+    V3's failing shape, echoed from the device-free 400-token fixture: the
+    aggregate census is no longer sparse, but the decode-row ranking does
+    not stabilise in this window. `rounds_to_plateau=None`.
+  - **Stability statement**: the A770 served depth-48 path is bit-identical
+    x8 (`74bc082`); measured here, the 2735-token prefill census counts are
+    **BYTE-IDENTICAL across the two independent A770 processes** of windows
+    002 and 003 (23,609 cells, 1,312,800 accesses, `diff` of the data rows
+    empty), and the probe census (614,400 accesses) is identical too. The
+    counts are run-to-run stable on the A770; no spread is required here (a
+    B60 census would carry the two-run spread statement, per the card
+    decision above).
+  - **Hot-set implication** [measured-here]: at the ratio-99 budget
+    (ceil(512 x 1%) = 6 slots/layer) the census's top-6 per layer covers
+    **9.36%** of the corpus's routed accesses; S = 10 covers 13.48%, S = 16
+    18.63%, S = 32 29.23%, S = 64 44.12%. The seed is deterministic (count
+    desc, ascending id; e.g. layer 0: 269, 309, 199, 117, 306, 11). The
+    speed row stays EMPTY and G UNPINNED: this leg moves no acceptance row,
+    and "frequency beats splitmix64" stays HYPOTHESIS.
+  - **Harness facts recorded**: the VENICE prefix needs its own
+    `runtime/lib/intel64` **plus** `runtime/3rdparty/tbb/lib` on
+    `LD_LIBRARY_PATH` (the libdir alone leaves `libtbb.so.12` unresolved);
+    the served load requires `--no-logits-slice` (the load-time probe
+    forward trips the default logits slice and the executor refuses to come
+    up -- window 001 failed at load for exactly this); and a token-id prompt
+    over a document that ends at EOS emits 0 decode tokens, so the
+    continuation needs `ignore_eos: true` (window 002 was prefill-only for
+    exactly this). Window 002's prefill census remains the stability
+    comparand.

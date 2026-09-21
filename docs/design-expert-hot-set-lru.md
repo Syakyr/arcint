@@ -256,12 +256,18 @@ code inspection.
    host/card readback of §6, which does not exist yet; per §6 it is **not
    asserted from code inspection**. Forcing it device-free would be measuring
    the host against itself, not host against card.
-3. **Served-path trace cell — not started.** One card window **on the A770**
+3. **Served-path trace cell — RUN 2026-09-21.** [measured-here; see the
+   campaign status entry of 2026-09-21 for the numbers] One card window **on
+   the A770**
    (the B60's GDN nondeterminism would make its counts move), a fresh trace
    path, the provenance header injected by the harness (now enforced by the
    converter, §4b), `--skip-batched` with its skip counts read back from the v1
    header, the trace/histogram agreement checked, and — if a B60 census is ever
-   taken — two runs with the count spread printed.
+   taken — two runs with the count spread printed. **Result:** the window ran;
+   the census is derived from the call trace directly (batched included), the
+   raw-`layer_key` join against patch 0013's CSV matches exactly, the decode
+   rows convert to 512 x 48 v1 rows, and the chosen ranking does **not**
+   plateau within 512 decode tokens at S = 6 or S = 10 (V3's failing shape).
 
 *Caveat.* `call_trace_to_v1` reconstructs token boundaries from a repeated
 `layer_key`, which is exact only if every layer's calls for one decode step
