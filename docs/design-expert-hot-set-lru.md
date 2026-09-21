@@ -138,12 +138,23 @@ for the record: trace sha256 `4659806b1544cd2d978b0ba5737c62761881efdc309a25e691
 log sha256 `3c2404abfe4ab6e7baae9e7020e40c6276f4e1c7ac8e7f0fea79cefcb1b0fe4c`.
 
 **(b) Served-path trace — the authority.** A new opt-in dump channel
-(`MOE_OTD_ROUTING_TRACE=<path>`) beside patch 0013's histogram, emitted at
-process exit and flushed per chunk so a `SIGKILL` does not lose a window
-(the 0013 dump learned that trap once already). The counting/emission site
-is the router's own top-k, so the row carries the token index the served
-graph routed. One card window produces it; the trace is the calibration
-input the hot set is chosen from.
+(`MOE_OTD_ROUTING_TRACE=<path>`) beside patch 0013's histogram. Patch 0044
+(landed 2026-09-21) appends one line per `try_acquire_simultaneous` call —
+`<call_seq> <layer_key> <top_k> <expert id...>` — at the same site patch
+0013 counts (before the dedup/hit-miss split), flushes each line so a
+`SIGKILL` does not lose a window, and keys the layer by the structural
+`layer_key`, not the construction-order `layer_seq_id`. The token index is
+**not** in the row; `tools/hot_set_census.py`'s `from-call-trace`
+reconstructs it offline (§5). Use a FRESH path per window: the emitter opens
+with append and the counter restarts per process, so a reused path merges
+runs. One card window produces it; the trace is the calibration input the
+hot set is chosen from. **Card decided before the leg: the A770**
+(bit-identical served depth-48 ×8); a B60 census would inherit the B60's
+GDN nondeterminism (DESIGN §7.0.2cb) and would require a run-to-run spread
+statement beside the counts. **Owed:** the window harness must inject the
+provenance header (§2: artifact/capture digests, card, depth, kv, chunk,
+ratio, tier, run, utc) — the plugin cannot know them, so until it does the
+converted trace is not yet a census by §2's own rule.
 
 **(c) Corpus.** The acceptance prompt is too short (measured). The census
 corpus is a long, fixed, published-in-digest-only document set replayed
@@ -204,7 +215,7 @@ code inspection.
 
 ## §7 — red-first cells (device-free first)
 
-1. `tools/test_hot_set_census.py` (**landed 2026-09-21**, 31 cells; stdlib,
+1. `tools/test_hot_set_census.py` (**landed 2026-09-21**, 43 cells; stdlib,
    no card) — parser accepts format v1 and refuses a malformed row; the
    canonical summary is sorted, total-preserving and pure of row order;
    selection is budgeted and tie-breaks on the ASCENDING id; coverage clears
@@ -212,14 +223,26 @@ code inspection.
    one for a never-stabilising ranking; patch 0013's four-column CSV parses,
    refuses a three-column row and a wrong `# total,`, and joins the trace on
    `weight_offset`; `write_router_trace` emits token-major rows with ids
-   ascending.
+   ascending. The patch-0044 converter cells pin the two silent-if-wrong
+   assumptions: a two-token call splits into the right `top_k` chunks while a
+   mis-sized call is REFUSED; the `layer_key` -> decoder-index map is a
+   bijection over the observed keys or the conversion refuses; a batched call
+   is refused by the decode converter.
 2. **Stale-byte digest cell — not started.** It needs the engine-side
    host/card readback of §6, which does not exist yet; per §6 it is **not
    asserted from code inspection**. Forcing it device-free would be measuring
    the host against itself, not host against card.
-3. **Served-path trace cell — not started.** One card window (the B60 while
-   the A770 leg runs), provenance header verified, the trace/histogram
-   agreement checked.
+3. **Served-path trace cell — not started.** One card window **on the A770**
+   (the B60's GDN nondeterminism would make its counts move), a fresh trace
+   path, the provenance header injected by the harness (owed, §4b), the
+   trace/histogram agreement checked, and — if a B60 census is ever taken —
+   two runs with the count spread printed.
+
+*Caveat.* `call_trace_to_v1` reconstructs token boundaries from a repeated
+`layer_key`, which is exact only if every layer's calls for one decode step
+precede the next step's. The aggregate `(layer, expert)` counts do not depend
+on the token labels; the LRU replay and rounds-to-plateau do. The emitter's
+integer ids are token-major (`code`, patch 0042 `_config.top_k` layout).
 
 ## §8 — evidence classes
 

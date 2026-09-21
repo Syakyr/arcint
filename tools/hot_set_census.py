@@ -358,6 +358,113 @@ def join_plugin_to_trace(rows, plugin_rows, layer_key_by_index):
     return plugin, trace, mismatches
 
 
+def parse_call_trace(path, strict=True):
+    """`(call_seq, layer_key, top_k, [expert_id, ...])` rows from patch 0044's
+    per-call trace.
+
+    Line grammar: `<call_seq> <layer_key> <top_k> <expert id...>`. `#`-lines
+    and blanks are skipped. A row with fewer than four fields (a call with no
+    ids) is malformed and refused.
+    """
+    rows = []
+    with open(path, "r", encoding="utf-8") as f:
+        for lineno, ln in enumerate(f, 1):
+            s = ln.strip()
+            if not s or s.startswith("#"):
+                continue
+            p = s.split()
+            if len(p) < 4:
+                if strict:
+                    raise ValueError(
+                        f"{path}:{lineno}: malformed call-trace row {s!r} "
+                        f"(need 'call_seq layer_key top_k expert...')")
+                continue
+            try:
+                seq = int(p[0])
+                lk = int(p[1])
+                tk = int(p[2])
+                ids = [int(x) for x in p[3:]]
+            except ValueError as e:
+                raise ValueError(f"{path}:{lineno}: non-integer field in {s!r}") from e
+            if seq < 0 or lk < 0 or tk < 0 or any(x < 0 for x in ids):
+                raise ValueError(f"{path}:{lineno}: negative field in {s!r}")
+            rows.append((seq, lk, tk, ids))
+    return rows
+
+
+def split_topk_chunks(ids, top_k):
+    """Split a call's flattened routed ids into per-token chunks of `top_k`.
+
+    Raises on a mis-sized call rather than truncating: a wrong chunk is silent
+    downstream, so it must fail here. `top_k <= 0` and a non-multiple length
+    are both refused.
+    """
+    if top_k <= 0:
+        raise ValueError(f"top_k must be > 0, got {top_k}")
+    if len(ids) == 0 or len(ids) % top_k != 0:
+        raise ValueError(
+            f"ids length {len(ids)} is not a positive multiple of top_k "
+            f"{top_k}; refusing rather than truncating")
+    return [ids[i:i + top_k] for i in range(0, len(ids), top_k)]
+
+
+def layer_key_index_map(layer_keys, explicit=None):
+    """Map each `layer_key` to its 0-based decoder-layer index.
+
+    Default (no `explicit`): ascending weight-file offset (export) order, the
+    identity patch 0018 already assumes. `explicit` is a decoder-index ->
+    layer_key map (the shape `seed_text` emits); it must be a bijection and
+    must cover every key the trace carries, else the map is refused loudly
+    (a re-ordered export must not silently be read as decoder order).
+    """
+    keys = sorted(set(layer_keys))
+    if explicit is None:
+        return {k: i for i, k in enumerate(keys)}
+    idx_to_key = {int(k): int(v) for k, v in explicit.items()}
+    vals = list(idx_to_key.values())
+    if len(set(vals)) != len(vals):
+        raise ValueError(f"decoder indices are not unique in the map: {vals}")
+    inv = {v: k for k, v in idx_to_key.items()}
+    missing = [k for k in keys if k not in inv]
+    if missing:
+        raise ValueError(
+            f"trace layer_key(s) absent from the exported map: {missing}; "
+            f"refusing (the map and the artifact disagree)")
+    return inv
+
+
+def call_trace_to_v1(call_rows, layer_key_map=None):
+    """Convert a patch-0044 per-call trace to format v1.
+
+    Decode (T=1) only: every call must carry exactly one `top_k` chunk. Tokens
+    are reconstructed by counting a repeated `layer_key` as the next token
+    (one call per layer per decode step), which is exact for the autoregressive
+    decode loop; a call carrying more than one token's ids is a batched/prefill
+    call and is REFUSED -- for prefill the per-token `token_idx` is not defined
+    by this trace, so it is not guessed. Returns `(v1_rows, report)`.
+    """
+    keys = [r[1] for r in call_rows]
+    lk_index = layer_key_index_map(keys, layer_key_map)
+    rows = []
+    tok = 0
+    seen = set()
+    for _seq, lk, top_k, ids in sorted(call_rows, key=lambda r: r[0]):
+        chunks = split_topk_chunks(ids, top_k)
+        if len(chunks) != 1:
+            raise ValueError(
+                f"call seq {_seq} carries {len(chunks)} tokens' ids; the "
+                f"decode converter refuses batched/prefill calls (per-token "
+                f"token_idx is undefined for them)")
+        if lk in seen:
+            tok += 1
+            seen = set()
+        seen.add(lk)
+        rows.append((tok, lk_index[lk], sorted(chunks[0])))
+    rows.sort(key=lambda r: (r[0], r[1]))
+    return rows, {"tokens": (tok + 1) if rows else 0, "layer_keys": len(lk_index),
+                  "calls": len(call_rows)}
+
+
 def seed_text(hot, layer_key_by_index=None):
     """The static-partition seed as text, one `layer expert` line.
 
@@ -445,6 +552,30 @@ def _cmd_plugin_csv(args):
     return 0
 
 
+def _cmd_from_call_trace(args):
+    call_rows = parse_call_trace(args.call_trace)
+    layer_keys = None
+    if args.layer_keys:
+        with open(args.layer_keys, encoding="utf-8") as f:
+            raw = json.load(f)
+        layer_keys = {int(k): int(v) for k, v in raw.items()}
+    rows, rep = call_trace_to_v1(call_rows, layer_keys)
+    lines = ["# arcint routing trace v1",
+             "# source=plugin-0044-call-trace",
+             f"# calls={rep['calls']} tokens={rep['tokens']} layers={rep['layer_keys']}"]
+    for tok, lay, ids in rows:
+        lines.append(" ".join([str(tok), str(lay)] + [str(x) for x in ids]))
+    text = "\n".join(lines) + "\n"
+    if args.out:
+        with open(args.out, "w", encoding="utf-8") as f:
+            f.write(text)
+        print(f"wrote {args.out}: {rep['tokens']} tokens x {rep['layer_keys']} layers "
+              f"from {rep['calls']} calls")
+    else:
+        sys.stdout.write(text)
+    return 0
+
+
 def build_parser():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -480,6 +611,14 @@ def build_parser():
     p = sub.add_parser("plugin-csv", help="parse/validate patch 0013's CSV")
     p.add_argument("--csv", required=True)
     p.set_defaults(func=_cmd_plugin_csv)
+
+    p = sub.add_parser("from-call-trace",
+                       help="convert patch 0044's per-call trace to format v1 (decode)")
+    p.add_argument("--call-trace", required=True)
+    p.add_argument("--out", default="")
+    p.add_argument("--layer-keys", default="",
+                   help="JSON decoder-index -> layer_key map; default is ascending export order")
+    p.set_defaults(func=_cmd_from_call_trace)
     return ap
 
 

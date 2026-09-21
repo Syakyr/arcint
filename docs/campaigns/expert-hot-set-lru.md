@@ -236,3 +236,30 @@ and the campaign stops. Every disposition carries an evidence class
   pinned tree, then take **one short B60 window** over the long corpus with
   the emitter on. The measurement plugin stays untouched, and no card has
   been taken yet.
+- 2026-09-21: **patch 0044 authored, built, and the offline converter
+  landed.** The emitter is `MOE_OTD_ROUTING_TRACE`, a per-call trace at
+  `OffloadExpertWeightProvider::try_acquire_simultaneous`, added to the
+  canonical series as
+  `contrib/packaging/marfrit-openvino/patches/0044-moe-otd-routing-trace.patch`
+  (mirrored in `patches/`) and applied on top of the 41 patches against pin
+  `71640275`; built via `ninja openvino_intel_gpu_plugin`; the third-prefix
+  install reports plugin version
+  `2026.4.0-22849-71640275d29-marfrit-p19` (stamp deliberately left at p19,
+  which already names patches 0003–0043; the trace build is identified by its
+  `routing_trace` symbol). The default-measurement plugin
+  and the debug-caps install are untouched. `tools/hot_set_census.py` gained
+  `parse_call_trace`, `split_topk_chunks`, `layer_key_index_map`,
+  `call_trace_to_v1` and the `from-call-trace` subcommand; cells are 43
+  green, including the two silent-if-wrong assumptions (a two-token call
+  splits into the right `top_k` chunks / a mis-sized call is refused; the
+  `layer_key` -> decoder index map is a bijection over the artifact's own
+  layer set or the conversion refuses).
+- 2026-09-21: **census-card decision, stated BEFORE the leg: the A770.**
+  [decision, not a measurement] A census taken on the B60 would inherit the
+  B60's run-to-run varying router input (DESIGN §7.0.2cb: the GDN state
+  output is nondeterministic on Xe2), so its counts could move between
+  forwards; the A770's served depth-48 path is bit-identical ×8 (the 74bc082
+  arm). If a B60 census is ever required, it will be run twice and the
+  run-to-run SPREAD of the counts printed beside the census, as the floor
+  rule requires for any other reading. A census whose stability is unstated
+  is not an instrument for a policy.

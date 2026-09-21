@@ -900,6 +900,52 @@ either card (three legs), which is consistent with, not proof of, that
 mechanism. Owed: the served depth-4 and depth-48 native artifacts through
 the tier, the KLD gate's native reading.
 
+### 0044-moe-otd-routing-trace.patch
+
+A per-call routing TRAIL beside patch 0013's aggregate histogram, so the
+0.5.2 VENICE census can be taken from the SERVED path (campaign
+`docs/campaigns/expert-hot-set-lru.md`, design
+`docs/design-expert-hot-set-lru.md` §4b). Patch 0013 answers "which experts
+route" but not "in what order", so it cannot feed the per-layer LRU replay;
+an aggregate is not a trace. This patch adds an opt-in env
+`MOE_OTD_ROUTING_TRACE=<path>`: each `OffloadExpertWeightProvider` reads it
+once at construction (same per-provider, construction-time discipline as
+`MOE_OTD_ROUTING_HIST`), and `try_acquire_simultaneous` appends one line
+
+    <call_seq> <layer_key> <top_k> <expert id...>
+
+at the SAME point patch 0013 counts (before the dedup/hit-miss split, so it
+records what the router picked, not what the pool served). `<call_seq>` is a
+process-wide atomic counter under a mutex, and each line is flushed
+immediately so a `SIGKILL`'d window keeps every record already written (the
+aggregate dump only runs at exit). `layer_key` is the structural weight-file
+offset (patch 0018's key), so the trace is independent of the
+construction-order `layer_seq_id`.
+
+The offline half is `tools/hot_set_census.py`: `parse_call_trace`,
+`split_topk_chunks`, `layer_key_index_map`, `call_trace_to_v1` and the
+`from-call-trace` subcommand. Both silent-if-wrong assumptions have
+red-first cells in `tools/test_hot_set_census.py`: a call carrying two
+tokens' ids splits into the right `top_k` chunks and a mis-sized call is
+REFUSED, not truncated; and the `layer_key` -> decoder index map is the
+ascending export order by default, while an exported map with a duplicate
+index or a missing key is refused. A call carrying more than one token's
+ids is refused by the decode converter (per-token `token_idx` is undefined
+for a batched/prefill call in this trace), which is the stated caveat.
+
+MEASURED (2026-09-21, dev build host): applied on top of the 41 patches
+against pin `71640275` and built (`ninja openvino_intel_gpu_plugin`); the
+third-prefix install reports plugin version
+`2026.4.0-22849-71640275d29-marfrit-p19` and carries the `routing_trace`
+string. NOTE: that stamp is deliberately left at `p19`, which the packaging
+record already uses for patches 0003-0043, so the stamp alone cannot tell a
+0044 build from a 0043 one; the trace build is identified by its
+`routing_trace` symbol, and a future window must cite the symbol, not only
+the version string. The offline cells are 43 green (`tools/test_hot_set_census.py`).
+OWED: the served card window (the census's own authority) and its
+stability statement; the measurement plugin and the debug-caps install are
+untouched, the new plugin lives in its own prefix.
+
 ## Deliberately NOT applied
 
 These live in the arcint repository's `patches/` as records of measurements.

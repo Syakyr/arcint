@@ -313,6 +313,82 @@ class TestRouterTraceWriter(unittest.TestCase):
             self.assertEqual(len(rows), 6)          # 5 x layer0 + 1 x layer1
 
 
+class TestCallTrace(unittest.TestCase):
+    def test_split_two_tokens_into_chunks(self):
+        self.assertEqual(hc.split_topk_chunks([1, 2, 3, 4], 2), [[1, 2], [3, 4]])
+        self.assertEqual(hc.split_topk_chunks([1, 2, 3, 4, 5, 6], 3),
+                         [[1, 2, 3], [4, 5, 6]])
+
+    def test_split_missized_is_refused_not_truncated(self):
+        with self.assertRaises(ValueError):
+            hc.split_topk_chunks([1, 2, 3], 2)
+        with self.assertRaises(ValueError):
+            hc.split_topk_chunks([], 2)
+
+    def test_split_zero_top_k_is_refused(self):
+        with self.assertRaises(ValueError):
+            hc.split_topk_chunks([1, 2], 0)
+
+    def test_layer_key_map_is_ascending_export_order(self):
+        self.assertEqual(hc.layer_key_index_map([300, 100, 200]),
+                         {100: 0, 200: 1, 300: 2})
+
+    def test_explicit_map_non_injective_is_refused(self):
+        with self.assertRaises(ValueError):
+            hc.layer_key_index_map([100, 200], {0: 100, 1: 200, 2: 200})
+
+    def test_explicit_map_missing_key_is_refused(self):
+        with self.assertRaises(ValueError):
+            hc.layer_key_index_map([100, 200, 300], {0: 100, 1: 200})
+
+    def test_decode_calls_reconstruct_token_major_v1(self):
+        call_rows = [(0, 100, 2, [3, 4]), (1, 200, 2, [5, 6]),
+                     (2, 100, 2, [7, 8]), (3, 200, 2, [9, 10])]
+        rows, rep = hc.call_trace_to_v1(call_rows)
+        self.assertEqual(rows, [(0, 0, [3, 4]), (0, 1, [5, 6]),
+                                (1, 0, [7, 8]), (1, 1, [9, 10])])
+        self.assertEqual(rep["tokens"], 2)
+        self.assertEqual(rep["layer_keys"], 2)
+        self.assertNotIn("prefill", rep)
+
+    def test_batched_call_is_refused(self):
+        with self.assertRaises(ValueError):
+            hc.call_trace_to_v1([(0, 100, 2, [1, 2, 3, 4])])
+
+    def test_empty_call_trace_reports_zero_tokens(self):
+        rows, rep = hc.call_trace_to_v1([])
+        self.assertEqual(rows, [])
+        self.assertEqual(rep["tokens"], 0)
+
+    def test_call_trace_parse_refuses_negative(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "c.trace")
+            with open(p, "w") as f:
+                f.write("0 -5 2 3 4\n")
+            with self.assertRaises(ValueError):
+                hc.parse_call_trace(p)
+
+    def test_call_trace_parse_refuses_missing_ids(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "c.trace")
+            with open(p, "w") as f:
+                f.write("0 100 2\n")          # top_k declared, no ids
+            with self.assertRaises(ValueError):
+                hc.parse_call_trace(p)
+
+    def test_from_call_trace_cli_writes_format_v1(self):
+        with tempfile.TemporaryDirectory() as d:
+            calls = os.path.join(d, "c.trace")
+            out = os.path.join(d, "v1.trace")
+            with open(calls, "w") as f:
+                f.write("0 100 2 3 4\n1 200 2 5 6\n2 100 2 7 8\n3 200 2 9 10\n")
+            rc = hc.main(["from-call-trace", "--call-trace", calls, "--out", out])
+            self.assertEqual(rc, 0)
+            rows = hc.parse_trace(out)
+            self.assertEqual(rows, [(0, 0, [3, 4]), (0, 1, [5, 6]),
+                                    (1, 0, [7, 8]), (1, 1, [9, 10])])
+
+
 class TestCli(unittest.TestCase):
     def test_summary_subcommand_writes_a_file(self):
         with tempfile.TemporaryDirectory() as d:
