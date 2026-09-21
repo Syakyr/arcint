@@ -154,7 +154,18 @@ GDN nondeterminism (DESIGN §7.0.2cb) and would require a run-to-run spread
 statement beside the counts. **Owed:** the window harness must inject the
 provenance header (§2: artifact/capture digests, card, depth, kv, chunk,
 ratio, tier, run, utc) — the plugin cannot know them, so until it does the
-converted trace is not yet a census by §2's own rule.
+converted trace is not yet a census by §2's own rule. **2026-09-21: this is
+now ENFORCED in the converter** — `from-call-trace` requires `--provenance`
+and refuses a file without a NON-EMPTY `artifact_sha256=` (or `artifact=`) and
+`card=`, so a census with no artifact or card attribution cannot be written;
+the remaining §2 fields (`capture_sha256`, `kv`, `depth`, `chunk`,
+`offload_ratio`, `tier`, `run`, `utc`) stay the harness's responsibility and
+are **not** machine-checked here — the gap is narrowed, not closed. The same
+commit added **`--skip-batched`**: a served trace
+opens with the batched prefill call, which the decode converter otherwise
+refused; the skip is REPORTED (call and token counts written into the v1
+header), and an all-batched trace is still refused rather than converted to an
+empty census.
 
 **(c) Corpus.** The acceptance prompt is too short (measured). The census
 corpus is a long, fixed, published-in-digest-only document set replayed
@@ -215,7 +226,7 @@ code inspection.
 
 ## §7 — red-first cells (device-free first)
 
-1. `tools/test_hot_set_census.py` (**landed 2026-09-21**, 43 cells; stdlib,
+1. `tools/test_hot_set_census.py` (**landed 2026-09-21**, 52 cells; stdlib,
    no card) — parser accepts format v1 and refuses a malformed row; the
    canonical summary is sorted, total-preserving and pure of row order;
    selection is budgeted and tie-breaks on the ASCENDING id; coverage clears
@@ -227,16 +238,22 @@ code inspection.
    assumptions: a two-token call splits into the right `top_k` chunks while a
    mis-sized call is REFUSED; the `layer_key` -> decoder-index map is a
    bijection over the observed keys or the conversion refuses; a batched call
-   is refused by the decode converter.
+   is refused by the decode converter, `skip_batched` skips and COUNTS it while
+   keeping the decode rows, an all-batched trace is refused even with the skip
+   (never an empty census), and the CLI refuses a missing, incomplete or
+   empty-valued provenance file (`artifact_sha256=`/`artifact=` and `card=`
+   required) while both §2 spellings are accepted and the stdout path still
+   emits a parseable v1 trace.
 2. **Stale-byte digest cell — not started.** It needs the engine-side
    host/card readback of §6, which does not exist yet; per §6 it is **not
    asserted from code inspection**. Forcing it device-free would be measuring
    the host against itself, not host against card.
 3. **Served-path trace cell — not started.** One card window **on the A770**
    (the B60's GDN nondeterminism would make its counts move), a fresh trace
-   path, the provenance header injected by the harness (owed, §4b), the
-   trace/histogram agreement checked, and — if a B60 census is ever taken —
-   two runs with the count spread printed.
+   path, the provenance header injected by the harness (now enforced by the
+   converter, §4b), `--skip-batched` with its skip counts read back from the v1
+   header, the trace/histogram agreement checked, and — if a B60 census is ever
+   taken — two runs with the count spread printed.
 
 *Caveat.* `call_trace_to_v1` reconstructs token boundaries from a repeated
 `layer_key`, which is exact only if every layer's calls for one decode step

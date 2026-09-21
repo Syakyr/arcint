@@ -250,6 +250,7 @@ and the campaign stops. Every disposition carries an evidence class
   and the debug-caps install are untouched. `tools/hot_set_census.py` gained
   `parse_call_trace`, `split_topk_chunks`, `layer_key_index_map`,
   `call_trace_to_v1` and the `from-call-trace` subcommand; cells are 43
+  (superseded below by the 2026-09-21 batched-prefill/provenance entry: 52)
   green, including the two silent-if-wrong assumptions (a two-token call
   splits into the right `top_k` chunks / a mis-sized call is refused; the
   `layer_key` -> decoder index map is a bijection over the artifact's own
@@ -263,3 +264,34 @@ and the campaign stops. Every disposition carries an evidence class
   run-to-run SPREAD of the counts printed beside the census, as the floor
   rule requires for any other reading. A census whose stability is unstated
   is not an instrument for a policy.
+- 2026-09-21: **the converter's batched-prefill gap is closed, and the
+  artifact/card part of the provenance requirement is enforced.** [code,
+  measured-here for the cells] A real served trace opens with a batched prefill
+  call, which `call_trace_to_v1` refused, so the captured trace could not
+  convert at all. `from-call-trace` now takes **`--skip-batched`**: the batched
+  call is skipped and **reported** (call and token counts in the v1 header, and
+  on stderr when writing to stdout), because a batch dropped silently is a
+  census that under-counts. Two rules hold either way: a trace in which EVERY
+  call was batched is refused rather than converted to an empty census, and an
+  empty call list stays an empty conversion (not a census). The same change
+  makes part of the harness-injected provenance header **mandatory**:
+  `from-call-trace` requires `--provenance` and refuses a file without a
+  NON-EMPTY `artifact_sha256=` (or `artifact=`) and `card=`, so a census with
+  no artifact or card attribution cannot be written. That is exactly what it
+  says — artifact and card, nothing more: `capture_sha256`, `kv`, `depth`,
+  `chunk`, `offload_ratio`, `tier`, `run` and `utc` from §2 are still the
+  harness's responsibility and are **not** machine-checked, so §4b's owed
+  item is narrowed, not closed. `tools/test_hot_set_census.py` is now **52
+  cells** (was 43): `skip_batched` skips and counts while keeping the decode
+  rows, an all-batched trace is refused with the skip ON, the CLI refuses a
+  missing, incomplete or empty-valued provenance file, both §2 artifact
+  spellings are accepted, and the stdout path still emits a parseable v1
+  trace. Note the shape of a skipped opening prefill **as modelled here**: the
+  prefill is one batched call, so the decode rows resume mid-sequence and the
+  first reconstructed token can be partial — a real depth-48 served prefill
+  emits one batched call per layer, all of them skipped, which leaves the
+  decode stream at layer 0. Either way the token labels are a reconstruction,
+  now stated in the header (`# token_labels=reconstructed`); aggregate counts
+  do not depend on them, the LRU/plateau do. The served-path trace cell (§7.3)
+  still needs the A770 window and is run against `/models/ov/ov-venice` (patch
+  0044 built there); the speed row stays EMPTY and G UNPINNED.

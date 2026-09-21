@@ -433,36 +433,79 @@ def layer_key_index_map(layer_keys, explicit=None):
     return inv
 
 
-def call_trace_to_v1(call_rows, layer_key_map=None):
+def call_trace_to_v1(call_rows, layer_key_map=None, skip_batched=False):
     """Convert a patch-0044 per-call trace to format v1.
 
-    Decode (T=1) only: every call must carry exactly one `top_k` chunk. Tokens
-    are reconstructed by counting a repeated `layer_key` as the next token
-    (one call per layer per decode step), which is exact for the autoregressive
+    Decode (T=1) rows: every call carries exactly one `top_k` chunk. Tokens are
+    reconstructed by counting a repeated `layer_key` as the next token (one
+    call per layer per decode step), which is exact for the autoregressive
     decode loop; a call carrying more than one token's ids is a batched/prefill
-    call and is REFUSED -- for prefill the per-token `token_idx` is not defined
-    by this trace, so it is not guessed. Returns `(v1_rows, report)`.
+    call, and for prefill the per-token `token_idx` is not defined by this
+    trace, so it is not guessed.
+
+    A served trace opens with that batched prefill call, so `skip_batched=True`
+    skips it instead of refusing it -- but a skipped call is never dropped
+    silently: every skip is counted and its token count reported, and a trace
+    in which *every* call was batched is REFUSED rather than converted to an
+    empty census. An empty call list stays an empty conversion.
+
+    A skipped prefill that ended mid-sequence is undetectable from the trace
+    alone, so token labels after it are a reconstruction: aggregate counts do
+    not depend on them, the LRU/plateau do.
     """
     keys = [r[1] for r in call_rows]
     lk_index = layer_key_index_map(keys, layer_key_map)
     rows = []
     tok = 0
     seen = set()
+    skipped_calls = 0
+    skipped_tokens = 0
     for _seq, lk, top_k, ids in sorted(call_rows, key=lambda r: r[0]):
         chunks = split_topk_chunks(ids, top_k)
         if len(chunks) != 1:
-            raise ValueError(
-                f"call seq {_seq} carries {len(chunks)} tokens' ids; the "
-                f"decode converter refuses batched/prefill calls (per-token "
-                f"token_idx is undefined for them)")
+            if not skip_batched:
+                raise ValueError(
+                    f"call seq {_seq} carries {len(chunks)} tokens' ids; the "
+                    f"decode converter refuses batched/prefill calls (use "
+                    f"--skip-batched to skip and report them)")
+            skipped_calls += 1
+            skipped_tokens += len(chunks)
+            continue
         if lk in seen:
             tok += 1
             seen = set()
         seen.add(lk)
         rows.append((tok, lk_index[lk], sorted(chunks[0])))
+    if call_rows and not rows:
+        raise ValueError(
+            f"no decode rows in the call trace: all {skipped_calls} call(s) "
+            f"carried more than one token's ids; refusing to emit an empty "
+            f"census")
     rows.sort(key=lambda r: (r[0], r[1]))
     return rows, {"tokens": (tok + 1) if rows else 0, "layer_keys": len(lk_index),
-                  "calls": len(call_rows)}
+                  "calls": len(call_rows),
+                  "batched_calls_skipped": skipped_calls,
+                  "batched_tokens_skipped": skipped_tokens}
+
+
+def read_provenance_file(path):
+    """`key=value` pairs from a harness-written provenance file.
+
+    The plugin cannot know the artifact, card, KV dtype or digests, so the
+    harness writes them here; bare `key=value` lines and `#`-prefixed v1
+    header spellings are both accepted, and free text is ignored.
+    """
+    prov = OrderedDict()
+    with open(path, "r", encoding="utf-8") as f:
+        for ln in f:
+            body = ln.strip().lstrip("#").strip()
+            if body.startswith("arcint routing trace"):
+                continue
+            for tok in body.split():
+                if "=" in tok:
+                    k, v = tok.split("=", 1)
+                    prov[k.strip()] = v.strip()
+    return prov
 
 
 def seed_text(hot, layer_key_by_index=None):
@@ -559,20 +602,44 @@ def _cmd_from_call_trace(args):
         with open(args.layer_keys, encoding="utf-8") as f:
             raw = json.load(f)
         layer_keys = {int(k): int(v) for k, v in raw.items()}
-    rows, rep = call_trace_to_v1(call_rows, layer_keys)
-    lines = ["# arcint routing trace v1",
-             "# source=plugin-0044-call-trace",
-             f"# calls={rep['calls']} tokens={rep['tokens']} layers={rep['layer_keys']}"]
+    prov = read_provenance_file(args.provenance)
+    artifact = prov.get("artifact_sha256") or prov.get("artifact")
+    if not artifact or not prov.get("card"):
+        raise ValueError(
+            f"provenance file {args.provenance} must carry a non-empty "
+            f"artifact_sha256= (or artifact=) and card= -- the plugin cannot "
+            f"know either, so the harness injects them; refusing to write an "
+            f"unattributable census")
+    rows, rep = call_trace_to_v1(call_rows, layer_keys,
+                                 skip_batched=args.skip_batched)
+    prov = OrderedDict(list(prov.items()) + [
+        ("source", "plugin-0044-call-trace"),
+        ("calls", rep["calls"]),
+        ("batched_calls_skipped", rep["batched_calls_skipped"]),
+        ("batched_tokens_skipped", rep["batched_tokens_skipped"]),
+        ("tokens", rep["tokens"]),
+        ("layers", rep["layer_keys"]),
+        # token labels are rebuilt from the layer-key wrap, not carried by the
+        # trace; say so in the header rather than leaving it implicit.
+        ("token_labels", "reconstructed"),
+    ])
+    lines = ["# arcint routing trace v1"]
+    for k, v in prov.items():
+        lines.append(f"# {k}={v}")
     for tok, lay, ids in rows:
         lines.append(" ".join([str(tok), str(lay)] + [str(x) for x in ids]))
     text = "\n".join(lines) + "\n"
+    note = (f"{rep['batched_calls_skipped']} batched prefill call(s), "
+            f"{rep['batched_tokens_skipped']} token(s), skipped")
     if args.out:
         with open(args.out, "w", encoding="utf-8") as f:
             f.write(text)
         print(f"wrote {args.out}: {rep['tokens']} tokens x {rep['layer_keys']} layers "
-              f"from {rep['calls']} calls")
+              f"from {rep['calls']} calls ({note})")
     else:
         sys.stdout.write(text)
+        if rep["batched_calls_skipped"]:
+            sys.stderr.write(f"# {note}\n")
     return 0
 
 
@@ -615,6 +682,13 @@ def build_parser():
     p = sub.add_parser("from-call-trace",
                        help="convert patch 0044's per-call trace to format v1 (decode)")
     p.add_argument("--call-trace", required=True)
+    p.add_argument("--provenance", required=True,
+                   help="harness-written key=value file; must carry a NON-EMPTY "
+                        "artifact_sha256= (or artifact=) and card= -- the plugin "
+                        "cannot know them; the rest of §2's header is not checkable here")
+    p.add_argument("--skip-batched", action="store_true",
+                   help="skip (and report) a batched prefill call instead of refusing; "
+                        "an all-batched trace is still refused")
     p.add_argument("--out", default="")
     p.add_argument("--layer-keys", default="",
                    help="JSON decoder-index -> layer_key map; default is ascending export order")

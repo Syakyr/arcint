@@ -931,7 +931,12 @@ REFUSED, not truncated; and the `layer_key` -> decoder index map is the
 ascending export order by default, while an exported map with a duplicate
 index or a missing key is refused. A call carrying more than one token's
 ids is refused by the decode converter (per-token `token_idx` is undefined
-for a batched/prefill call in this trace), which is the stated caveat.
+for a batched/prefill call in this trace), which is the stated caveat;
+`from-call-trace --skip-batched` skips and COUNTS the opening prefill call
+instead (an all-batched trace is still refused, never an empty census), and
+the CLI requires a `--provenance` file with a non-empty `artifact_sha256=`
+(or `artifact=`) and `card=` -- the artifact/card part of §2's header is
+enforced, the rest is not machine-checked here.
 
 MEASURED (2026-09-21, dev build host): applied on top of the 41 patches
 against pin `71640275` and built (`ninja openvino_intel_gpu_plugin`); the
@@ -941,7 +946,7 @@ string. NOTE: that stamp is deliberately left at `p19`, which the packaging
 record already uses for patches 0003-0043, so the stamp alone cannot tell a
 0044 build from a 0043 one; the trace build is identified by its
 `routing_trace` symbol, and a future window must cite the symbol, not only
-the version string. The offline cells are 43 green (`tools/test_hot_set_census.py`).
+the version string. The offline cells are 52 green (`tools/test_hot_set_census.py`).
 OWED: the served card window (the census's own authority) and its
 stability statement; the measurement plugin and the debug-caps install are
 untouched, the new plugin lives in its own prefix.

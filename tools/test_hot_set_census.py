@@ -24,6 +24,9 @@ The fixture is the committed WP7 routing sample
 top-10), the same trace tools/test_expert_lru_replay.py uses. The full-trace
 WP6b reproduction stays a separate check.
 """
+import contextlib
+import inspect
+import io
 import os
 import sys
 import tempfile
@@ -355,6 +358,34 @@ class TestCallTrace(unittest.TestCase):
         with self.assertRaises(ValueError):
             hc.call_trace_to_v1([(0, 100, 2, [1, 2, 3, 4])])
 
+    def test_skip_batched_keeps_decode_rows_and_counts_the_skip(self):
+        # a served trace opens with a batched prefill call: skipped, counted,
+        # and the decode rows still convert frame-for-frame. As modelled here
+        # the prefill is ONE call, so the decode stream resumes mid-sequence:
+        # token 0 = seq 1 (layer 200) + seq 2 (layer 100), token 1 = seq 3
+        # (layer 200) ONLY -- token 1 is the partial one. A real depth-48
+        # prefill emits one batched call per layer; skipped, they leave the
+        # decode stream at layer 0.
+        call_rows = [(0, 100, 2, [1, 2, 3, 4]),          # prefill, 2 tokens
+                     (1, 200, 2, [5, 6]),
+                     (2, 100, 2, [7, 8]),
+                     (3, 200, 2, [9, 10])]
+        rows, rep = hc.call_trace_to_v1(call_rows, skip_batched=True)
+        self.assertEqual(rows, [(0, 0, [7, 8]), (0, 1, [5, 6]), (1, 1, [9, 10])])
+        self.assertEqual(rep["batched_calls_skipped"], 1)
+        self.assertEqual(rep["batched_tokens_skipped"], 2)
+
+    def test_all_batched_is_refused_even_with_skip_batched(self):
+        # the skip must not turn a prefill-only trace into an empty census.
+        with self.assertRaises(ValueError):
+            hc.call_trace_to_v1([(0, 100, 2, [1, 2, 3, 4])], skip_batched=True)
+
+    def test_skip_batched_default_is_off(self):
+        # the name says the DEFAULT is off, so pin the default itself: the
+        # empty-list count would be zero whichever way it were set.
+        sig = inspect.signature(hc.call_trace_to_v1)
+        self.assertIs(sig.parameters["skip_batched"].default, False)
+
     def test_empty_call_trace_reports_zero_tokens(self):
         rows, rep = hc.call_trace_to_v1([])
         self.assertEqual(rows, [])
@@ -380,13 +411,113 @@ class TestCallTrace(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             calls = os.path.join(d, "c.trace")
             out = os.path.join(d, "v1.trace")
+            prov = os.path.join(d, "prov.txt")
             with open(calls, "w") as f:
                 f.write("0 100 2 3 4\n1 200 2 5 6\n2 100 2 7 8\n3 200 2 9 10\n")
-            rc = hc.main(["from-call-trace", "--call-trace", calls, "--out", out])
+            with open(prov, "w") as f:
+                f.write("# artifact=d48n card=A770 kv=u8\n")
+            rc = hc.main(["from-call-trace", "--call-trace", calls,
+                          "--provenance", prov, "--out", out])
             self.assertEqual(rc, 0)
             rows = hc.parse_trace(out)
             self.assertEqual(rows, [(0, 0, [3, 4]), (0, 1, [5, 6]),
                                     (1, 0, [7, 8]), (1, 1, [9, 10])])
+            prov_out = hc.read_provenance(out)
+            self.assertEqual(prov_out["artifact"], "d48n")
+            self.assertEqual(prov_out["card"], "A770")
+
+    def test_from_call_trace_cli_refuses_missing_provenance(self):
+        # an empty provenance file carries neither artifact= nor card=.
+        with tempfile.TemporaryDirectory() as d:
+            calls = os.path.join(d, "c.trace")
+            prov = os.path.join(d, "prov.txt")
+            with open(calls, "w") as f:
+                f.write("0 100 2 3 4\n")
+            with open(prov, "w") as f:
+                f.write("")
+            with self.assertRaises(ValueError):
+                hc.main(["from-call-trace", "--call-trace", calls,
+                         "--provenance", prov])
+
+    def test_from_call_trace_cli_refuses_incomplete_provenance(self):
+        # artifact without card is still unattributable: refused, not written.
+        with tempfile.TemporaryDirectory() as d:
+            calls = os.path.join(d, "c.trace")
+            prov = os.path.join(d, "prov.txt")
+            with open(calls, "w") as f:
+                f.write("0 100 2 3 4\n")
+            with open(prov, "w") as f:
+                f.write("# artifact=d48n\n")
+            with self.assertRaises(ValueError):
+                hc.main(["from-call-trace", "--call-trace", calls,
+                         "--provenance", prov])
+
+    def test_from_call_trace_cli_refuses_empty_provenance_values(self):
+        # an empty value is not an attribution: refused, not written.
+        with tempfile.TemporaryDirectory() as d:
+            calls = os.path.join(d, "c.trace")
+            prov = os.path.join(d, "prov.txt")
+            with open(calls, "w") as f:
+                f.write("0 100 2 3 4\n")
+            with open(prov, "w") as f:
+                f.write("# artifact_sha256= card=\n")
+            with self.assertRaises(ValueError):
+                hc.main(["from-call-trace", "--call-trace", calls,
+                         "--provenance", prov])
+
+    def test_from_call_trace_cli_accepts_the_artifact_sha256_spelling(self):
+        # §2's canonical key is artifact_sha256=; both spellings are accepted
+        # and the emitted header carries the one that was injected.
+        with tempfile.TemporaryDirectory() as d:
+            calls = os.path.join(d, "c.trace")
+            out = os.path.join(d, "v1.trace")
+            prov = os.path.join(d, "prov.txt")
+            with open(calls, "w") as f:
+                f.write("0 100 2 3 4\n1 200 2 5 6\n")
+            with open(prov, "w") as f:
+                f.write("# artifact_sha256=deadbeef card=8086:56A0\n")
+            rc = hc.main(["from-call-trace", "--call-trace", calls,
+                          "--provenance", prov, "--out", out])
+            self.assertEqual(rc, 0)
+            prov_out = hc.read_provenance(out)
+            self.assertEqual(prov_out["artifact_sha256"], "deadbeef")
+            self.assertEqual(prov_out["token_labels"], "reconstructed")
+
+    def test_from_call_trace_cli_stdout_is_a_valid_v1_trace(self):
+        with tempfile.TemporaryDirectory() as d:
+            calls = os.path.join(d, "c.trace")
+            prov = os.path.join(d, "prov.txt")
+            with open(calls, "w") as f:
+                f.write("0 100 2 3 4\n1 200 2 5 6\n")
+            with open(prov, "w") as f:
+                f.write("# artifact=d48n card=A770\n")
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = hc.main(["from-call-trace", "--call-trace", calls,
+                              "--provenance", prov])
+            self.assertEqual(rc, 0)
+            out = os.path.join(d, "stdout.trace")
+            with open(out, "w") as f:
+                f.write(buf.getvalue())
+            self.assertEqual(hc.read_provenance(out)["card"], "A770")
+            self.assertEqual(len(hc.parse_trace(out)), 2)
+
+    def test_from_call_trace_cli_skip_batched_reports_the_skip(self):
+        with tempfile.TemporaryDirectory() as d:
+            calls = os.path.join(d, "c.trace")
+            out = os.path.join(d, "v1.trace")
+            prov = os.path.join(d, "prov.txt")
+            with open(calls, "w") as f:
+                f.write("0 100 2 1 2 3 4\n1 200 2 5 6\n2 100 2 7 8\n3 200 2 9 10\n")
+            with open(prov, "w") as f:
+                f.write("# artifact=d48n card=A770\n")
+            rc = hc.main(["from-call-trace", "--call-trace", calls,
+                          "--provenance", prov, "--skip-batched", "--out", out])
+            self.assertEqual(rc, 0)
+            prov_out = hc.read_provenance(out)
+            self.assertEqual(prov_out["batched_calls_skipped"], "1")
+            self.assertEqual(prov_out["batched_tokens_skipped"], "2")
+            self.assertEqual(len(hc.parse_trace(out)), 3)
 
 
 class TestCli(unittest.TestCase):

@@ -11,3 +11,6 @@ CLAUDE.local.md
 *.local.md.tmp.*
 *.local.md.bak*
 review.md
+
+# operator-local scratch/archive: never tracked, never in a public repo
+.local-archive/
