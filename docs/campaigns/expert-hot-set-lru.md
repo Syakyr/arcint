@@ -401,3 +401,74 @@ and the campaign stops. Every disposition carries an evidence class
     continuation needs `ignore_eos: true` (window 002 was prefill-only for
     exactly this). Window 002's prefill census remains the stability
     comparand.
+- 2026-09-21 (night): **"frequency beats splitmix64" is now MEASURED, not a
+  hypothesis — and the REGIME of the calibration corpus decides the size of
+  the win.** [measured-here] New instrument `tools/expert_policy_compare.py`
+  (+ 33 red-first cells in `tools/test_expert_policy_compare.py`) replays three
+  per-layer policies at one budget over window 003's served census: the
+  INCUMBENT `static-splitmix64` (patch 0018's rule replicated exactly — seed
+  `0xF2A17C0DE5EED`, rank `splitmix64(splitmix64(seed ^ layer_key * 0xD6E8FEB86659FD93) ^ expert)`,
+  `layer_key` = the weight-file offset, tie-break on the ASCENDING id), the
+  CANDIDATE `static-frequency` (top-`slots` per layer from a calibration
+  census, ascending-id tie), and the comparand `lru-per-layer` (demand-warm).
+  The frequency seed is calibrated on accesses it is NOT scored on (the tool
+  REFUSES an in-sample seed), and the analytic chance baseline `slots/512` is
+  printed so "the incumbent is at chance" is checkable rather than asserted.
+  - **Protocol A — calibrate on the prefill+probe census (seq < 576), score the
+    held-out 512-token decode (245,760 accesses).** At 6 slots/layer (the
+    ratio-99 budget): splitmix64 **1.289%** (1.10x chance), frequency
+    **3.658%** (3.12x), LRU **0.219%**; at 10: 1.934 / 5.445 / 20.954 (chance
+    1.953); at 16: 3.087 / 10.205 / 34.348 (chance 3.125); at 32: 5.747 /
+    21.163 / 55.586 (chance 6.250); at 64: 11.946 / 38.525 / 69.164 (chance
+    12.500). **splitmix64 sits at chance at EVERY budget** (0.92-1.10x) — what a
+    frequency-free seed should do — while the census seed reaches 2.79-3.39x
+    chance.
+  - **Protocol B — calibrate on the FIRST HALF of the decode and score the
+    SECOND half (122,880 accesses), so both sides are the same regime.** At 6
+    slots/layer frequency reaches **14.591%** (12.45x chance) against splitmix64
+    1.262% and LRU 0.206%; at 10, 21.659% vs 1.923% and 18.127%; at 16, 29.563%
+    vs 3.073% and 29.548% — a TIE within 0.02 pt, not a win.
+  - **The finding that matters most: the calibration regime decides the win.** A
+    prefill-derived census under-predicts decode hotness by ~4x (3.658% vs
+    14.591% at 6 slots/layer). The corpus a hot set is seeded from must be the
+    regime that will be served; seeding from prefill and serving decode left a
+    factor of four on the table. Design rule, not a footnote.
+  - **The comparand is not decoration.** The demand-warm LRU — a TRUE LRU,
+    promoted on hit — is WORST at the ratio-99 budget (0.219%: it starts cold)
+    and BEST above ~10 slots/layer in protocol A (20.954% at 10, 69.164% at 64);
+    in protocol B the census seed beats it at 10 (21.659% vs 18.127%) and TIES at
+    16 (29.563% vs 29.548%). So the policy answer is budget- and
+    protocol-dependent — **static census seed at the tight budget, demand-warm
+    LRU once the budget can warm** — and the crossover is a measured number, not
+    an assumption.
+  - **Convergence (protocol A, S = 6, head bounded to the CALIBRATION window,
+    fixed decode tail).** Hit% over heads of 73 -> 576 calls: 3.524, 3.824,
+    3.196, 2.619, 2.767, 2.899, 3.422, 3.658 — **NOT monotone**, ending at the
+    full-census value (3.658%) only because the last head IS the full prefill
+    census. Membership churn is large early (**40, 33, 44 of 48 layers**
+    changing) and settles to 9-19 changes per step. So at this head length the
+    calibration has NOT converged, which agrees with `rounds_to_plateau=None`
+    over the decode rows: the two quantities differ (seed membership vs
+    decode-row ranking) and neither has plateaued. An earlier same-night draft
+    of this entry reported the series as monotone and nearly converged; that
+    series was IN-SAMPLE — its heads grew past the calibration window into the
+    scored tail — and is withdrawn here (the tool now bounds every head to
+    `[cal_lo, cal_hi)`; external review caught it before the commit).
+  - **Instrument corrections, dated in place.** This entry REPLACES the first
+    pass of the same night, whose hand-rolled comparand was **FIFO, not LRU**
+    (no promotion on a hit) and whose convergence series was in-sample; both were
+    caught in external review, which returned **NO-GO** with exactly these two as
+    the blockers. The LRU numbers above are the true-LRU rerun, and the incumbent
+    replication is now **cross-language verified**: the patch's own
+    `static_partition.hpp` was reconstructed from `0018-*.patch`, compiled with
+    `g++ -std=c++17`, and its `static_partition_rank_key` /
+    `static_partition_resident_experts` printed exactly the values the Python
+    cells pin (`rank(seed,0,0)=0xcab2b6579e38a8e3`,
+    `resident(lk=704,cap=6)=289,321,337,344,499,509`) — so the baseline is the
+    real incumbent, not an approximation of it.
+  - **Caveats, stated.** The evaluation windows are 512 decode tokens and do not
+    plateau (clause V3's failing shape stands), so these are hit fractions over a
+    window, not a converged steady state; window 004 (4,096 decode tokens,
+    running) is the longer test; the chance baseline is analytic; and NO served
+    throughput is claimed — the speed row stays EMPTY, G stays UNPINNED, and no
+    acceptance row moves.

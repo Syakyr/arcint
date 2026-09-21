@@ -191,6 +191,28 @@ same corpus can be replayed after the policy lands.
    **comparand** — the demand-warm LRU and patch 0018's random
    `splitmix64` seed — so the policy's gain is a delta against a measured
    baseline in one window, per `partition-seeding`'s gate shape.
+   **2026-09-21: the comparand is now an instrument of its own** —
+   `tools/expert_policy_compare.py` (+ 33 red-first cells), which replays all
+   three policies at one budget and refuses an in-sample frequency seed.
+   MEASURED on window 003's served census, in TWO protocols: calibrating on
+   the prefill census and scoring the held-out decode, the incumbent sits at
+   CHANCE at every budget (0.92–1.10× `slots/512`) while the census seed
+   reaches 2.79–3.39× chance (6 slots/layer: 3.658% vs 1.289%, chance 1.172%);
+   calibrating on the FIRST HALF of the decode and scoring the SECOND half —
+   same regime on both sides — the census seed reaches 12.45× chance at 6
+   slots/layer (14.591% vs 1.262%), beats the demand-warm LRU at 10 slots/layer
+   (21.659% vs 18.127%) and TIES it at 16 (29.563% vs 29.548%). **The
+   calibration REGIME decides the win**: a prefill-derived census
+   under-predicts decode hotness by ~4×, so the corpus a hot set is seeded from
+   must be the regime that will be served. The comparand — a TRUE LRU, promoted
+   on hit — is worst at the ratio-99 budget (0.219%: cold) and best above ~10
+   slots/layer IN PROTOCOL A (20.954% at 10, 69.164% at 64), where the census
+   seed is only 2.79–3.39× chance; the answer is therefore budget- and
+   protocol-dependent — static census seed at the tight budget, demand-warm LRU
+   once the budget can warm. The incumbent replica is **cross-language
+   verified**: the patch's `static_partition.hpp`, reconstructed from
+   `0018-*.patch` and compiled with `g++ -std=c++17`, prints exactly the values
+   the Python cells pin.
 3. **Rounds-to-plateau.** The replay is run over trace prefixes of length
    `1, 2, 4, ...` tokens; plateau is the first prefix length `r` at which
    the selected hot set per layer is **unchanged** for two consecutive
@@ -268,6 +290,21 @@ code inspection.
    raw-`layer_key` join against patch 0013's CSV matches exactly, the decode
    rows convert to 512 x 48 v1 rows, and the chosen ranking does **not**
    plateau within 512 decode tokens at S = 6 or S = 10 (V3's failing shape).
+
+4. **Policy-comparand cells — RUN 2026-09-21.** [measured-here]
+   `tools/expert_policy_compare.py` (+ 33 cells in
+   `tools/test_expert_policy_compare.py`) pins: patch 0018's rank key against
+   GOLDEN values computed from its own constants (a changed mix, layer-mix
+   constant or seed is caught, not silently accepted); the incumbent's set is
+   deterministic, ascending and edge-correct (0 slots -> empty, >= num_expert
+   -> everything, capacity clamped), with the tie-break pinned to the
+   ASCENDING expert id under a mocked constant rank; the frequency seed is the
+   top-`slots` with an ascending-id tie; the calibration census COUNTS batched
+   calls while the evaluation keeps only single-chunk decode calls and counts
+   the skipped ones; the format is read from the header marker (a v1 row's
+   third field can divide the id count and masquerade as a `top_k`, so a
+   row-guess is refused); and the honesty guard REFUSES an in-sample frequency
+   seed. The measured numbers are in the campaign status entry of 2026-09-21.
 
 *Caveat.* `call_trace_to_v1` reconstructs token boundaries from a repeated
 `layer_key`, which is exact only if every layer's calls for one decode step
