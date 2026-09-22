@@ -687,3 +687,19 @@ and the campaign stops. Every disposition carries an evidence class
   prediction is a shortfall (V1) with the hot-set *correctly engaged*. A
   measured decode at or above the gate overturns the prediction and G is
   corrected in place with the measurement's date.
+
+- 2026-09-22 (rate leg, cross-reference) — **the speed leg ran: V1 at the
+  ratio-99 VENICE budget, and the dispatch route shows a §3.4/V4
+  answer-dependence.** [measured-here] A770, native `d48n`, plugin `ov-0047`,
+  ratio 99: census S5 **0.556 t/s** against the same-day host-tier comparand
+  0.526 (< the pinned 0.579), B60 0.555 against 0.88 — **V1**; the speed row
+  stays EMPTY. The residency sweep puts the win at ratio 75: census top-128
+  **0.842 t/s** against the same-config host control **0.465 t/s** = 1.81×
+  (`ρ = 0.073 [derived]`). **The quality row's PASS was measured without
+  `--moe-per-expert-dispatch`** (every routed expert on the host tier,
+  residency moves bytes not arithmetic) and therefore does not cover the
+  dispatch route; there the greedy answer changes with the resident seed
+  (splitmix64 `55dff6f2…` vs census `2e7c508f…` at ratio 99), so the policy is
+  **visible** on that route: **V4 FIRES (RED)** and the dispatch-route quality
+  is **OPEN**, not PASS. Full raw evidence and the §3.4 finding:
+  `sub4bit-vram-kernel.md`, status 2026-09-22 (rate leg); DESIGN §7.0.2ce.

@@ -120,6 +120,25 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
   `moe_cpu_expert` threads at ~90% CPU during the load probe), not a JIT and
   not a deadlock; it terminates. The rate win stays open (resident fraction,
   hot-set/LRU HELD).
+- **The rate leg: V1 at the ratio-99 budget, 1.81x at ratio 75.** The
+  VENICE speed gate (G = 1.10) is measured on the serving native route:
+  at ratio 99 the census-seeded route decodes 0.556 t/s on the 16 GiB card
+  against a 0.579 t/s bar (same-day host-tier comparand 0.526) and
+  0.555 t/s on the 24 GB card against 0.88 — **V1 fires, the speed row
+  stays EMPTY**. The residency sweep locates the win: ratio 75, census
+  top-128, 0.842 t/s against the same-config host control 0.465 t/s =
+  **1.81x** (`rho = 0.073 [derived]`: the card ~13x the host per resident
+  expert pair). The prediction commit's `rho` was corrected in place — the
+  ratio-99 shortfall is a hit-fraction limit, not a per-pair limit. **A new
+  §3.4/V4 finding:** on the dispatch route the greedy answer depends on the
+  resident seed (splitmix64 vs census), because the GPU per-expert kernel
+  and the host tier are not bit-identical — **V4 FIRES (RED) on that
+  route**; the earlier no-V4 quality PASS was measured without the dispatch
+  flag and does not cover this route. The
+  `--fit-ledger-dir` probe skip reproduces the same greedy answers; the
+  affine per-expert path (u4 `d48g`) serves under 0047 with a non-zero
+  counter (rate not comparable: cold disk). Ratio 50 is refused on the
+  16 GiB card and did not return on the 24 GB card.
 
 ### The serving-shape MoE block fuses (campaign: sub4bit-vram-kernel)
 

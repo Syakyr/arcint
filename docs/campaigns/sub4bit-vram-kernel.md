@@ -756,3 +756,151 @@ fusion-impact profile, not a kernel micro-benchmark) applies.
     (2) the rate win needs the HELD hot-set/LRU campaign; (3) the affine
     per-expert path (0040, u4 artifact) is owed under 0047. The decode
     arithmetic stays pinned device-free (16 cells).
+
+- 2026-09-22 (rate leg) — **the native per-expert route's rate comparison:
+the mechanism serves and pays at high residency; the ratio-99 VENICE budget
+does NOT meet the pinned gate (V1), and the dispatch route shows a §3.4/V4
+answer-divergence.** [measured-here] One fresh process per arm, A770 (GPU.1,
+PCI 8086:56a0) and B60 (GPU.0, PCI 8086:e211), native `d48n`, plugin
+`ov-0047` (`f021de51b5812ee2`), binary tree `wt-b6dbca5` (`f6abb4027a976ad6`),
+`--moe-cpu-tier --moe-per-expert-dispatch`, KV u8, one lane, n_ctx 8192,
+greedy 64 tokens, temperature 0, `ignore_eos`, the pinned capture window-0's
+first 256 token ids. `--fit-ledger-dir` skips the load-time plateau +
+activation probes on the second matching run (probe-skip below).
+
+  **Rate table (decode 64 tokens):**
+  | run | card | ratio | seed | decode t/s | prefill t/s | gpu_hit_rate | per_expert_gpu_invocations | cpu_tier_pairs | card-pair share | answer sha256 |
+  |---|---|---|---|---|---|---|---|---|---|---|
+  | splitmix64 seed | A770 | 99 | splitmix64 | **0.547** | 0.736 | 0.580 % | 5,126 | 212,477 | 1.19 % | `55dff6f2…` |
+  | census seed | A770 | 99 | S5 | **0.556** | 0.789 | 3.285 % | 16,230 | 206,925 | 3.77 % | `2e7c508f…` |
+  | census seed | A770 | 75 | S128 | **0.842** | 1.328 | 33.22 % | 207,970 | 111,055 | 48.36 % | `5cd2e195…` |
+  | host control (no dispatch) | A770 | 75 | — | **0.465** | 0.676 | — | 0 | 159,264 | n/a | `5437683b…` |
+  | census seed | B60 | 99 | S5 | **0.555** | 0.746 | 3.098 % | 30,778 | 383,971 | 3.85 % (mixture) | `7e0adcd6…` |
+
+  Card-pair share = `(invocations/2) / (invocations/2 + cpu_tier_pairs)`,
+with the two per-expert kernels (gate-up and down) per card pair. It is
+defined for the dispatch arms only: they total 215,040 pairs = 448 tokens ×
+48 layers × 10 experts exactly (128 warm-up + 320 served tokens). The host
+control runs the fused/tier path, whose `cpu_tier_pairs` counts differently
+(159,264) and has no card pairs, so it is the rate baseline and not a share
+point. The A770 splitmix64/census ratio-99 runs and the A770 ratio-75 rows
+are ledger hits (served-only counters); the B60 ratio-99 run is the first at
+its key, so its counters include the load probe (*mixture*).
+
+  **Raw evidence (excerpt per arm; OTD_PERF lines elided at `…`, answer
+sha256 prefixes):**
+
+      # A770 ratio-99 splitmix64 (ledger hit)
+      lgc  slot 0: decode     64 tok in 116.91 s (  0.5 t/s)
+      lgc  slot 0: prefill   256 tok in 347.80 s (  0.7 t/s)
+      [OTD_PERF] gpu_hits=288, gpu_misses=49398, gpu_hit_rate=0.57964%, …
+                 per_expert_dispatches=49686, per_expert_gpu_invocations=5126, …
+                 cpu_tier_pairs=212477, created_onednn_kernels=0
+      # A770 ratio-99 census S5 (ledger hit)
+      lgc  slot 0: decode     64 tok in 115.17 s (  0.6 t/s)
+      lgc  slot 0: prefill   256 tok in 324.37 s (  0.8 t/s)
+      [OTD_PERF] gpu_hits=1632, gpu_misses=48051, gpu_hit_rate=3.28483%, …
+                 per_expert_dispatches=49683, per_expert_gpu_invocations=16230, …
+                 cpu_tier_pairs=206925, created_onednn_kernels=0
+      # A770 ratio-75 census S128 (ledger hit)
+      lgc  slot 0: decode     64 tok in 75.98 s (  0.8 t/s)
+      lgc  slot 0: prefill   256 tok in 192.75 s (  1.3 t/s)
+      [OTD_PERF] gpu_hits=18008, gpu_misses=36208, gpu_hit_rate=33.2153%, …
+                 per_expert_dispatches=54216, per_expert_gpu_invocations=207970, …
+                 cpu_tier_pairs=111055, created_onednn_kernels=0
+      # A770 ratio-75 host control (no dispatch, ledger hit)
+      lgc  slot 0: decode     64 tok in 137.69 s (  0.5 t/s)
+      lgc  slot 0: prefill   256 tok in 378.75 s (  0.7 t/s)
+      [OTD_PERF] gpu_hits=10185, gpu_misses=47803, gpu_hit_rate=17.564%, …
+                 per_expert_dispatches=0, per_expert_gpu_invocations=0, …
+                 cpu_tier_pairs=159264, created_onednn_kernels=0
+      # B60 ratio-99 census S5 (first run, probe mixture)
+      lgc  slot 0: decode     64 tok in 115.31 s (  0.6 t/s)
+      lgc  slot 0: prefill   256 tok in 343.19 s (  0.7 t/s)
+      [OTD_PERF] gpu_hits=2154, gpu_misses=67369, gpu_hit_rate=3.09826%, …
+                 per_expert_dispatches=69523, per_expert_gpu_invocations=30778, …
+                 cpu_tier_pairs=383971, created_onednn_kernels=0
+      # Affine d48g ratio-75 (first run)
+      lgc  slot 0: decode     64 tok in 758.25 s (  0.1 t/s)
+      lgc  slot 0: prefill   256 tok in 1172.74 s (  0.2 t/s)
+      [OTD_PERF] gpu_hits=22539, gpu_misses=86539, gpu_hit_rate=20.6632%, …
+                 per_expert_dispatches=69899, per_expert_gpu_invocations=14930, …
+                 cpu_tier_pairs=575473, created_onednn_kernels=0
+
+  **§3.4 / V4 finding — V4 FIRES (RED) on the dispatch route.**
+[measured-here, `code`] The A770 ratio-99 arms differ ONLY in the resident
+seed and produce different greedy answers: splitmix64 `55dff6f2…` vs census
+`2e7c508f…` (the splitmix64 ledger-hit repeat reproduced `55dff6f2…`, and
+the A770 served path is bit-identical across forwards, so this is not
+run-to-run noise). VENICE clause V4 fires literally: the census-seeded policy
+changes a served greedy digest. The cause is structural: under
+`--moe-per-expert-dispatch` a resident expert is computed by the GPU
+per-expert kernel while a miss is computed by the host tier, and the two
+paths are not bit-identical by construction (`code`: the GPU kernels run at
+the plugin's execution precision, the host tier decodes rows to f32 scratch);
+so the served output depends on which experts happen to be resident — what
+DESIGN §3.4 forbids. The VENICE quality row's **PASS / no V4** was measured
+WITHOUT `--moe-per-expert-dispatch` (every routed expert on the host tier,
+residency moves bytes, not arithmetic) and therefore does NOT cover this
+route. This is recorded as a NEW open item, not smoothed: the speed route
+must either make GPU and host expert arithmetic bit-identical or be admitted
+only where residency cannot move arithmetic.
+
+  **Ratio-99 VENICE budget: V1.** The pinned gate (`docs/window-052.md`,
+G = 1.10, 2026-09-22) reads **0.556 < 1.10 × 0.526 = 0.579 t/s** on the
+A770 (same-day host-tier comparand) and **0.555 < 1.10 × 0.8 = 0.88 t/s** on
+the B60 (recorded band's upper edge). The speed row stays EMPTY.
+
+  **The sweep says where the win is.** At ratio 75 (128 slots/layer, census
+top-128 = 67.66 % corpus coverage) the same-config host control is 0.465 t/s
+and the census-seeded resident route is **0.842 t/s = 1.81×**. Fitting
+`R(h) = H/(1 − h(1−ρ))` to that pair with the unrounded rates
+(`H = 0.464810`, `R = 0.842327`, `h = 0.483557`) gives **ρ = 0.073**
+`[derived]`, i.e. the card computes a resident expert pair ~13× faster than
+the host; the ratio-99 point is consistent within ~2 % (predicted 0.542 vs
+measured 0.556). The ratio-99 budget's 5 slots/layer hold only 3.77 % of the
+served request's pairs, whose free-card ceiling (`ρ = 0`) is
+`1/(1 − 0.0377) = 1.039`, so no 1.10× win is reachable there. This is the
+campaign's "the rate win needs the resident fraction" made numeric; it is NOT
+a defect. The host control uses the fused/tier path (no per-expert dispatch),
+so it prices the host tier without the per-expert dispatch overhead; the
+1.81× is therefore a lower bound on the per-expert route's advantage.
+
+  **G-pin correction (dated in place, `docs/window-052.md`).** The prediction
+commit's `ρ ≈ 1.55` was drawn from the ratio-75 counters BEFORE their phase
+composition was attributed; the served-only measurement gives
+`ρ = 0.073 [derived]`, so the card is fast and the ratio-99 shortfall is a
+hit-fraction limit, not a per-pair limit. The pinned G stays 1.10 and the
+predicted verdict (V1) holds; its reasoning was wrong and is corrected in
+place.
+
+  **Ratio 50 refused / unusable.** A770: the plateau probe throws
+(`clEnqueueWriteBuffer, error code: -5 CL_OUT_OF_RESOURCES`) and the analytic
+pinned-pool fallback prices 28.12 GiB against the 16 GiB card — the static
+partition refuses the 16 GiB card at ratio 50 (DESIGN §7.0.2ai). B60: ratio
+50 LOADS (probe 0.37 GiB device) but the request did not return in 62 min
+(the connection dropped, no decode line); the process was killed and no rate
+was read.
+
+  **Probe-skip, shown same-numbers.** `--fit-ledger-dir` skipped the
+14–27-minute load probe on the second matching run; the A770 ratio-99
+splitmix64 original and its ledger-hit repeat produced the **same greedy
+answer** (`55dff6f2…`) at 0.535 / 0.547 t/s, and the ratio-75 census original
+and repeat produced the same `5cd2e195…` at 0.836 / 0.842 t/s. The plugin,
+artifact and prompt are unchanged across the pair; only the probe skip
+differs.
+
+  **Affine per-expert path (patch 0040, u4 artifact `d48g`) under 0047:
+UNBLOCKED.** [measured-here] A770 ratio 75, same harness:
+`per_expert_dispatches=69899, per_expert_gpu_invocations=14930`, hit
+20.66 %, no fault, answer `ed01eb71…`. The rate (decode 64 tok in 758 s) is
+NOT comparable: the run was cold on ZFS (`avg_disk_io_us=11901`, 481 s of
+disk I/O in the counters). The owed cell is therefore closed as
+*serves under 0047 with a non-zero card counter*; a warm rate is not claimed.
+
+  Open after this leg: (1) the dispatch route's §3.4/V4 answer-dependence
+(above); (2) the ratio-99 budget's realized hit (3.77 %) is below the corpus
+top-5 coverage (9.96 %) because a 256+64-token request does not sample the
+whole corpus — whether a longer served request at ratio 99 reaches the
+9.96 % coverage is the hot-set/LRU campaign's to measure; (3) the 5-slot
+pool's ledger/engine off-by-one (`docs/window-052.md`).

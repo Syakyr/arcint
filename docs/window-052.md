@@ -120,6 +120,26 @@ date. **A V1 firing with the hot-set correctly engaged (the census seed
 serving at `seed_source=census`, its top-5 pinned) is the predicted shape;
 V1's "the hot-set did not engage" branch is not implied.**
 
+[CORRECTED 2026-09-22 (measured), after the rate leg: the pin's `ρ ≈ 1.55`
+was drawn from the ratio-75 counters *before* their phase composition was
+attributed; the served-only measurement reverses it. The A770 ratio-75
+ledger-hit arm (census top-128, `h = 0.4836`) decodes **0.842 t/s** against
+the same-config host control **0.465 t/s**, which solves
+`ρ = 1 − (1 − H/R)/h` on the unrounded rates to **ρ = 0.073 `[derived]`** —
+the card computes a resident expert pair ~13× faster than the host. The pin
+`G = 1.10` and the predicted verdict stand; only the reason is corrected:
+the ratio-99 budget fails because just **3.77 %** of its served pairs are
+resident (not the corpus's 9.96 % top-5 coverage), whose free-card ceiling
+(`ρ = 0`) is `1/(1 − 0.0377) = 1.039`, so no 1.10× win is reachable there.
+At ratio 75 the fit reaches 1.81× against a free-card ceiling of 1.936. The
+resident-compute rate the gate wanted is therefore **ρ = 0.073 `[derived]`**,
+no longer "not separately measured"; the ratio-75 counters' phase mixture is
+the reason the prediction commit could not see it. **New §3.4/V4 finding,
+V4 FIRES (RED) (same leg):** on the dispatch route the served answer depends
+on the resident seed (splitmix64 `55dff6f2…` vs census `2e7c508f…` at
+ratio 99), because the GPU per-expert kernel and the host tier are not
+bit-identical; recorded in `docs/campaigns/sub4bit-vram-kernel.md`.]
+
 ## The bar in force
 
 `bar_0.5.1 = 100 × F_ref` = **3.0905e-03 nats below row 2051 /
@@ -134,11 +154,11 @@ nothing here. Any KL reading must print `F_served` beside it; a bar below
 
 | quantity | predicted | measured |
 |---|---|---|
-| warm-up decode vs the host-bound baseline | ≥ G × (measured d48n 0.5–0.8 t/s), **G = 1.10** (pinned 2026-09-22, PREDICTION; see Entry criteria and the G-pin section). Thresholds read against the band's upper edge: B60 **< 0.88 t/s** fails, A770 **< 0.579 t/s** fails | EMPTY |
+| warm-up decode vs the host-bound baseline | ≥ G × (measured d48n 0.5–0.8 t/s), **G = 1.10** (pinned 2026-09-22, PREDICTION; see Entry criteria and the G-pin section). Thresholds: B60 **< 0.88 t/s** fails (1.10 × the band's upper edge 0.8), A770 **< 0.579 t/s** fails (1.10 × the same-day host-tier comparand 0.526) | **MEASURED — V1 FIRES (2026-09-22), speed row NOT filled.** `measured-here`, one fresh process per arm, native `d48n`, plugin `ov-0047`, KV u8, one lane, the capture window-0's first 256 ids, greedy 64, temperature 0: at the ratio-99 VENICE budget the census-seeded resident route is **0.556 t/s** on the A770 (splitmix64 seed 0.547; same-day host-tier comparand 0.526) — **< 0.579 t/s** — and **0.555 t/s** on the B60 — **< 0.88 t/s**. The shortfall is recorded here and the row is not filled. The residency sweep puts the win at ratio 75: census top-128 gives **0.842 t/s** against the same-config host control **0.465 t/s** = **1.81×** (`ρ = 0.073 [derived]`). Raw logs in `docs/campaigns/sub4bit-vram-kernel.md`, status 2026-09-22 (rate leg). **Scope caveat:** the same leg measured a §3.4 answer-dependence on the dispatch route (the served answer changes with the resident seed); the quality row below was measured on the non-dispatch path and does not cover it. |
 | stale-byte zero proof | digest(host-bound bytes of expert E) == digest(card-bound bytes of the same E), every E in the hot set | EMPTY |
 | convergence | rounds-to-plateau printed with the census | **MEASURED 2026-09-22** (`measured-here`): `rounds_to_plateau = None`, `plateau = False` at **S = 6 and S = 10**, at both **512 decode tokens** (window 003) and **4,096 decode tokens** (window 004); the selected resident set changed at every power-of-two prefix including 2,048 → 4,096. **V3 FIRES (2026-09-22):** the census does not plateau within the rounds this corpus admits, so the policy is not converging at this corpus length. Raw series in `docs/campaigns/expert-hot-set-lru.md` (status, 2026-09-21 night) and the window-004 plateau JSONs. |
 | seed implication at the ratio-99 budget | coverage of the corpus's routed accesses by the census-seeded static partition (input to the seed decision; not a V-clause) | **MEASURED 2026-09-22** (`measured-here`): window 004 corpus census (3,278,880 accesses, 6,831 × 48 × 10): S = 6 **11.37 %**, S = 10 **16.22 %**, S = 16 **22.19 %**, S = 32 **33.84 %**, S = 64 **49.20 %**; analytic chance S/512 = 1.17 / 1.95 / 3.13 / 6.25 / 12.50 %. The incumbent `splitmix64` seed sits at chance at every budget (0.92–1.10× `slots/512`), so the census seed reaches 9.70 / 8.31 / 7.10 / 5.41 / 3.94× chance here. Coverage is a hit fraction over a non-plateauing window, not a converged steady state. **Measured correction (2026-09-22):** the plugin's actual pool at ``--offload-ratio 99`` is **5 slots/layer**, not 6 — `prepare_moe_otd_params` uses integer division `512*(100-99)/100 = 5`, while the engine's own ledger (`src/exec/fit.h`) prices `ceil(...) = 6`. The S = 6 seed is therefore REFUSED at load (measured: `census seed: layer_key … lists 6 experts but the pool has 5 slots (mismatched budget)`), and the served seed uses the corpus top-5 (coverage **9.96 %**, computed by grouping the corpus census CSV by layer, sorting `(-count, expert)` and summing the top 5: raw output `S=5: 9.9595%`, `S=6: 11.3721%`, in the session's `quality-report.txt`). The S = 6…64 numbers above are the engine-priced offline analysis; the served pool is one slot smaller. |
-| quality under policy | no greedy digest change vs the pre-policy served answer | **MEASURED 2026-09-22** (`measured-here`): **PASS, no V4.** On the A770 (GPU.1, PCI 8086:56a0), native d48n artifact, `--offload-ratio 99 --moe-cpu-tier`, KV u8, chunk 512, one served window per arm, same 256-token prompt and greedy 32 tokens (temperature 0): incumbent `splitmix64` seed → greedy text sha256 `2169836b33e8bc74d7965fff867b13c1d3637388a4b52f11f639f381ce7cc36f`; corpus census seed (S = 5, the plugin's measured pool) → the **same** `2169836b…336f`. Byte-identical greedy output, so the census-seeded static partition is not visible under DESIGN §3.4. Plugin for the window: VENICE tree + patches 0003–0045 + 0046 (`d72c00bf…`); raw evidence in the session's `quality-report.txt` on the persistent census path. |
+| quality under policy | no greedy digest change vs the pre-policy served answer | **MEASURED 2026-09-22** (`measured-here`): **PASS, no V4.** On the A770 (GPU.1, PCI 8086:56a0), native d48n artifact, `--offload-ratio 99 --moe-cpu-tier`, KV u8, chunk 512, one served window per arm, same 256-token prompt and greedy 32 tokens (temperature 0): incumbent `splitmix64` seed → greedy text sha256 `2169836b33e8bc74d7965fff867b13c1d3637388a4b52f11f639f381ce7cc36f`; corpus census seed (S = 5, the plugin's measured pool) → the **same** `2169836b…336f`. Byte-identical greedy output, so the census-seeded static partition is not visible under DESIGN §3.4. Plugin for the window: VENICE tree + patches 0003–0045 + 0046 (`d72c00bf…`); raw evidence in the session's `quality-report.txt` on the persistent census path. **[SCOPE 2026-09-22: this PASS was measured WITHOUT `--moe-per-expert-dispatch`, so every routed expert ran on the host tier and residency moved bytes, not arithmetic. It does NOT cover the dispatch route: there the 2026-09-22 rate leg measured a §3.4 answer-dependence by resident seed (splitmix64 `55dff6f2…` vs census `2e7c508f…`), so **V4 FIRES (RED) on that route** and its quality is OPEN, not PASS (`docs/campaigns/sub4bit-vram-kernel.md`).]** |
 | verdict | REPORT ONLY until the tag | EMPTY |
 
 ## Falsifiable clauses (each can fail)
@@ -284,3 +304,18 @@ nothing here. Any KL reading must print `F_served` beside it; a bar below
   Falsifiable: a measured decode at or above the gate overturns it, and G is
   corrected in place with the measurement's date. The speed row itself stays
   EMPTY until the measurement.
+- 2026-09-22 (rate leg, MEASURED) — **V1 fires at the ratio-99 VENICE budget;
+the speed row stays EMPTY, and the sweep locates the win at ratio 75.**
+[measured-here] Native `d48n`, plugin `ov-0047` (`f021de51b5812ee2`), one
+fresh process per arm, KV u8, one lane, the capture window-0's first 256 ids,
+greedy 64, temperature 0. `--fit-ledger-dir` skipped the load probes on the
+second matching run (same greedy answer reproduced). The gate at ratio 99:
+A770 census **0.556 t/s** < 1.10 × 0.526 = 0.579 (incumbent 0.547; same-day
+host-tier comparand 0.526); B60 census **0.555 t/s** < 1.10 × 0.8 = 0.88.
+The residency sweep: A770 ratio 75 census top-128 **0.842 t/s** against the
+same-config host control **0.465 t/s** = **1.81×**, `ρ = 0.073` (the card
+~13× the host per pair). The pin's `ρ ≈ 1.55` premise is corrected in place
+above; `G = 1.10` and the V1 verdict stand. The ratio-50 point is refused on
+the A770 (16 GiB card) and did not return on the B60. Raw evidence in
+`docs/campaigns/sub4bit-vram-kernel.md`, status 2026-09-22 (rate leg). The
+stale-byte proof stays EMPTY (no engine-side host/card readback).

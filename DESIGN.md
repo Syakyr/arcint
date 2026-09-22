@@ -9594,11 +9594,91 @@ ratio 75 only 25% of routed experts are resident.
 **What remains.** [documented] (1) The load-time probes run the CPU tier on
 every routed expert, making a per-expert native load 14 minutes at chunk 128;
 a served window that skips the probe (`--fit-ledger-dir` with a matching entry)
-or a cold-start fix is the practical route to rate measurement. (2) The ratio 75
+or a cold-start fix is the practical route to rate measurement. [DATED
+2026-09-22: `--fit-ledger-dir` now does this and is shown to reproduce the
+same greedy answers; see §7.0.2ce.] (2) The ratio 75
 rate is 0.6 t/s, a lower bound, not a win — the win needs the resident fraction
 (the HELD hot-set/LRU campaign). (3) The affine per-expert path (patch 0040, u4
 artifact) is not re-measured under 0047; it shares the same allocation and is
-expected to be unblocked, but that cell is owed.
+expected to be unblocked, but that cell is owed. [DATED 2026-09-22: it serves
+under 0047 with a non-zero card counter
+(`per_expert_gpu_invocations=14930`) and no fault; the rate is not comparable
+(cold disk). See §7.0.2ce.]
+
+#### 7.0.2ce The native per-expert route's rate: V1 at the ratio-99 budget, and 1.81x at ratio 75 (2026-09-22)
+
+Campaign: `docs/campaigns/sub4bit-vram-kernel.md`; acceptance
+`docs/window-052.md` (G pinned 2026-09-22); plugin `ov-0047`
+(`f021de51b5812ee2`); design note
+`docs/design-routing-aware-expert-execution.md` §2.3d/§3.2.
+
+**What was measured.** [measured-here] The native per-expert route (patch
+0043/0045) on the 0047 plugin, one fresh process per arm, native `d48n`,
+`--offload-ratio {99,75} --moe-cpu-tier --moe-per-expert-dispatch`, KV u8,
+one lane, the pinned capture's window-0 first 256 token ids, greedy 64,
+temperature 0:
+
+| card | ratio | seed | decode t/s | prefill t/s | hit | card-pair share |
+|---|---|---|---|---|---|---|
+| A770 GPU.1 | 99 | splitmix64 seed | 0.547 | 0.736 | 0.58 % | 1.19 % |
+| A770 GPU.1 | 99 | census S5 | 0.556 | 0.789 | 3.29 % | 3.77 % |
+| A770 GPU.1 | 75 | census S128 | **0.842** | 1.328 | 33.2 % | 48.4 % |
+| A770 GPU.1 | 75 | host control | **0.465** | 0.676 | — | n/a |
+| B60 GPU.0 | 99 | census S5 | 0.555 | 0.746 | 3.10 % | 3.85 % (probe mix) |
+
+**V1 at the ratio-99 budget.** [measured-here] The pinned gate G = 1.10 reads
+`0.556 < 1.10 x 0.526 = 0.579 t/s` on the A770 (same-day host-tier
+comparand) and `0.555 < 1.10 x 0.8 = 0.88 t/s` on the B60. The speed row
+stays EMPTY and V1 fires.
+
+**The sweep locates the win, and corrects the prediction's mechanism.**
+[measured-here, `derived` for the fit] At ratio 75 the same-config host control
+is 0.465 t/s and the census-seeded route is 0.842 t/s = **1.81x**. The model
+`R(h) = H/(1 - h(1-rho))` solved on that pair with the unrounded rates
+(`H = 0.464810`, `R = 0.842327`, `h = 0.483557`) gives **rho = 0.073
+[derived]**: the card computes a resident expert pair ~13x faster than the
+host. The ratio-99 budget's 5 slots/layer hold only 3.77 % of the served
+request's pairs, whose free-card ceiling (`rho = 0`) is
+`1/(1 - 0.0377) = 1.039`, so no 1.10x win is reachable there; at ratio 75 the
+fit's 1.81x sits below that hit's free-card ceiling of 1.936. The prediction
+commit's `rho ~ 1.55` came from the ratio-75 counters before their phase
+composition was attributed (255,840 pairs = 533 tokens against a 21-token
+served request); the served-only ledger-hit authenticates the 0.073. The
+finding is the campaign's "the rate win needs the resident fraction" made
+numeric -- not a defect of the kernel.
+
+**A §3.4/V4 finding on the dispatch route.** [measured-here, `code`] The A770
+ratio-99 arms differ only in the resident seed yet produce different greedy
+answers (splitmix64 `55dff6f2…` vs census `2e7c508f…`); the splitmix64
+ledger-hit repeat reproduces `55dff6f2…`, and the A770 served path is
+bit-identical across forwards, so it is not run-to-run noise. Under
+`--moe-per-expert-dispatch` a resident expert is computed by the GPU
+per-expert kernel and a miss by the host tier, and the two paths are not
+bit-identical by construction (`code`: GPU at the plugin's execution
+precision, host rows decoded to f32 scratch), so residency moves arithmetic —
+what DESIGN §3.4 forbids, and VENICE clause V4 fires (RED). The VENICE quality
+row's PASS was measured without `--moe-per-expert-dispatch` and does not cover
+this route; the dispatch route's quality is OPEN.
+
+**Probe-skip.** [measured-here] `--fit-ledger-dir` skips the load-time
+plateau + activation probes on a second matching run (14-27 min saved); the
+A770 ratio-99 splitmix64 original and its repeat produced the same greedy
+answer (`55dff6f2…`) at 0.535 / 0.547 t/s, the ratio-75 census original and
+repeat the same `5cd2e195…` at 0.836 / 0.842 t/s.
+
+**Affine and ratio-50.** [measured-here] The affine per-expert path (patch
+0040, u4 artifact `d48g`) under 0047 serves with
+`per_expert_gpu_invocations=14930` and no fault -- the owed cell closes as
+*unblocked*; its rate (cold ZFS, 481 s of disk I/O) is not comparable. Ratio
+50 is refused on the 16 GiB A770 (`clEnqueueWriteBuffer CL_OUT_OF_RESOURCES`,
+analytic fallback 28.12 GiB) and did not return on the B60.
+
+**Accounting note.** [code] The dispatch arms' counters total 215,040 pairs =
+448 tokens x 48 layers x 10 experts (128 warm-up + 320 served tokens), so the
+card-pair share `(invocations/2)/(invocations/2 + cpu_tier_pairs)` is exact.
+The host control runs the fused/tier path, whose `cpu_tier_pairs` counts
+differently (159,264) and has no card pairs; it is the rate baseline, not a
+share point.
 
 #### 7.0.3 KV precision on the paged path — u8 is the lever, u4 is a tax
 
