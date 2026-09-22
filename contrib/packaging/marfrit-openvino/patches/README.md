@@ -1037,6 +1037,72 @@ They are listed here so that nobody re-derives the decision by trying them.
   restricted to the GDN sets the gain is 66.6 against 66.4 t/s — inside the
   noise. DESIGN records it as "not carried".
 
+### 0046-moe-cpu-tier-census-seed.patch
+
+The census-seeded static partition for the MoE host compute tier (campaign
+`docs/campaigns/expert-hot-set-lru.md`, design
+`docs/design-expert-hot-set-lru.md` §5.1). Patch 0018 chooses a layer's
+resident expert set with a frequency-FREE `splitmix64(seed, layer_key,
+expert)` rank, measured (`tools/expert_policy_compare.py`) to sit at CHANCE at
+every budget (0.92–1.10× `slots/512`). This patch replaces that ranking with a
+measured-frequency rank from a served-routing census, so the pinned half is
+the hot half, while keeping DESIGN §3.4: the seed is a pure function of the
+RECORDED census, not of run history.
+
+New file `census_seed.hpp` (deliberately OpenVINO-free): a parser for the
+"hot-set seed v2" format, one data line per layer
+
+    <layer_key> <expert> <expert> ...
+
+with a MANDATORY `# space=layer_key` header. Malformed lines, duplicate
+`layer_key`s, duplicate expert ids, a missing or wrong `space=` header, and an
+empty file are REFUSED (`std::runtime_error`), not defaulted. The consumer
+half, `census_seed_resident_experts()`, validates one layer against the model:
+the `layer_key` must be present, the expert count must equal the pool
+capacity (a budget that moved since the census is a mismatch), and every
+expert id must be `< num_expert`.
+
+`expert_weight_providers.{hpp,cpp}` gains `set_census_seed()` /
+`census_seed_active()`; `bind()` pins the census set when active, else patch
+0018's splitmix64 rank. `moe_3gemm_swiglu_opt.cpp` reads the per-run env
+`MOE_CPU_TIER_SEED=<path>` once per process (cached across the 48 layers),
+validates THIS layer's entry at construction -- so a mismatched seed REFUSES
+THE LOAD before any request is served -- and logs
+`seed_source=census|census_seed_fp=0x...` beside the existing
+seed/`resident_checksum` fields. With the env var unset, patch 0018's
+behaviour is unchanged.
+
+`tools/hot_set_census.py`'s `select` now emits this format: `--census
+<layer,expert,count CSV>` (the CORPUS census a hot set is seeded from, not the
+decode-only v1 rows), `--layer-keys <JSON decoder-index -> layer_key>` to key
+the seed by the structural `layer_key`, and a `# space=layer_key` header. A
+seed with no layer-key map declares `# space=layer` and is refused by the
+plugin parser -- a decoder-index seed can no longer be silently consumed.
+
+MEASURED (2026-09-22, dev build host): applied on top of the 43 carried
+patches (0003-0045) against pin `71640275` and built (`ninja
+openvino_intel_gpu_plugin`, clean); the plugin carries the
+`MOE_CPU_TIER_SEED` / `seed_source=` / `census seed: layer_key` strings. The
+version stamp stays at `marfrit-p19` (disclosed: `p19` is also the 0003-0043
+stamp, so the 0046 build is identified by its env/parse symbols, not the
+stamp). Device-free cells: **14 green** in `tools/test_census_seed.py`
+(compile `census_seed.hpp` with g++ and exercise every malformed/mismatched
+case; each refusal goes RED when its check is removed) plus **76 green** in
+`tools/test_hot_set_census.py`.
+
+MEASURED (2026-09-22, A770 GPU.1 / PCI 8086:56a0): the served quality row is
+PASS, no V4. Native d48n artifact, `--offload-ratio 99 --moe-cpu-tier`, KV u8,
+chunk 512; incumbent `splitmix64` seed and the corpus census seed, same
+256-token prompt and greedy 32 tokens, both produced greedy sha256
+`2169836b33e8bc74d7965fff867b13c1d3637388a4b52f11f639f381ce7cc36f` --
+byte-identical, because under the native artifact every routed expert runs on
+the host tier (patch 0043), so residency moves bytes, not arithmetic. The
+corpus S = 6 seed (one slot over the pool) was run first and REFUSED the load
+(`census seed: layer_key ... lists 6 experts but the pool has 5 slots
+(mismatched budget)`). Finding: the plugin's pool at ratio 99 is 5 slots/layer
+(integer division) while the fit ledger prices 6 (`ceil`); the served seed is
+the corpus top-5. The speed row stays EMPTY and G UNPINNED.
+
 ## Not carried either: the measurement instrument
 
 The arcint session's working tree also carries per-stage timing accumulators

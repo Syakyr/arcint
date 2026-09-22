@@ -599,21 +599,110 @@ def read_provenance_file(path):
 
 
 def seed_text(hot, layer_key_by_index=None):
-    """The static-partition seed as text, one `layer expert` line.
+    """The static-partition seed as text, ONE line per layer
+    `<key> <expert> <expert> ...`.
 
-    Two provenance lines are emitted: membership in trace layer-index space,
-    and -- if `layer_key_by_index` is given -- the same membership keyed by
-    patch 0018's `layer_key` (the layer's first OTD weight-file offset), which
-    is what the static partition actually consumes.
+    The line key is patch 0018's structural `layer_key` (the layer's first OTD
+    weight-file offset) when `layer_key_by_index` maps decoder-layer index ->
+    `layer_key`; otherwise the decoder-layer index itself. The space is
+    stated in the header (`# space=layer_key` / `# space=layer`) so a
+    consumer can never silently read one key space as the other -- the
+    plugin's own parser REFUSES a file that does not declare
+    `space=layer_key`. The experts are emitted in frequency-rank order (count
+    desc, id asc); the consumer re-sorts ascending for slot assignment.
+
+    This is format v2. The v1 form this replaces was one `layer expert` pair
+    per line and carried no space declaration, so a decoder-index seed and a
+    `layer_key` seed were indistinguishable.
     """
-    lines = ["# hot-set seed v1"]
+    if layer_key_by_index:
+        keys = list(layer_key_by_index.values())
+        if len(set(keys)) != len(keys):
+            raise ValueError(
+                "seed_text: the layer_key map maps two decoder layers to the "
+                "same layer_key; a duplicate key is refused rather than "
+                "written (the plugin would refuse it at load)")
+    space = "layer_key" if layer_key_by_index else "layer"
+    lines = ["# hot-set seed v2 (frequency rank, id tie-break)",
+             f"# space={space}"]
     if layer_key_by_index:
         lines.append("# layer_key_by_index=" + json.dumps(
             {str(k): v for k, v in sorted(layer_key_by_index.items())}))
     for lay in sorted(hot):
-        for e in hot[lay]:
-            lines.append(f"{lay} {e}")
+        key = layer_key_by_index.get(lay) if layer_key_by_index else lay
+        if key is None:
+            raise ValueError(
+                f"seed_text: decoder layer {lay} has no layer_key in the "
+                f"supplied map")
+        lines.append(" ".join([str(key)] + [str(e) for e in hot[lay]]))
     return "\n".join(lines) + "\n"
+
+
+def read_census_summary(path):
+    """[(layer, expert, count)] from a canonical census summary CSV.
+
+    Contract: header `layer,expert,count`, `#`-lines skipped, optional
+    trailer `# total,<T>`. Refuses a row whose field count is not three or
+    whose fields are not non-negative integers. This is the CORPUS census
+    (every routed id of every selected call, batched prefill included), which
+    is what a hot set must be seeded from -- not the decode-only v1 rows.
+    """
+    out = []
+    total = None
+    with open(path, "r", encoding="utf-8") as f:
+        for lineno, ln in enumerate(f, 1):
+            s = ln.strip()
+            if not s:
+                continue
+            if s.startswith("#"):
+                if s.startswith("# total,"):
+                    try:
+                        total = int(s.split(",", 1)[1])
+                    except ValueError:
+                        total = None
+                continue
+            p = s.split(",")
+            if p[0] == "layer":          # header line
+                continue
+            if len(p) != 3:
+                raise ValueError(
+                    f"{path}:{lineno}: census summary row has {len(p)} "
+                    f"fields, expected 3 (layer,expert,count): {s!r}")
+            try:
+                lay, e, c = int(p[0]), int(p[1]), int(p[2])
+            except ValueError:
+                raise ValueError(
+                    f"{path}:{lineno}: census summary row is not three "
+                    f"non-negative integers: {s!r}")
+            if lay < 0 or e < 0 or c < 0:
+                raise ValueError(
+                    f"{path}:{lineno}: census summary row is negative: {s!r}")
+            out.append((lay, e, c))
+    if total is not None and total != sum(r[2] for r in out):
+        raise ValueError(
+            f"{path}: '# total,{total}' disagrees with the summed counts "
+            f"({sum(r[2] for r in out)})")
+    return out
+
+
+def select_hot_set_from_counts(counts, slots_per_layer):
+    """{layer: [expert, ...]} -- top-`slots_per_layer` per layer from
+    a canonical census summary `[(layer, expert, count)]`.
+
+    Same rank rule as `select_hot_set`: count DESC, ties broken by expert id
+    ASC. This is the corpus-census path (every selected call's ids counted),
+    so a seed built here is the regime the served path actually sees.
+    """
+    if slots_per_layer < 0:
+        raise ValueError("slots_per_layer must be >= 0")
+    by_layer = defaultdict(list)
+    for lay, e, c in counts:
+        by_layer[lay].append((e, c))
+    out = {}
+    for lay in sorted(by_layer):
+        rank = sorted(by_layer[lay], key=lambda kv: (-kv[1], kv[0]))
+        out[lay] = [e for e, _c in rank[:slots_per_layer]]
+    return out
 
 
 def _cmd_shape(args):
@@ -637,13 +726,20 @@ def _cmd_summary(args):
 
 
 def _cmd_select(args):
-    rows = parse_trace(args.trace)
-    hot = select_hot_set(rows, args.slots_per_layer)
+    if bool(args.census) == bool(args.trace):
+        raise ValueError(
+            "select takes exactly one of --census / --trace")
     layer_keys = None
     if args.layer_keys:
         with open(args.layer_keys, encoding="utf-8") as f:
             raw = json.load(f)
         layer_keys = {int(k): int(v) for k, v in raw.items()}
+    if args.census:
+        hot = select_hot_set_from_counts(read_census_summary(args.census),
+                                         args.slots_per_layer)
+    else:
+        rows = parse_trace(args.trace)
+        hot = select_hot_set(rows, args.slots_per_layer)
     text = seed_text(hot, layer_keys)
     if args.out:
         with open(args.out, "w", encoding="utf-8") as f:
@@ -796,12 +892,18 @@ def build_parser():
     p.set_defaults(func=_cmd_summary)
 
     p = sub.add_parser("select", help="frequency-ranked hot-set seed")
-    p.add_argument("--trace", required=True)
+    p.add_argument("--trace", default="",
+                   help="format-v1 trace; mutually exclusive with --census")
+    p.add_argument("--census", default="",
+                   help="canonical census summary CSV (layer,expert,count); the "
+                        "CORPUS census a hot set is seeded from; mutually "
+                        "exclusive with --trace")
     p.add_argument("--slots-per-layer", type=int, required=True)
     p.add_argument("--out", default="")
     p.add_argument("--layer-keys", default="",
                    help="JSON map decoder-layer index -> weight-file offset "
-                        "(patch 0018's layer_key); emitted in the seed header")
+                        "(patch 0018's layer_key); emits the seed keyed by "
+                        "layer_key with a `# space=layer_key` header")
     p.set_defaults(func=_cmd_select)
 
     p = sub.add_parser("plateau", help="summary + rounds-to-plateau")

@@ -9450,6 +9450,55 @@ is `docs/campaigns/served-prefill-determinism.md`; its handoff documents carry
 the reproducer plan, the floor-read rule (name the transition: `#1↔#2`,
 `#2↔#3`, …) and the paid-for traps.
 
+#### 7.0.2cc The static partition's resident set can be seeded from a measured routing census (2026-09-22)
+
+**What the lever is.** [code, measured-here] Patch 0018 picks each MoE layer's
+resident expert set with a frequency-FREE `splitmix64(seed, layer_key, expert)`
+rank. `tools/expert_policy_compare.py` measured that incumbent at CHANCE at
+every budget (0.92–1.10x `slots/512`), while a census-frequency rank reaches
+2.79–3.39x chance (prefill-calibrated) and 12.45x at 6 slots/layer when
+calibrated on the decode regime itself (2026-09-21, protocol B). Campaign
+`docs/campaigns/expert-hot-set-lru.md`; acceptance `docs/window-052.md`.
+
+**Patch 0046.** A new `census_seed.hpp` parses a “hot-set seed v2”, one
+`<layer_key> <expert> <expert> ...` line per layer, with a MANDATORY
+`# space=layer_key` header. Malformed lines, duplicate keys, duplicate experts,
+a missing/wrong space header, an empty file, an absent `layer_key`, a slot-count
+mismatch and an out-of-range expert are REFUSED (`std::runtime_error`), not
+defaulted. `OffloadExpertWeightProvider` gained `set_census_seed()`; `bind()`
+pins the census set when active, else patch 0018's splitmix64 rank. The impl
+constructor reads `MOE_CPU_TIER_SEED=<path>` once per process, validates this
+layer's entry at construction, and logs `seed_source=census|census_seed_fp=`. The
+seed is a pure function of the RECORDED corpus census, so it does not depend on
+run history and DESIGN Section 3.4 is untouched.
+
+**Measured.** [measured-here] One A770 window per arm, native d48n artifact,
+`--offload-ratio 99 --moe-cpu-tier`, KV u8, chunk 512, the same 256-token
+prompt and greedy 32 tokens. Incumbent `seed_source=splitmix64` and census
+`seed_source=census` both produced greedy sha256
+`2169836b33e8bc74d7965fff867b13c1d3637388a4b52f11f639f381ce7cc36f` —
+**byte-identical**, because under the native artifact every routed expert runs
+on the host tier (patch 0043), so residency moves bytes, not arithmetic. The
+quality row reads PASS, no V4. The corpus S = 6 seed was run first and REFUSED
+the load (`census seed: layer_key … lists 6 experts but the pool has 5 slots
+(mismatched budget)`), which is the mismatch refusal on real hardware.
+
+**A finding, not smoothed.** [code, measured-here] The plugin's actual pool at
+`--offload-ratio 99` is **5 slots/layer**: `prepare_moe_otd_params` uses integer
+division `512*(100-99)/100 = 5`, while this repository's fit ledger
+(`src/exec/fit.h`, `expert_slot_bytes` / `expert_slot_bytes_static`) prices
+`ceil(...) = 6`. The served OTD_PERF lines read `slots=5`. The campaign's S = 6
+coverage analysis is therefore one slot larger than the pool the plugin pins;
+the served seed is the corpus top-5. The off-by-one is open and recorded in
+`docs/window-052.md`.
+
+**Still empty.** [documented] The speed row stays EMPTY and G UNPINNED: the
+native artifact has no resident-compute path (patch 0043 runs every routed
+expert on the host tier), so residency alone moves no compute; the dependency is
+`sub4bit-vram-kernel` step 3. The stale-byte zero proof stays EMPTY: it needs an
+engine-side host/card readback that does not exist, and is not asserted from
+code.
+
 #### 7.0.3 KV precision on the paged path — u8 is the lever, u4 is a tax
 
 The plugin accepts f16/u8/i8/u4/i4 for `KV_CACHE_PRECISION` on the paged path,

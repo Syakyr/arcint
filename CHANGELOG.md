@@ -197,6 +197,32 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
   `hybrid_prefill_layers`.
 - Requires `marfrit-openvino 2026.4.0~dev20260821+p16` (patches 0003–0037).
 
+### Census-seeded expert residency (campaign: expert-hot-set-lru)
+
+- **Plugin patch 0046**: the static partition's resident expert set can be
+  seeded from a measured served-routing census instead of patch 0018's
+  frequency-free `splitmix64` rank (measured at chance at every budget,
+  0.92–1.10x `slots/512`). A seed file emitted by `tools/hot_set_census.py
+  select --census` — one `<layer_key> <expert> <expert> ...` line per layer,
+  with a mandatory `# space=layer_key` header — is read at provider
+  construction via `MOE_CPU_TIER_SEED=<path>`, validated there (malformed or
+  budget-mismatched seeds REFUSE the load), and applied at `bind()`. With the
+  env var unset, patch 0018's behaviour is unchanged.
+- **Measured quality row (A770, native d48n, `--offload-ratio 99
+  --moe-cpu-tier`)**: incumbent vs census seed on the same 256-token prompt
+  and greedy settings produced byte-identical greedy text (sha256
+  `2169836b…336f`). Under the native artifact every routed expert runs on the
+  host tier (patch 0043), so residency moves bytes, not arithmetic; the
+  quality row reads PASS, no V4.
+- **Finding**: the plugin's pool at ratio 99 is 5 slots/layer (integer
+  division), while the fit ledger prices 6 (`ceil`); the S = 6 seed is
+  therefore refused, and the served seed uses the corpus top-5.
+- The speed row stays EMPTY and G UNPINNED; the resident-compute path is
+  `sub4bit-vram-kernel` step 3. Requires `marfrit-openvino …+p19` (patches
+  0003–0046); note `p19` is ALSO the 0003–0043 stamp (deliberately not
+  renumbered — the 0046 build is identified by its seed env/parse symbols,
+  as `contrib/packaging/marfrit-openvino/patches/README.md` discloses).
+
 ## 0.5.0 — 2026-09-13
 
 Requires `marfrit-openvino 2026.4.0~dev20260821+p15` (patches 0003–0033) —

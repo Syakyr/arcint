@@ -182,10 +182,27 @@ same corpus can be replayed after the policy lands.
    offset (`code`, patch 0018 header), the same structural key patch 0013's
    CSV calls `weight_offset` — so the instrument also exports the
    decoder-index→`layer_key` map (from the served graph's own layer
-   enumeration) and the seed is emitted in both spaces. `S` comes from the
+   enumeration); v2 emits the membership in ONE space (the one the header
+   declares) plus that map as a header comment. `S` comes from the
    measured device-pool budget
    (`ARCINT_MOE_DEVICE_POOL_BYTES` / the fit's `expert_slot_bytes_static`),
    not from a guess.
+
+   **2026-09-22: `select` emits format v2, and the plugin consumes it
+   (patch 0046).** The seed is one line per layer, `<layer_key> <expert>
+   <expert> ...`, with a MANDATORY `# space=layer_key` header.
+   `--census <layer,expert,count CSV>` is the CORPUS census (every selected
+   call's routed ids, batched prefill included), not the decode-only v1
+   rows: seeding from the regime served is the measured rule above.
+   `--layer-keys <JSON decoder-index -> layer_key>` keys the file by the
+   structural `layer_key`. A map-less seed declares `# space=layer`, and the
+   plugin parser REFUSES it -- a decoder-index seed can no longer be silently
+   consumed as a `layer_key` seed. The parser and its validation are
+   `census_seed.hpp` in patch 0046. The per-run env `MOE_CPU_TIER_SEED=<path>`
+   is READ at provider construction and this layer's entry is validated there
+   (so a mismatched file refuses the load); the validated membership is then
+   APPLIED at `bind()`. The incumbent `splitmix64` path is the default when
+   the env var is unset.
 2. **LRU replay.** The same trace feeds `tools/expert_lru_replay.py`
    unchanged: per-layer hit rate at `S`, cross-token reuse, and the
    **comparand** — the demand-warm LRU and patch 0018's random
@@ -306,6 +323,23 @@ code inspection.
    row-guess is refused); and the honesty guard REFUSES an in-sample frequency
    seed. The measured numbers are in the campaign status entry of 2026-09-21.
 
+5. **Census-seed parser cells — RUN 2026-09-22 (patch 0046).** [measured-here]
+   `tools/test_census_seed.py` EXTRACTS `census_seed.hpp` from
+   `patches/0046-moe-cpu-tier-census-seed.patch`, compiles it with plain g++
+   (the header has no OpenVINO dependency), and runs a driver once per case:
+   a valid v2 seed parses to the right membership; a missing `# space=layer_key`
+   header, a `# space=layer` header, a duplicate `layer_key`, a duplicate
+   expert id, a non-numeric key or id, an empty file and a key-only row are
+   each REFUSED; and `census_seed_resident_experts()` refuses an absent
+   `layer_key`, a slot-count mismatch (pool budget moved since the census),
+   and an expert id `>= num_expert`, while returning the validated set sorted
+   ascending. **14 cells**, green; each refusal was confirmed RED with its
+   check removed (a check that cannot fail measures nothing). The Python
+   side (`tools/test_hot_set_census.py`) gained the v2 emission and census
+   cells: **76 cells**, green (was 66). Verified that the S=5 corpus seed
+   passes validation at capacity 5 and the S=6 seed is refused with the
+   mismatch message.
+
 *Caveat.* `call_trace_to_v1` reconstructs token boundaries from a repeated
 `layer_key`, which is exact only if every layer's calls for one decode step
 precede the next step's. The aggregate `(layer, expert)` counts do not depend
@@ -323,4 +357,8 @@ integer ids are token-major (`code`, patch 0042 `_config.top_k` layout).
 | the served d48n host-tier rate is 0.5–0.8 t/s | `measured-here` | `sub4bit-vram-kernel` status; DESIGN §7.0.2ca |
 | every native-format expert runs on the host tier (no resident compute) | `code` | patch 0043's in-code assert `:726-731`; DESIGN §7.0.2ca |
 | the reference router is not the served router (near-tied margins) | `measured-here` | `sub4bit-vram-kernel` status |
+| the census seed beats the incumbent `splitmix64` seed on the census's own hit fraction | `measured-here` | `tools/expert_policy_compare.py`, 2026-09-21 |
+| the calibration regime decides the win (prefill-derived seed under-predicts decode hotness ~4x) | `measured-here` | `tools/expert_policy_compare.py` protocols A/B, 2026-09-21 |
+| the served static partition consumes a census seed keyed by `layer_key`, refusing malformed/mismatched files | `code`/`measured-here` | patch 0046; `tools/test_census_seed.py` 14 cells |
+| residency moves bytes, not arithmetic, under the native artifact (so a seed change should not change the greedy digest) | `code` | patch 0043's in-code assert; the quality row measures it |
 | hot set beats random seed; replay hit rate transfers to served t/s | `HYPOTHESIS` | untested |

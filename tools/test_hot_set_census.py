@@ -287,9 +287,87 @@ class TestPluginCsv(unittest.TestCase):
     def test_seed_text_carries_layer_key_map(self):
         hot = {0: [3, 7], 1: [2]}
         text = hc.seed_text(hot, {0: 1000, 1: 1001})
-        self.assertIn("0 3", text)
+        self.assertIn("# space=layer_key", text)
+        self.assertIn("# layer_key_by_index", text)
+        # one line per layer, keyed by the structural layer_key, not the
+        # decoder index -- v2's whole point over the ambiguous v1 form.
+        self.assertIn("1000 3 7", text)
+        self.assertIn("1001 2", text)
+        self.assertNotIn("\n0 3 7", text)
+
+    def test_seed_text_declares_decoder_space_without_the_map(self):
+        text = hc.seed_text({0: [3, 7], 1: [2]})
+        self.assertIn("# space=layer", text)
+        self.assertIn("0 3 7", text)
         self.assertIn("1 2", text)
-        self.assertIn("layer_key_by_index", text)
+        self.assertNotIn("space=layer_key", text)
+
+    def test_seed_text_refuses_a_layer_missing_from_the_map(self):
+        # an incomplete map is a mismatch, not a partial seed: refused.
+        with self.assertRaises(ValueError):
+            hc.seed_text({0: [3], 1: [2]}, {0: 1000})
+
+    def test_seed_text_refuses_a_duplicate_layer_key(self):
+        # two decoder layers mapping to one layer_key would collide in the
+        # plugin's layer_key-keyed map: refused, not written.
+        with self.assertRaises(ValueError):
+            hc.seed_text({0: [3], 1: [2]}, {0: 1000, 1: 1000})
+
+    def test_census_summary_parses_and_sums(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "c.csv")
+            with open(p, "w") as f:
+                f.write("# census summary\nlayer,expert,count\n0,3,5\n0,7,2\n1,2,9\n# total,16\n")
+            counts = hc.read_census_summary(p)
+        self.assertEqual(counts, [(0, 3, 5), (0, 7, 2), (1, 2, 9)])
+
+    def test_census_summary_refuses_a_wrong_total(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "c.csv")
+            with open(p, "w") as f:
+                f.write("layer,expert,count\n0,3,5\n# total,99\n")
+            with self.assertRaises(ValueError):
+                hc.read_census_summary(p)
+
+    def test_census_summary_refuses_a_four_column_row(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "c.csv")
+            with open(p, "w") as f:
+                f.write("layer,expert,count\n0,3,5,1\n")
+            with self.assertRaises(ValueError):
+                hc.read_census_summary(p)
+
+    def test_select_from_counts_ranks_count_desc_id_asc(self):
+        counts = [(0, 9, 3), (0, 4, 3), (0, 7, 5), (1, 2, 1)]
+        hot = hc.select_hot_set_from_counts(counts, 2)
+        self.assertEqual(hot, {0: [7, 4], 1: [2]})
+        # ties broken by ascending id, not by file order
+        self.assertLess(hot[0][1], hot[0][2] if len(hot[0]) > 2 else 99)
+
+    def test_select_from_counts_zero_slots_is_empty_not_error(self):
+        self.assertEqual(hc.select_hot_set_from_counts([(0, 3, 1)], 0), {0: []})
+
+    def test_select_cli_refuses_trace_and_census_together(self):
+        with self.assertRaises(ValueError):
+            hc.main(["select", "--trace", "x", "--census", "y",
+                     "--slots-per-layer", "1"])
+
+    def test_select_cli_emits_a_layer_key_seed_from_a_census(self):
+        with tempfile.TemporaryDirectory() as d:
+            csv = os.path.join(d, "c.csv")
+            mapf = os.path.join(d, "map.json")
+            out = os.path.join(d, "seed.txt")
+            with open(csv, "w") as f:
+                f.write("layer,expert,count\n0,3,5\n0,7,2\n")
+            with open(mapf, "w") as f:
+                f.write('{"0": 704}')
+            rc = hc.main(["select", "--census", csv, "--layer-keys", mapf,
+                          "--slots-per-layer", "2", "--out", out])
+            self.assertEqual(rc, 0)
+            with open(out) as f:
+                text = f.read()
+        self.assertIn("# space=layer_key", text)
+        self.assertIn("704 3 7", text)
 
 
 class TestRouterTraceWriter(unittest.TestCase):
@@ -732,8 +810,13 @@ class TestCli(unittest.TestCase):
             rc = hc.main(["select", "--trace", FIXTURE,
                           "--slots-per-layer", "4", "--out", out])
             self.assertEqual(rc, 0)
+            text = open(out).read()
+            self.assertIn("# space=layer", text)
             data = [l for l in open(out) if l.strip() and not l.startswith("#")]
-            self.assertEqual(len(data), 48 * 4)          # 48 layers x 4 slots
+            # v2: ONE line per layer, key + slots_per_layer experts
+            self.assertEqual(len(data), 48)
+            for line in data:
+                self.assertEqual(len(line.split()), 1 + 4)
 
 
 if __name__ == "__main__":

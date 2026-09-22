@@ -508,3 +508,137 @@ and the campaign stops. Every disposition carries an evidence class
     003), consistent with the host-COMPUTE-bound reading.
   - Teardown clean: no `arcint` process, units inactive as found, wake lock
     untouched. The speed row stays EMPTY and G UNPINNED.
+
+- 2026-09-22 — **the acceptance document's convergence row is filled (V3
+  firing), the seed-implication coverage is recorded, and the remaining rows
+  stay EMPTY for named reasons.** [documented fill; the coverage values are
+  `measured-here`, re-derived from the window-004 corpus census CSV rather
+  than copied]
+  - **`docs/window-052.md` convergence row, FILLED.** `rounds_to_plateau=None`,
+    `plateau=False` at S = 6 and S = 10, at both 512 decode tokens (window
+    003) and 4,096 decode tokens (window 004); the selected set changed at
+    every power-of-two prefix including 2,048 → 4,096. **V3 FIRES
+    (2026-09-22)** — a failing measurement is still a measurement, so the row
+    carries the value and the clause, not EMPTY. This does not change the
+    campaign's status: the non-plateau is permanent at this corpus length.
+  - **seed implication, ADDED as an input row, FILLED.** On the window-004
+    CORPUS census (`w004.corpus-census.csv`, 3,278,880 accesses over 24,088
+    cells = 6,831 x 48 x 10 exactly) the census top-S per layer covers
+    S = 6 **11.3721 %**, S = 10 **16.2245 %**, S = 16 **22.1925 %**,
+    S = 32 **33.8386 %**, S = 64 **49.1955 %** of the corpus's routed
+    accesses. Analytic chance (`S/512`) is 1.1719 / 1.9531 / 3.1250 /
+    6.2500 / 12.5000 %, so the census seed clears chance by 9.70 / 8.31 /
+    7.10 / 5.41 / 3.94x. Command:
+    `python3 - <<'PY' ...` over `w004.corpus-census.csv`, grouping by layer,
+    sorting `(-count, expert)`, summing the top S; the script and its raw
+    output are recorded in the session log. The incumbent `splitmix64` seed
+    remains at chance at every budget (0.92–1.10x, `expert_policy_compare.py`)
+    — this row is the seed's implied coverage, not a served result.
+  - **STILL EMPTY.** (a) *speed* — HELD for `sub4bit-vram-kernel` step 3, G
+    UNPINNED, no host-compute-tier speed measurement taken; (b) *stale-byte
+    zero* — blocked on the engine-side host/card readback that does not
+    exist, not asserted from code; (c) *quality under policy* — to be
+    measured in this same session on the census-seeded served path (incumbent
+    vs census seed, greedy digest), no earlier value exists; (d) *verdict* —
+    REPORT ONLY until the tag.
+  - **No policy code is claimed by this entry.** The seed-implication row is
+    a census statistic; the seed is not yet consumed by the served static
+    partition in this entry.
+
+- 2026-09-22 — **the census seed is wired into the served static partition,
+  and the quality row is MEASURED: PASS, no V4.** [code + measured-here,
+  one A770 window]
+  - **The seed path (patch 0046).** New file `census_seed.hpp` (OpenVINO-free
+    parser for "hot-set seed v2", one `<layer_key> <expert> <expert> ...`
+    line per layer, MANDATORY `# space=layer_key` header; malformed lines,
+    duplicate keys/ids, missing/wrong space header and an empty file are
+    REFUSED; `census_seed_resident_experts()` refuses an absent `layer_key`, a
+    slot-count mismatch and an out-of-range expert). `expert_weight_providers`
+    gains `set_census_seed()`/`census_seed_active()` and `bind()` pins the
+    census set when active, else patch 0018's splitmix64 rank. The impl
+    constructor reads `MOE_CPU_TIER_SEED=<path>` once per process (cached
+    across the 48 layers), validates THIS layer's entry at construction
+    (mismatch refuses the load), and logs
+    `seed_source=census|census_seed_fp=0x...`. With the env var unset, patch
+    0018 is unchanged. `tools/hot_set_census.py select` emits the v2 format
+    from `--census <layer,expert,count CSV>` (the CORPUS census) with
+    `--layer-keys <JSON decoder-index -> layer_key>`; a map-less seed declares
+    `# space=layer` and the plugin parser refuses it. Files: `patches/0046-moe-cpu-tier-census-seed.patch`
+    (+ mirrored in `contrib/packaging/marfrit-openvino/patches/` and its
+    README), `tools/hot_set_census.py`, `tools/test_hot_set_census.py`,
+    `tools/test_census_seed.py`.
+  - **Cells.** `tools/test_census_seed.py`: **14 green** (extract
+    `census_seed.hpp` from the patch, compile with plain g++, run one driver
+    case per refusal/success). Each refusal was shown RED with its check
+    removed. `tools/test_hot_set_census.py`: **76 green** (was 66), including
+    the v2 seed emission, the census-summary parser and the `select --census`
+    CLI. Device-free, no card. Raw output in the session's
+    `cells-green.txt` / `redfirst-mutation1.txt` on the persistent census path.
+  - **Build, measured (device-free).** Patch 0046 applied on top of patches
+    0003–0045 against pin `71640275`; `ninja openvino_intel_gpu_plugin` clean;
+    the plugin carries `MOE_CPU_TIER_SEED` / `seed_source=` /
+    `census seed: layer_key` strings. Plugin sha256 prefix `d72c00bfc341e398`.
+  - **Quality row, MEASURED (A770, GPU.1, PCI 8086:56a0).** Native d48n
+    artifact, `--offload-ratio 99 --moe-cpu-tier`, KV u8, chunk 512, one fresh
+    process per arm, the SAME 256-token prompt (pinned capture window 0) and
+    greedy `max_tokens` 32, temperature 0. Incumbent (`MOE_CPU_TIER_SEED`
+    unset; `seed_source=splitmix64`) and census seed
+    (`MOE_CPU_TIER_SEED` at the corpus S = 5 seed; `seed_source=census`) both produced
+    greedy text sha256 **`2169836b33e8bc74d7965fff867b13c1d3637388a4b52f11f639f381ce7cc36f`**
+    — **byte-identical**. The design's expectation holds: under the native
+    artifact every routed expert runs on the host tier (patch 0043), so
+    residency moves bytes, not arithmetic. **No V4.**
+  - **Red-first refusal, measured on the card.** The corpus S = 6 seed was
+    run first and refused the load: `census seed: layer_key 284636629 lists 6
+    experts but the pool has 5 slots (mismatched budget)`; the process never
+    became ready. The device-free cells cover the same class; this is the
+    on-hardware instance.
+  - **Measured correction (a finding, `code` + `measured-here`).** The
+    plugin's actual pool at `--offload-ratio 99` is **5 slots/layer**:
+    `prepare_moe_otd_params` uses integer division `512*(100-99)/100 = 5`,
+    while the engine's own ledger (`src/exec/fit.h`, `expert_slot_bytes` /
+    `expert_slot_bytes_static`) prices `ceil(...) = 6`. The OTD_PERF lines from
+    both served arms read `slots=5`. So the campaign's `S = 6` offline
+    analysis is one slot larger than the pool the plugin actually pins; the
+    served seed is the corpus top-5 (coverage **9.96 %**). This is recorded,
+    not smoothed: the offline S = 6…64 coverage numbers in `docs/window-052.md`
+    are the engine-priced analysis. The served-pool/ledger off-by-one is open.
+  - **Rows.** `docs/window-052.md` now carries: convergence (V3 firing),
+    seed implication (with the off-by-one correction), and quality (PASS, no
+    V4). STILL EMPTY: *speed* (HELD for `sub4bit-vram-kernel` step 3, G
+    UNPINNED; no host-compute-tier speed measurement taken), *stale-byte zero*
+    (no engine-side host/card readback exists; not asserted from code),
+    *verdict* (REPORT ONLY until the tag). The campaign stays OPEN: the
+    resident-compute path that would make the policy pay is still the named
+    dependency.
+
+- 2026-09-22 (review) — **external review of the seed-wiring commit; one
+  blocker fixed, the rest recorded as carry-forward.** [documented]
+  - **Blocker, fixed:** the patch record in
+    `contrib/packaging/marfrit-openvino/patches/README.md` still ended
+    "OWED-until-run: the served A770 quality row" while the same change set
+    records that row as MEASURED/PASS. The OWED sentence is replaced with the
+    measured digest pair and the mismatch refusal.
+  - **Fixed with it:** the served top-5 coverage (9.96 %) now carries the
+    reproducible command and raw output in the session's `quality-report.txt`;
+    the CHANGELOG's `+p19` line now discloses that `p19` is also the 0003–0043
+    stamp; the design note's "emitted in both spaces" and "consumed at
+    `bind()`" sentences are corrected (the env is read and validated at
+    construction, applied at `bind()`); `seed_text` now REFUSES a
+    `layer_key` map with a duplicate value instead of writing a file the
+    plugin would refuse at load (one new Python cell: 76 green, was 75).
+  - **Carry-forward, deliberately NOT fixed in the plugin patch.** The
+    reviewer flagged two source-level items: `census_seed_active()` has no
+    caller in the patch, and `cached_census_seed()`'s function-local static
+    map is unsynchronized (safe only because provider construction is
+    single-threaded today). Both are behaviour-neutral, but editing the patch
+    now would change the source that produced the measured plugin
+    (`d72c00bf`) without re-running the card, breaking the measured-artifact
+    match. They are recorded as open rather than patched-and-unmeasured; a
+    later leg that re-runs the window may clean them in the same commit as the
+    measurement.
+  - **Also carry-forward:** `resident_slot_count()` and `_capacity` are equal
+    by construction (`resident_slot_count()` returns
+    `_weight_provider->resident_capacity()`, which returns `_capacity`), so
+    the validation/bind pairing is not a divergence; stated here because the
+    reviewer could not see the provider source.
