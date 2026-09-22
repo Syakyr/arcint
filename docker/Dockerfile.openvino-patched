@@ -13,7 +13,7 @@
 # string must name the patch level).
 #
 # Build from the REPO ROOT:
-#   docker build -t arcint-ov:2026.4.0-marfrit-p16 \
+#   docker build -t arcint-ov:2026.4.0-marfrit-p15 \
 #     -f docker/Dockerfile.openvino-patched .
 # ---------------------------------------------------------------------------
 
@@ -35,7 +35,9 @@ ARG OV_PIN=71640275d29692354223572e77ef717e92b891d9
 ARG OV_PIN_SHORT=71640275d29
 # The version string must parse for ov_parse_ci_build_number: the build-number
 # FIELD stays numeric, the patch level rides in the free-form tail.
-ARG PATCHLEVEL=marfrit-p16
+# marfrit-p15 = the deployed level: measured from git (b0ccd47), the +p15
+# deb was built from patches 0003-0033 (31 patches), matching README.md.
+ARG PATCHLEVEL=marfrit-p15
 ARG OV_UPSTREAM=https://github.com/openvinotoolkit/openvino.git
 
 # Shallow fetch of the exact commit (GitHub serves reachable SHAs). If the
@@ -53,8 +55,18 @@ COPY contrib/packaging/marfrit-openvino/patches /opt/patches
 
 # Same gate as build-openvino.sh: a patch that does not apply to the pin is
 # a bug in patches/, not a reason to move the pin.
+# PATCH_MAX: apply only patches numbered up to this. The investigation
+# builds the deployed +p15 set (0003-0033). 0034-0036 came later and were
+# never stamped into a deb; 0037 (+p16 per its commit ae620e3) is TRUNCATED
+# in this repo AND upstream marfrit/arcint — last hunk declares new=82/
+# old=6, the file has 79/4, corrupt at line 436 — and fails the project's
+# own build-openvino.sh identically. Needs re-export by the patch author;
+# bump PATCH_MAX when it lands. (INVESTIGATION.md §5.1/§8.)
+ARG PATCH_MAX=0033
 RUN cd /opt/ov && shopt -s nullglob && \
     for p in /opt/patches/*.patch; do \
+      n=$(basename "$p" | cut -d- -f1); \
+      if [ "$((10#$n))" -gt "$((10#$PATCH_MAX))" ]; then echo "skipping $(basename "$p") (> PATCH_MAX=${PATCH_MAX})"; continue; fi; \
       echo "applying $(basename "$p")"; \
       git apply --check "$p" || { echo "does not apply to ${OV_PIN}: fix patches/, not the pin" >&2; exit 1; }; \
       git apply "$p"; \
@@ -120,7 +132,7 @@ RUN dnf -y --nodocs --setopt=install_weak_deps=False install \
       intel-compute-runtime intel-level-zero oneapi-level-zero ocl-icd \
   && dnf clean all && rm -rf /var/cache/dnf/*
 
-ARG PATCHLEVEL=marfrit-p16
+ARG PATCHLEVEL=marfrit-p15
 ARG OV_PREFIX=/usr/lib/marfrit-openvino
 
 # The wheel's INTERNAL LAYOUT IS LOAD-BEARING (OpenVINOTargets-release.cmake

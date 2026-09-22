@@ -2,7 +2,7 @@
 # operator namespace on GHCR so the Pro B60 box can pull and test.
 #
 # Images produced:
-#   ghcr.io/syakyr/arcint-ov:2026.4.0-marfrit-p16   (tier 1, patched OpenVINO)
+#   ghcr.io/syakyr/arcint-ov:2026.4.0-marfrit-p15   (tier 1, patched OpenVINO)
 #   ghcr.io/syakyr/arcint:investigation-<ts>         (tier 2, immutable)
 #   ghcr.io/syakyr/arcint:investigation              (tier 2, moving channel)
 #
@@ -84,12 +84,12 @@ jobs:
       - name: Build patched OpenVINO base
         run: |
           docker build \
-            -t ${{ env.REGISTRY }}/${{ needs.ns.outputs.owner }}/arcint-ov:2026.4.0-marfrit-p16 \
+            -t ${{ env.REGISTRY }}/${{ needs.ns.outputs.owner }}/arcint-ov:2026.4.0-marfrit-p15 \
             -f docker/Dockerfile.openvino-patched .
 
       - name: Push tier 1 (tag carries pin + patch level; immutable by content)
         run: |
-          docker push ${{ env.REGISTRY }}/${{ needs.ns.outputs.owner }}/arcint-ov:2026.4.0-marfrit-p16
+          docker push ${{ env.REGISTRY }}/${{ needs.ns.outputs.owner }}/arcint-ov:2026.4.0-marfrit-p15
 
   tier2-engine:
     needs: [ns, tier1-openvino]
@@ -110,7 +110,7 @@ jobs:
       - name: Build engine image
         run: |
           docker build \
-            --build-arg OV_BASE=${{ env.REGISTRY }}/${{ needs.ns.outputs.owner }}/arcint-ov:2026.4.0-marfrit-p16 \
+            --build-arg OV_BASE=${{ env.REGISTRY }}/${{ needs.ns.outputs.owner }}/arcint-ov:2026.4.0-marfrit-p15 \
             --build-arg ARCINT_GIT_SHA=${GITHUB_SHA::12} \
             -t ${{ env.REGISTRY }}/${{ needs.ns.outputs.owner }}/arcint:build-${{ needs.ns.outputs.build_ts }} \
             -f docker/Dockerfile.arcint .

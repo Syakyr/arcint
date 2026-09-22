@@ -59,7 +59,7 @@ From `DEVELOPMENT.md`, `README.md`, `CMakeLists.txt` and
 - **A patched OpenVINO, not a release.** The measurement stack is nightly
   `2026.4.0-22849-71640275d29` (commit `71640275`) plus the numbered
   patch series (`0003`–`0032` in `patches/`; deployed level `+p15`,
-  build script currently stamps `marfrit-p16` — see §5, open question).
+  build script had moved to `marfrit-p16` — resolved in §5.1: the image builds the deployed +p15 set).
   kyuz0's `Dockerfile.openvino` downloads the **official 2026.2 tgz** —
   that path is unusable here: no MoE slot-pool fixes, no paged-KV
   precision patches, no kquant kernels. `arcint` reads the `+pN` marker
@@ -175,14 +175,21 @@ host, so the ExecStart shape carries over verbatim.
 
 ## 5. Open questions for the operator
 
-1. **Patch-level drift (`code`, unresolved).** `build-openvino.sh` stamps
-   `PATCHLEVEL=marfrit-p16`; `build-deb.sh` ships `PKGVER=…+p15` and
-   `README.md` says the deployed level/floor is `+p15` with "patches
-   0003–0033", while `patches/` holds `0003`–`0032`. The image drafts
-   take `marfrit-p16` as the ARG default because that is what the build
-   script says, but the three sources disagree and per this repo's own
-   discipline that discrepancy should be resolved before anything is
-   published. Which is the deployed level?
+1. **Patch-level drift — RESOLVED 2026-09-22 (`code`, measured from
+   git).** The deployed `+p15` deb was built from patches **0003–0033**
+   (31 patches; measured at commit `b0ccd47`, where `build-deb.sh` was
+   stamped `+p15`) — README.md was right; an earlier note here claiming
+   `patches/` held only `0003–0032` was a `head -60` truncation
+   artifact. `0034`–`0036` were added later (0.4.5+/flash-next work)
+   and were never stamped into a deb. **`0037` — the `+p16` patch per
+   its own commit `ae620e3` — is TRUNCATED in this repo AND in upstream
+   `marfrit/arcint`** (identical bytes): its last hunk declares
+   `new=82/old=6`, the file carries `79/4`, corrupt at line 436. The
+   project's own `build-openvino.sh` fails on it identically — this is
+   a bug in the patch directory, not in the image recipe, and it needs
+   re-export by the patch author. The image therefore builds the
+   deployed `+p15` set (`PATCH_MAX=0033`) and stamps `marfrit-p15`,
+   matching the deb's semantics exactly; bumping later is one ARG.
 2. **Registry**: ~~GHCR vs Docker Hub~~ **decided 2026-09-22: GHCR,
    `ghcr.io/syakyr/`** — the workflow is live (see §8). Docker Hub
    remains an option if discoverability like kyuz0's matters later.
@@ -254,6 +261,18 @@ host, so the ExecStart shape carries over verbatim.
   the fix is a self-hosted runner or a pre-baked OV cache, not the
   Dockerfile.
 
+- **2026-09-22, run 3 failed at patch 0037 — root-caused.**
+  `corrupt patch at 0037-moe-hybrid-prefill-split.patch:436` (measured
+  via CI log). The committed blob is truncated in this repo and upstream
+  alike (hunk declares new=82/old=6; file has 79/4). Reconstruction of
+  the missing tail was rejected — one added line is unrecoverable and a
+  guessed patch is worse than a loud failure. Fix taken: `PATCH_MAX=0033`
+  in the tier-1 Dockerfile, level stamped `marfrit-p15` (= the deployed
+  set, measured from git at `b0ccd47`); all image/workflow tags moved
+  from `2026.4.0-marfrit-p16` to `2026.4.0-marfrit-p15`. **Action for
+  the operator: get a complete `0037` re-exported by the patch author,
+  then bump `PATCH_MAX` and the level.**
+
 ## 9. Testing on the Pro B60 box
 
 Once `ghcr.io/syakyr/arcint:investigation` exists:
@@ -284,7 +303,7 @@ docker run --rm -it \
 
 # 4. Inside the container, confirm the runtime says it is patched:
 #    /props reports the engine sha; the OV plugin version string should
-#    carry marfrit-p16 (visible in arcint's -v load log).
+#    carry marfrit-p15 (visible in arcint's -v load log).
 curl -s http://127.0.0.1:8080/v1/models
 ```
 
