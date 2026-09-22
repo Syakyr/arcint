@@ -703,3 +703,48 @@ and the campaign stops. Every disposition carries an evidence class
   **visible** on that route: **V4 FIRES (RED)** and the dispatch-route quality
   is **OPEN**, not PASS. Full raw evidence and the §3.4 finding:
   `sub4bit-vram-kernel.md`, status 2026-09-22 (rate leg); DESIGN §7.0.2ce.
+- 2026-09-22 (late) — **the ratio-99 shortfall is a REGIME shortfall, not a policy
+  failure: the same seed covers 4.11% of PREFILL and 13.86% of DECODE, and the
+  served request was 80% prefill.** [measured-here] Re-derived in one pass from
+  window 004's own trace (the corpus top-5 seed fixed, four views of the same
+  call trace):
+  | view | coverage of the S=5 corpus seed |
+  |---|---|
+  | corpus census (2,735 prefill + 4,096 decode = 6,831 tok) | 326,559/3,278,880 = **9.96%** |
+  | prefill only (2,735 tok) | 54,024/1,312,800 = **4.11%** |
+  | decode only (4,096 tok) | 272,535/1,966,080 = **13.86%** |
+  | decode, first 64 tokens | 2,026/30,720 = **6.60%** |
+  | prefill + the first 250 decode tokens (2,985 tok) | 63,751/1,432,800 = **4.45%** |
+  | prefill + the first 314 decode tokens (3,049 tok) | 65,777/1,463,520 = **4.49%** |
+
+  **Why the last two rows are not "the request":** the rate leg served a
+  **256-token prompt + 64 greedy tokens**, but this trace CANNOT be sliced
+  per-token through the prefill — the emitter's prefill calls are BATCHED (one
+  call per 512-token chunk, with that chunk's ids aggregated into one row), so a
+  range expressed in CALLS is not a range expressed in TOKENS. The two rows above
+  are the closest views the trace admits, and both are prefill-dominated, landing
+  at 4.4–4.5%; that is the band the served arm's realized 3.77% sits in.
+
+  So the ratio-99 card share of 3.77% is neither a defect nor a mis-set: a request
+  that is 80% prefill sees the PREFILL coverage (~4.1%), and the residual to
+  3.77% is attributed — as a HYPOTHESIS, not a measurement — to the load-time
+  probe's own mix plus the served counters' accounting (the probe's accesses enter
+  both hits and misses). **The corpus's 9.96% is a MIXTURE average over a
+  decode-heavy corpus and must never be quoted as what a prefill-heavy request
+  will realize.**
+  - This is the SAME regime law the policy comparison established from the other
+    direction (2026-09-21 entry: a prefill-derived census under-predicts DECODE
+    hotness ~4x). Coverage is not a property of the seed; it is a property of the
+    **(seed x regime)** pair. The acceptance text therefore carries a coverage
+    PAIR (prefill, decode), or one figure for a STATED mix — never a single
+    number, which is what `docs/window-052.md`'s seed-implication row now says.
+  - **Consequence for the gate (named, not decided here):** the ratio-99 V1 is
+    structural FOR A PREFILL-HEAVY REQUEST. The lever is therefore not more slots
+    but the right calibration — seed per regime (two sets, or a set chosen by the
+    request's prefill/decode shape), or calibrate on the serving mix. Nothing here
+    moves the pinned G or the V1/V4 records; it explains WHY V1 fired and names
+    the lever.
+  - **Per-layer texture:** the request's coverage ranges from **1.3%**
+    (layer_key 9143804121) to **20.6%** (73272898913) across the 48 layers, so the
+    shortfall is per-layer, not a single global deficit — a per-layer calibration
+    problem, not a budget problem.
