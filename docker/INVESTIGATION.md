@@ -183,9 +183,9 @@ host, so the ExecStart shape carries over verbatim.
    script says, but the three sources disagree and per this repo's own
    discipline that discrepancy should be resolved before anything is
    published. Which is the deployed level?
-2. **Registry**: GHCR (free for public repos, no username juggling) vs
-   Docker Hub (matches kyuz0's discoverability, `toolbox` docs use
-   `docker.io/`). Drafts assume GHCR; trivially changed.
+2. **Registry**: ~~GHCR vs Docker Hub~~ **decided 2026-09-22: GHCR,
+   `ghcr.io/syakyr/`** — the workflow is live (see §8). Docker Hub
+   remains an option if discoverability like kyuz0's matters later.
 3. **Base distro**: Fedora 43 chosen for parity with kyuz0's runtime
    driver packages (`intel-compute-runtime` etc. are current there) and
    because the from-source OV build is distro-agnostic. The deb recipe
@@ -214,9 +214,9 @@ host, so the ExecStart shape carries over verbatim.
 - `docker/Dockerfile.openvino-patched` — tier 1 draft (patched OV base).
 - `docker/Dockerfile.arcint` — tier 2 draft (engine image).
 - `docker/docker-compose.example.yaml` — run recipe with GPU passthrough.
-- `docker/workflow-build-toolbox.yml.example` — CI draft (kept out of
-  `.github/workflows/` so it does not fire from this investigation
-  branch).
+- `.github/workflows/build-toolbox.yml` — **live** CI (activated
+  2026-09-22; see §8). `workflow_dispatch` only: tiers `ov` / `arcint`
+  / `all`, moving channel tag (default `investigation`).
 
 ## 7. Verification status
 
@@ -228,3 +228,71 @@ host, so the ExecStart shape carries over verbatim.
 | Draft Dockerfiles build at all | **unverified** — first CI run is the test |
 | GPU passthrough recipe works for arcint on Arc | `code`-transposed from kyuz0; unverified for this engine |
 | Stub smoke test is device-free | `code` (README/DEVELOPMENT.md; unit ladder design) |
+| Workflow YAML fires / tier gating | **unverified** — first dispatch is the test |
+
+## 8. Status log (appended, never rewritten)
+
+- **2026-09-22, investigation pushed.** Design + drafts, nothing built
+  (no Docker daemon on the authoring host).
+- **2026-09-22, workflow activated under the operator namespace.**
+  `.github/workflows/build-toolbox.yml` is live on this branch. First
+  run: dispatch with `tiers=all` (tier 2 FROMs the tier-1 image from the
+  registry, so tier 1 must exist first). Images:
+  - `ghcr.io/syakyr/arcint-ov:2026.4.0-marfrit-p16`
+  - `ghcr.io/syakyr/arcint:investigation-<ts>` (immutable) and
+    `ghcr.io/syakyr/arcint:investigation` (moving channel).
+  `latest` is deliberately untouched while this is an investigation.
+- **GHCR first-push gotcha:** packages are **private** by default. After
+  the first successful push, flip both packages to public (package page →
+  Package settings → Change visibility) so the B60 box can pull without
+  credentials — or have it log in with a PAT carrying `read:packages`:
+  `echo $PAT | docker login ghcr.io -u syakyr --password-stdin`.
+- **Known CI risks for the first run** (`unverified` until dispatched):
+  the nightly-wheel fetch (§5.4) and the tier-1 disk footprint — the
+  OpenVINO clone+build is tens of GB and GitHub runners are tight even
+  after the cleanup step; if tier 1 dies with no space left on device,
+  the fix is a self-hosted runner or a pre-baked OV cache, not the
+  Dockerfile.
+
+## 9. Testing on the Pro B60 box
+
+Once `ghcr.io/syakyr/arcint:investigation` exists:
+
+```bash
+# 1. Pull (public, or after docker login ghcr.io — see §8)
+docker pull ghcr.io/syakyr/arcint:investigation
+
+# 2. Device-free sanity: the stub serves without a card
+docker run --rm ghcr.io/syakyr/arcint:investigation --stub --port 8090 &
+curl -s http://127.0.0.1:8090/props
+kill %1
+
+# 3. Card test — same device recipe as kyuz0's toolboxes. Models are
+#    mounted read-only; the IR directory layout arcint expects is in
+#    README.md ("Supported model formats").
+docker run --rm -it \
+  --device /dev/dri --group-add video --group-add render \
+  --security-opt seccomp=unconfined \
+  -v "$MODELS_ROOT:/models:ro" \
+  -v arcint-cache:/var/cache/arcint \
+  -p 8080:8080 \
+  ghcr.io/syakyr/arcint:investigation \
+  --model /models/ov/<ir-dir> --model-id <allowlist-id> \
+  --served-model-name <name> --device GPU.0 \
+  --host 0.0.0.0 --port 8080 --n-ctx 262144 \
+  --cache-dir /var/cache/arcint --queue-timeout 30
+
+# 4. Inside the container, confirm the runtime says it is patched:
+#    /props reports the engine sha; the OV plugin version string should
+#    carry marfrit-p16 (visible in arcint's -v load log).
+curl -s http://127.0.0.1:8080/v1/models
+```
+
+What the B60 run actually proves, in order: Level Zero sees the card
+through `/dev/dri` (load log), the patched plugin loads at the expected
+level (version string), the IR opens (model load), and the serving
+surface answers end-to-end (`/v1/models`, a chat completion). A failure
+at step 1 is the host driver/kernel; at step 2 the image's driver stack;
+at step 3 the model mount; at step 4 the engine — the classes are
+separable before any log diving.
+
