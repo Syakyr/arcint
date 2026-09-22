@@ -682,3 +682,20 @@ fusion-impact profile, not a kernel micro-benchmark) applies.
   the dispatch bookkeeping; that is the next localisation. The card was left
   clean (sampler, SIGTERM, no leftover process); a fresh wake lock would be
   needed for a leg past the coordinator's.
+
+- 2026-09-22 (early) — **the fault is card-specific: the A770 takes the same
+  native per-expert load and survives it.** [measured-here] The identical
+  config (native d48n, `--moe-per-expert-dispatch`, ratio 90, KV u8, chunk
+  512) on the A770 (GPU.1, PCI 8086:56a0) LOADS and compiles: `language model
+  ready in 38.5 s (paged); device-resident 8.06 GiB`, and the plateau probe
+  settles at 0.37 GiB (`source: probe-static`, against the 5.71 GiB config
+  ceiling — the driver keeps the pool host-mapped, the §7.0.2t two-ledger
+  shape). No GPU fault, no segfault. But the served HTTP server did **not**
+  come up within ~30 min of the process running at ~475 % CPU after the
+  probe (no listener on the port); the leg was killed and the card released
+  clean. So the B60's blit-engine page fault is a per-card defect (as the
+  B60 faults in this campaign have been), while on the A770 the native
+  per-expert execution path reaches the probe and then stalls before serving
+  — a JIT/dispatch stall to localise, not a numeric fault. Neither card has
+  a served reading yet; the decode arithmetic stays pinned device-free (16
+  cells).
