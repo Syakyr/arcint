@@ -1151,7 +1151,11 @@ at `0.37 GiB` (`probe-static`), and the served path answers. On the native
 gpu_hits=3623, gpu_misses=21053, gpu_hit_rate=14.6823%, cpu_tier_pairs=187903,
 created_onednn_kernels=0`; prefill 5 tokens 14.72 s, decode 16 tokens 28.21 s
 (0.6 t/s), answer ` Paris. Paris is the most populous city in France and one
-of the most visited`. The load takes 845 s — the residual stall is the CPU
+of the most visited`. The 16 GiB card serves the same cell too: load 675 s,
+16 tokens 36.5 s (0.44 t/s on the request wall, prefill + decode; the B60's
+0.6 t/s is decode-only), `per_expert_gpu_invocations=135634`,
+`per_expert_dispatches=24697`, hit 14.89%, `cpu_tier_pairs=188023`. The load
+takes 845 s on the 24 GB card — the residual stall is the CPU
 tier's scalar native decode during the load-time probe (seven
 `moe_cpu_expert` threads at ~90% CPU), not a JIT (no `ocloc`/`llvm-spirv`
 child) and not a deadlock; it terminates.

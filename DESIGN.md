@@ -9567,7 +9567,13 @@ answer is coherent: "The capital of France is" → ` Paris. Paris is the most
 populous city in France and one of the most visited`. The load took 845 s, and
 that is the stall (below). `per_expert_gpu_invocations > 0` is the counter the
 campaign owed; the resident route computes on the card, the misses on the host
-tier.
+tier. The **A770** (GPU.1, PCI 8086:56a0) serves the same cell: the load
+completes in 675 s, the request answers in 36.5 s (16 tokens, 0.44 t/s on the
+request wall, prefill + decode, where the B60's 0.6 t/s is decode-only), and
+the dump reads `per_expert_gpu_invocations=135634, per_expert_dispatches=24697,
+gpu_hit_rate=14.89%, cpu_tier_pairs=188023, created_onednn_kernels=0`; the
+answer is ` Paris. The capital of Germany is Berlin. The capital of Italy is
+Rome.`. So the native per-expert route is unblocked on both cards.
 
 **The stall is the CPU tier's scalar native decode, not a JIT.** [measured-here,
 code] With the fix the fault is gone and the B60 reaches the plateau probe
@@ -9592,9 +9598,7 @@ or a cold-start fix is the practical route to rate measurement. (2) The ratio 75
 rate is 0.6 t/s, a lower bound, not a win — the win needs the resident fraction
 (the HELD hot-set/LRU campaign). (3) The affine per-expert path (patch 0040, u4
 artifact) is not re-measured under 0047; it shares the same allocation and is
-expected to be unblocked, but that cell is owed. (4) The A770 is not re-run
-under 0047; the B60 result and the shared mechanism make it the same class, but
-the card-specific row stands.
+expected to be unblocked, but that cell is owed.
 
 #### 7.0.3 KV precision on the paged path — u8 is the lever, u4 is a tax
 

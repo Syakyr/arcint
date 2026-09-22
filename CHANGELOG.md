@@ -112,7 +112,10 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
   24 GB card (native `d48n`, ratio 75, KV u8, chunk 128):
   `per_expert_gpu_invocations=135874`, hit 14.68%, 16 greedy tokens 28.21 s
   (**0.6 t/s**), answer ` Paris. Paris is the most populous city in France` —
-  the counter and the served native route the campaign owed. The remaining
+  the counter and the served native route the campaign owed. The 16 GiB card
+  serves the same cell too (load 675 s, 0.44 t/s,
+  `per_expert_gpu_invocations=135634`, hit 14.89%), so both cards are
+  unblocked. The remaining
   load-time delay is the CPU tier's scalar native decode (seven
   `moe_cpu_expert` threads at ~90% CPU during the load probe), not a JIT and
   not a deadlock; it terminates. The rate win stays open (resident fraction,

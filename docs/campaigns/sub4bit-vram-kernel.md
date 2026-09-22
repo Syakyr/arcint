@@ -738,6 +738,13 @@ fusion-impact profile, not a kernel micro-benchmark) applies.
     `created_onednn_kernels=0`. Prefill 5 tok 14.72 s; decode 16 tok 28.21 s
     (**0.6 t/s**); answer ` Paris. Paris is the most populous city in France
     and one of the most visited`. Load 845 s.
+  - **Second card.** The A770 (GPU.1, PCI 8086:56a0) serves the same cell:
+    load 675 s, 16 tokens in 36.5 s — **0.44 t/s on the request wall (prefill +
+    decode; the B60's 0.6 t/s is decode-only)** — answer ` Paris. The capital of
+    Germany is Berlin. The capital of Italy is Rome.`,
+    `per_expert_gpu_invocations=135634`, `per_expert_dispatches=24697`, hit
+    14.89%, `cpu_tier_pairs=188023`. Both cards' native per-expert route is
+    unblocked.
   - The stall is localised: with the fault gone, the load-time activation /
     plateau probe runs `paged_forward` while the **seven `moe_cpu_expert` pool
     threads** burn ~90% CPU each on the scalar native row decoder
@@ -747,6 +754,5 @@ fusion-impact profile, not a kernel micro-benchmark) applies.
   - Open: (1) a served window that skips the load probe (`--fit-ledger-dir`)
     or a cold-start fix, for rate measurement without the 14-minute load;
     (2) the rate win needs the HELD hot-set/LRU campaign; (3) the affine
-    per-expert path (0040, u4 artifact) is owed under 0047; (4) the A770 row
-    under 0047 is owed. The decode arithmetic stays pinned device-free (16
-    cells).
+    per-expert path (0040, u4 artifact) is owed under 0047. The decode
+    arithmetic stays pinned device-free (16 cells).
