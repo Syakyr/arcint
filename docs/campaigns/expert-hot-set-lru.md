@@ -748,3 +748,31 @@ and the campaign stops. Every disposition carries an evidence class
     (layer_key 9143804121) to **20.6%** (73272898913) across the 48 layers, so the
     shortfall is per-layer, not a single global deficit — a per-layer calibration
     problem, not a budget problem.
+- 2026-09-22 (late, second) — **regime-matched calibration PAYS: a prefill-seeded
+  S=5 set doubles the prefill coverage, and the seed we ship is decode-leaning.**
+  [measured-here] Same trace (window 004), same 5-slot budget, three calibration
+  sources, coverage measured on BOTH regimes:
+  | seed calibrated on | coverage on PREFILL | coverage on DECODE |
+  |---|---|---|
+  | mixture (2,735 prefill + 4,096 decode) — what we serve today | 4.11% | 13.86% |
+  | **prefill only (2,735 tokens)** | **8.11%** | 5.36% |
+  | decode only (4,096 tokens) | 2.86% | 14.34% |
+  - **The shipped seed is DECODE-leaning**: it agrees with the decode seed on
+    **18 of 48 layers** and with the prefill seed on **0 of 48** — exactly what a
+    mixture dominated by decode tokens should produce.
+  - **The lever has a measured size**: for a prefill-heavy serving shape,
+    calibrating on the prefill census buys **1.97x the prefill coverage at the
+    SAME 5-slot budget**, with no extra VRAM; the price is decode coverage
+    (13.86 -> 5.36%), which the serving mix must decide.
+  - This is the same law as the 2026-09-21 policy comparand (a prefill-derived
+    census under-predicts DECODE hotness ~4x) and the regime entry above, now
+    quantified in the direction that matters for the served workload: coverage is
+    a property of the **(seed x regime)** pair, so the seed is calibrated on the
+    mix you serve.
+  - Caveats, stated: this is coverage over one window, not a converged steady
+    state (the decode ranking does not plateau; V3 fires); it is a device-free
+    replay of the trace, NOT a served measurement; and it moves no acceptance row
+    — the pinned G and the V1/V4 records are untouched. The three seeds disagree
+    per layer (layer_key 284636629: mixture [88,158,261,269,333], prefill
+    [11,117,199,269,306], decode [88,169,261,333,439]), so this is a different
+    membership, not a tie-break effect.
