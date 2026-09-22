@@ -22,7 +22,10 @@ measured facts frame it:
   kernels refuse the native formats (`code`, patch 0043's in-code assert
   that every routed expert is computed on the CPU tier until the OpenCL
   decode exists `:726-731`, DESIGN §7.0.2ca; design note
-  `docs/design-routing-aware-expert-execution.md` §2.3b/§2.3c). Keeping an
+  `docs/design-routing-aware-expert-execution.md` §2.3b/§2.3c). [DATED IN
+  PLACE 2026-09-22: it exists now — patches 0043/0045 carry the native
+  per-expert OpenCL decode, served at the 0045+0047 prefix `ov-0047`; the
+  statement above was true when written.] Keeping an
   expert's bytes on the card changes **no** compute in that regime — the
   host kernel still decodes and GEMVs every routed expert from host mmap.
   The rate lever is `sub4bit-vram-kernel`'s step 3, the OpenCL decode of the
@@ -86,7 +89,10 @@ census instrument this campaign's charter names as its first deliverable.
 cannot be measured on the native artifact until either (a)
 `sub4bit-vram-kernel`'s OpenCL decode lands, or (b) a resident-compute arm
 of the fused path is produced. Stated here so the gate's emptiness is
-attributable, the way window-051 clause (d)'s emptiness was.
+attributable, the way window-051 clause (d)'s emptiness was. [DATED IN
+PLACE 2026-09-22: condition (a) is met — the native per-expert OpenCL
+ decode (patches 0043/0045) serves at the 0045+0047 prefix `ov-0047`; the
+ dependency is discharged and the speed leg runs.]
 
 ## Gate
 
@@ -102,10 +108,23 @@ Copied from `ROADMAP-0.5.x.local.md` 0.5.2 and `docs/window-052.md`
   per-layer hit rate and the measured resident-compute rate; until the
   resident-compute path exists G is **UNPINNED** and the row reads EMPTY,
   not PASS. No stale figure (the 23.6 t/s HF-exported 35B control) is
-  inherited.
+  inherited. [DATED IN PLACE 2026-09-22: the resident-compute path now
+  exists (native per-expert OpenCL decode, patches 0043/0045; served prefix
+  `ov-0047`), so **G is PINNED at 1.10** in `docs/window-052.md` — the
+  free-card ceiling `1/(1 − h₉₉) = 1.1106` rounded down, from the census
+  top-5 coverage `h₉₉ = 9.9595 %`. The resident-compute ratio `ρ` is NOT
+  separately measured: the one counter point (ratio 75) mixes the load
+  probe, the warm-up and the 16 served decode tokens, so it is an
+  observation, not a fit. The pinned prediction is a V1 shortfall with the
+  hot-set *correctly engaged*. The `UNPINNED` sentence above stays as
+  written, marked.]
 - **Speed hold (operator decision, 2026-09-21):** the speed row waits for
   `sub4bit-vram-kernel` step 3, the OpenCL decode. Census + policy land
   first; the speed measurement is not attempted on the host-compute tier.
+  [DATED IN PLACE 2026-09-22: the dependency is met — the native per-expert
+  OpenCL decode (patches 0043/0045) serves at the 0045+0047 prefix
+  `ov-0047`; the speed leg runs and G is PINNED at 1.10 in
+  `docs/window-052.md`. The hold above stays as written, marked.]
 - **Stale-byte zero:** `digest(host-bound bytes of expert E) ==
   digest(card-bound bytes of the same E)` for every E in the hot set, with a
   **red-first mutation on eviction** (perturb one byte in the eviction path
@@ -131,7 +150,12 @@ byte, V3 no plateau in the predicted rounds, V4 visible policy change.
    **speed leg is HELD** until `sub4bit-vram-kernel` step 3 (the OpenCL
    decode of the native formats in the per-expert kernel) lands: the census
    and policy paths proceed now, and **no speed measurement is taken before
-   that patch**. Until then the speed row reads EMPTY, not PASS.
+   that patch**. Until then the speed row reads EMPTY, not PASS. [DATED IN
+   PLACE 2026-09-22: the path now exists — the native per-expert OpenCL
+   decode (patches 0043/0045) serves at the 0045+0047 prefix `ov-0047`
+   (plugin `f021de51b5812ee2`) on both cards; the speed leg is no longer
+   held and G is PINNED at 1.10 in the acceptance document. The `HELD`
+   sentence above stays as written, marked.]
 
 ## Scope — in / out
 
@@ -642,3 +666,24 @@ and the campaign stops. Every disposition carries an evidence class
     `_weight_provider->resident_capacity()`, which returns `_capacity`), so
     the validation/bind pairing is not a divergence; stated here because the
     reviewer could not see the provider source.
+
+- 2026-09-22 (G pin, PREDICTION commit) — **G is PINNED at 1.10 before any
+  speed measurement; the speed row's HOLD is discharged.** [documented pin;
+  `measured-here` inputs, `derived` ceiling] The native per-expert OpenCL
+  decode (patches 0043/0045) serves at the 0045+0047 prefix `ov-0047` on both
+  cards, so the speed leg this campaign HELD is runnable. The gate `warm-up
+  decode ≥ G × host-bound baseline` now has its G, pinned in
+  `docs/window-052.md`: census-measured hit fraction `h₉₉ = 9.9595 %`
+  (window-004 CORPUS census top-5 at the plugin's measured 5 slots/layer —
+  also transcribed here, S = 5; the in-sample seed is disclosed against the
+  held-out decode-regime value 14.59 % at S = 6), and the one existing
+  resident-compute datum (B60, ratio 75, 0047: `per_expert_gpu_invocations`
+  135,874 → 67,937 card pairs vs `cpu_tier_pairs` 187,903, `h₇₅ = 0.2655`,
+  decode 0.5672 t/s). That datum is a phase MIXTURE (255,840 pairs = 533
+  tokens × 48 × 10, against a 21-token served request: the load probe and the
+  activation ladder dominate), so it is an observation (no win at
+  `h₇₅ ≈ 0.27`) and NOT a fit. The assumption-free ceiling is
+  `1/(1 − h₉₉) = 1.1106`, so the pinned gate is **G = 1.10** and the
+  prediction is a shortfall (V1) with the hot-set *correctly engaged*. A
+  measured decode at or above the gate overturns the prediction and G is
+  corrected in place with the measurement's date.

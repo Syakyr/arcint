@@ -45,6 +45,80 @@ selection from an expert-access census; eviction/refresh discipline.
   and the policy land on the host-tier path first; the speed row stays EMPTY
   and G stays UNPINNED until the resident-compute patch exists. No speed
   window is spent on the host-compute tier.]
+  [CORRECTED 2026-09-22, PREDICTION: **G is PINNED at 1.10, before any speed
+  measurement of this leg.** The dependency the HOLD named is discharged: the
+  native per-expert OpenCL decode exists (patches 0043/0045) and the served
+  path is the 0045+0047 prefix `ov-0047` (plugin `f021de51b5812ee2`), which
+  serves on both cards (`sub4bit-vram-kernel` status 2026-09-22 late
+  morning). The pin, its arithmetic and the predicted outcome are in the
+  section below. This paragraph supersedes the two `UNPINNED` lines above;
+  those stay as written, marked.]
+
+## G pin — the prediction commit, before the speed leg (2026-09-22)
+
+The gate is `warm-up decode ≥ G × the host-bound baseline`. G is pinned from
+the measured baseline and the census-measured hit fraction; the one existing
+resident-compute datum is a phase mixture and is reported as such, not fitted.
+
+- **baseline** `H`: the `d48n` host-tier decode, **0.5–0.8 t/s** (B60, ratio
+  99 + tier, KV u8, f16, chunk 512; `measured-here`, 2026-09-18). The gate is
+  read against the band's **upper edge 0.8 t/s**, so a pass cannot be an
+  artefact of the friendlier end; the midpoint 0.65 is quoted beside it and
+  decides nothing. On the A770 (the rate leg's card) the same-day host-tier
+  comparand is **0.526 t/s** `[derived: 32 decode tokens / 60.84 s; measured
+  2026-09-22, the quality-window incumbent arm, run without
+  `--moe-per-expert-dispatch`]`.
+- **served hit fraction** `h`: at the ratio-99 budget the plugin's pool is
+  **5 slots/layer** (integer division, `measured-here` 2026-09-22), and the
+  window-004 CORPUS census's top-5 per layer covers **9.9595 %** of the
+  corpus's routed accesses (`measured-here`; 3,278,880 accesses over 24,088
+  nonzero `(layer, expert)` cells; 6,831 tokens × 48 layers × 10 experts).
+  `h₉₉ = 0.0996`. **Disclosure:** the seed IS the top-5 of the census it is
+  served over (in-sample), so 9.96 % is its realized coverage for that corpus
+  by construction; the campaign's held-out protocol B measured the
+  decode-regime hit at **14.59 %** for S = 6 (`measured-here`), ~4× the
+  prefill-calibrated value. No held-out S = 5 number exists, so the
+  held-out value at this budget is unverified; if the served hit were the
+  larger 14.59 %, the free-card ceiling would rise with it
+  (`1/(1 − 0.1459) = 1.17` `[derived]`) and G = 1.10 would be 94 % of that
+  ceiling rather than 99 %. The pin is therefore computed from the smaller
+  in-sample hit, which is the stricter of the two readings: it yields the
+  lower ceiling and the harder gate.
+- **resident-compute rate** `ρ` (card per-pair time ÷ host per-pair time):
+  **NOT separately measured, and the gap is stated rather than smoothed.**
+  The only counter reading with a card/host split is the B60 ratio-75 run
+  under the 0047 plugin (`per_expert_gpu_invocations = 135874` → 67,937 card
+  pairs; `cpu_tier_pairs = 187903`; decode 16 tok in 28.21 s = **0.5672 t/s**,
+  `measured-here`). Those counters span the whole process: 255,840 pairs =
+  533 tokens × 48 layers × 10 experts, while the served request is 21 tokens
+  (5 prefill + 16 decode) — so ~96 % of the counted pairs are the load-time
+  plateau probe and the activation ladder, a phase mixture whose served-decode
+  split is not readable from these counters. Taken at face value under the
+  midpoint baseline the mixture implies `ρ ≈ 1.55` `[derived]`; over
+  `H ∈ {0.5, 0.8}` it spans 0.55–2.55 `[derived]`, so the point cannot even
+  decide the sign of the win. It is used only as an observation: **at
+  `h₇₅ ≈ 0.27` the served decode (0.5672 t/s) sat inside the baseline band,
+  so no win is demonstrated at that residency.**
+
+Model: `R(h) = H / (1 − h·(1 − ρ))`. With `ρ` unmeasured, the only
+assumption-free statement is the free-card ceiling `ρ = 0`:
+
+    R₉₉ ≤ H / (1 − h₉₉) = H / 0.9004  →  G_max = 1.1106   [derived]
+
+**The pinned gate is G = 1.10** (the free-card ceiling at the in-sample hit
+`h₉₉ = 9.96 %`, rounded down from 1.1106). It requires the served decode to
+reach 99 % of the speedup a zero-cost card could buy at that hit, and the
+ratio is invariant across the baseline band (the baseline cancels).
+Thresholds: B60 `≥ 1.10 × 0.8 =` **0.88 t/s**; A770
+`≥ 1.10 × 0.526 =` **0.579 t/s** `[derived]`. The prediction is that
+the gate will **NOT** be met and clause V1 fires: no measured point
+demonstrates a card/host per-pair win (the ratio-75 observation), and the
+ceiling itself is only 1.1106, so a realized win at `h₉₉ = 9.96 %` is at
+best 11 %. The prediction is falsifiable — a measured decode at or above the
+gate overturns it, and G is then corrected in place with the measurement's
+date. **A V1 firing with the hot-set correctly engaged (the census seed
+serving at `seed_source=census`, its top-5 pinned) is the predicted shape;
+V1's "the hot-set did not engage" branch is not implied.**
 
 ## The bar in force
 
@@ -60,7 +134,7 @@ nothing here. Any KL reading must print `F_served` beside it; a bar below
 
 | quantity | predicted | measured |
 |---|---|---|
-| warm-up decode vs the host-bound baseline | ≥ G × (measured d48n 0.5–0.8 t/s), G stated before the run; G UNPINNED today (see Entry criteria) | EMPTY |
+| warm-up decode vs the host-bound baseline | ≥ G × (measured d48n 0.5–0.8 t/s), **G = 1.10** (pinned 2026-09-22, PREDICTION; see Entry criteria and the G-pin section). Thresholds read against the band's upper edge: B60 **< 0.88 t/s** fails, A770 **< 0.579 t/s** fails | EMPTY |
 | stale-byte zero proof | digest(host-bound bytes of expert E) == digest(card-bound bytes of the same E), every E in the hot set | EMPTY |
 | convergence | rounds-to-plateau printed with the census | **MEASURED 2026-09-22** (`measured-here`): `rounds_to_plateau = None`, `plateau = False` at **S = 6 and S = 10**, at both **512 decode tokens** (window 003) and **4,096 decode tokens** (window 004); the selected resident set changed at every power-of-two prefix including 2,048 → 4,096. **V3 FIRES (2026-09-22):** the census does not plateau within the rounds this corpus admits, so the policy is not converging at this corpus length. Raw series in `docs/campaigns/expert-hot-set-lru.md` (status, 2026-09-21 night) and the window-004 plateau JSONs. |
 | seed implication at the ratio-99 budget | coverage of the corpus's routed accesses by the census-seeded static partition (input to the seed decision; not a V-clause) | **MEASURED 2026-09-22** (`measured-here`): window 004 corpus census (3,278,880 accesses, 6,831 × 48 × 10): S = 6 **11.37 %**, S = 10 **16.22 %**, S = 16 **22.19 %**, S = 32 **33.84 %**, S = 64 **49.20 %**; analytic chance S/512 = 1.17 / 1.95 / 3.13 / 6.25 / 12.50 %. The incumbent `splitmix64` seed sits at chance at every budget (0.92–1.10× `slots/512`), so the census seed reaches 9.70 / 8.31 / 7.10 / 5.41 / 3.94× chance here. Coverage is a hit fraction over a non-plateauing window, not a converged steady state. **Measured correction (2026-09-22):** the plugin's actual pool at ``--offload-ratio 99`` is **5 slots/layer**, not 6 — `prepare_moe_otd_params` uses integer division `512*(100-99)/100 = 5`, while the engine's own ledger (`src/exec/fit.h`) prices `ceil(...) = 6`. The S = 6 seed is therefore REFUSED at load (measured: `census seed: layer_key … lists 6 experts but the pool has 5 slots (mismatched budget)`), and the served seed uses the corpus top-5 (coverage **9.96 %**, computed by grouping the corpus census CSV by layer, sorting `(-count, expert)` and summing the top 5: raw output `S=5: 9.9595%`, `S=6: 11.3721%`, in the session's `quality-report.txt`). The S = 6…64 numbers above are the engine-priced offline analysis; the served pool is one slot smaller. |
@@ -70,7 +144,9 @@ nothing here. Any KL reading must print `F_served` beside it; a bar below
 ## Falsifiable clauses (each can fail)
 
 - **V1** — if warm-up decode < G × baseline, the hot-set did not engage (or
-  the baseline moved): the row says so, not PASS.
+  the baseline moved, or the resident-compute path has no per-pair win). The
+  parenthesis names causes, not the only cause: a shortfall with the hot-set
+  correctly engaged is V1 too. The row says so, not PASS.
 - **V2** — if any expert's host-bound and card-bound bytes differ by digest,
   eviction/refresh is stale: RED, not PASS.
 - **V3** — if the census does not plateau within the rounds the prediction
@@ -181,3 +257,30 @@ nothing here. Any KL reading must print `F_served` beside it; a bar below
   - The speed row stays EMPTY (HELD), G stays UNPINNED, and the stale-byte
     proof stays EMPTY (no engine-side host/card readback). No speed number is
     claimed.
+- 2026-09-22 (G pin, PREDICTION commit) — **G is PINNED at 1.10 before any
+  speed measurement of this leg, and the HOLD is discharged.**
+  [documented pin; `measured-here` for its inputs, `derived` for the ceiling]
+  The native per-expert decode the HOLD named exists (patches 0043/0045) and
+  serves at the 0045+0047 prefix `ov-0047` (plugin `f021de51b5812ee2`) on both
+  cards, so the speed leg is runnable. The pin, written here before the run:
+  baseline `H = 0.5–0.8 t/s` (d48n host tier, B60, ratio 99 + tier, KV u8,
+  f16, chunk 512; gate read at its upper edge, 0.8) and the A770 same-day
+  host-tier comparand 0.526 t/s `[derived: 32 decode tokens / 60.84 s; the
+  quality-window incumbent arm, which did NOT pass
+  `--moe-per-expert-dispatch`]`; served hit fraction `h₉₉ = 9.9595 %`
+  (window-004 corpus census top-5 at the plugin's measured 5 slots/layer;
+  in-sample, with the held-out decode-regime value 14.59 % at S = 6 also
+  disclosed). The resident-compute ratio `ρ` is **NOT
+  separately measured**: the one counter point (B60, ratio 75, 0047:
+  `per_expert_gpu_invocations=135874` → 67,937 card pairs vs
+  `cpu_tier_pairs=187903`, `h₇₅ = 0.2655`, decode 0.5672 t/s) spans the whole
+  process (255,840 pairs = 533 tokens × 48 × 10) and is a probe/warm-up/decode
+  mixture, so it is an observation only — at `h₇₅ ≈ 0.27` the served decode sat
+  inside the baseline band, no win demonstrated. The assumption-free ceiling
+  `1/(1−h₉₉) = 1.1106` `[derived]` is the pin's basis. **The pinned gate is
+  G = 1.10 (the ceiling); the prediction is that the gate is NOT met and
+  clause V1 fires** — no measured point demonstrates a per-pair win. The
+  predicted shape is a V1 shortfall with the hot-set *correctly engaged*.
+  Falsifiable: a measured decode at or above the gate overturns it, and G is
+  corrected in place with the measurement's date. The speed row itself stays
+  EMPTY until the measurement.
