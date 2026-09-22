@@ -179,11 +179,22 @@ RUN strip --strip-unneeded ${OV_PREFIX}/openvino/libs/*.so* 2>/dev/null || true;
       || { echo "wheel layout changed: targets no longer point at openvino/libs" >&2; exit 1; }; \
     rm -rf /tmp/patched /tmp/tbb
 
-# Deliberately NO /etc/ld.so.conf.d entry — arcint finds these through its
-# RPATH (same reasoning as the deb: a system-wide entry would put a nightly
-# OpenVINO ahead of anything else linking the same sonames). In the image
-# nothing else links them, but keeping the deb's discipline means the binary
-# behaves identically in both worlds.
+# ld.so.conf.d INSIDE the image — deliberately deviating from the deb's
+# "no system-wide entry" discipline here. Measured reason (pulled the pushed
+# tier-1 image layers and read the ELF dynamic tags): the wheel's original
+# libs carry DT_RPATH=$ORIGIN (self-locating), but the source build's libs
+# carry DT_RUNPATH=/opt/ov/temp/Linux_x86_64/tbb/lib (and
+# /opt/ov/bin/intel64/Release) — build-tree paths that do not exist in the
+# final image. RUNPATH is not inherited from the executable, so
+# arcint -> libopenvino -> libtbb fails at the second hop (measured: tier-2
+# ctest, run 35754012937). The deb gets away with it via load-order on the
+# host; an image must not depend on that. The deb's objection (a nightly
+# OpenVINO jumping ahead of other consumers) cannot apply inside a dedicated
+# container — nothing else links these sonames here.
+RUN echo /usr/lib/marfrit-openvino/openvino/libs > /etc/ld.so.conf.d/marfrit-openvino.conf \
+  && ldconfig \
+  && ldconfig -p | grep -F libtbb.so.12 > /dev/null \
+  || { echo "ldconfig did not pick up the OV libs dir" >&2; exit 1; }
 
 RUN ldconfig && ls /usr/lib64/libze_intel_gpu* > /dev/null 2>&1 \
   || echo "WARN: libze_intel_gpu not found in the expected place — check the intel-compute-runtime package layout" >&2

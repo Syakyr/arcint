@@ -273,6 +273,25 @@ host, so the ExecStart shape carries over verbatim.
   the operator: get a complete `0037` re-exported by the patch author,
   then bump `PATCH_MAX` and the level.**
 
+- **2026-09-22, run 4: tier 1 PASSED (`ghcr.io/syakyr/arcint-ov:
+  2026.4.0-marfrit-p15` pushed), tier 2 failed at the ctest gate —
+  `libtbb.so.12: cannot open shared object file`.** Root cause measured,
+  not guessed: pulled the pushed tier-1 image layers via the GHCR registry
+  API (no Docker needed) and read the ELF dynamic tags with a minimal
+  parser. The wheel's original libs carry `DT_RPATH=$ORIGIN`
+  (self-locating); the source-build libs that replace them carry
+  `DT_RUNPATH=/opt/ov/temp/Linux_x86_64/tbb/lib` — build-tree paths that
+  don't exist in the final image. RUNPATH is not inherited from the
+  executable, so `arcint → libopenvino → libtbb` fails at the second
+  hop. The deb survives this via load-order on the host; an image must
+  not depend on that. Fix: tier 1 now installs
+  `/etc/ld.so.conf.d/marfrit-openvino.conf` + `ldconfig` (with a gate
+  that the cache picked it up). The deb's "no ld.so.conf entry"
+  discipline protects shared hosts; inside a dedicated container nothing
+  else links these sonames, so the deviation is safe and every chain
+  resolves. Requires a full tier-1 rebuild (~90 min) — layer cache is
+  not configured across runs.
+
 ## 9. Testing on the Pro B60 box
 
 Once `ghcr.io/syakyr/arcint:investigation` exists:
