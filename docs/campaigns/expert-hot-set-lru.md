@@ -776,3 +776,21 @@ and the campaign stops. Every disposition carries an evidence class
     per layer (layer_key 284636629: mixture [88,158,261,269,333], prefill
     [11,117,199,269,306], decode [88,169,261,333,439]), so this is a different
     membership, not a tie-break effect.
+- 2026-09-22 (late, third) — **the regime-calibrated seed is now EMITTABLE with the
+  tool, not merely measurable.** [code + measured-here]
+  `census-from-call-trace` gained an EXCLUSIVE ceiling (`--to-call-seq`) beside its
+  floor, so a REGIME is a half-open call-seq range, and `join-plugin-call-trace`
+  takes the same range; an inverted range or one that selects NO call is REFUSED
+  (a census that selects nothing is not a census). The recipe, run end-to-end on
+  window 004 with the shipped tool:
+  1. `census-from-call-trace --call-trace … --from-call-seq 288 --to-call-seq 576`
+     -> **23,609 cells, 1,312,800 accesses over 288 batched prefill calls** — the
+     prefill regime, matching the prefill census already on the record.
+  2. `select --census <that> --slots-per-layer 5 --layer-keys <map>` ->
+     `venice-seed-prefill-S5.txt`, a v2 seed keyed by the structural `layer_key`.
+  The prefill seed differs from the shipped mixture seed on **all 48 layers**
+  (96 differing data rows out of 48+48), so the lever is a different membership
+  rather than a tie-break. +5 cells (`tools/test_hot_set_census.py`, now 81 census
+  cells; 134 tests green across the four ladders). This makes the measured V1
+  lever actionable — whether to serve the prefill- or mixture-calibrated seed is
+  still the operator's decision, and it is now a one-line flag, not a new tool.

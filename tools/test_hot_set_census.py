@@ -485,6 +485,40 @@ class TestCallTrace(unittest.TestCase):
             with self.assertRaises(ValueError):
                 hc.parse_call_trace(p)
 
+    def test_census_range_selects_one_regime(self):
+        # a REGIME is a half-open call-seq range: floor 2, ceiling 5 selects
+        # calls 2, 3 and 4 only -- the mechanism the prefill/decode split needs.
+        calls = [(i, 100, 2, [i, i + 1]) for i in range(10)]
+        summary, meta = hc.census_from_call_trace(calls, None, 2, 5)
+        self.assertEqual(meta["calls_selected"], 3)
+        self.assertEqual(meta["to_call_seq"], 5)
+        self.assertEqual(sum(c for _l, _e, c in summary), 6)
+
+    def test_census_range_without_a_ceiling_still_counts_the_tail(self):
+        calls = [(i, 100, 2, [1, 2]) for i in range(5)]
+        _s, meta = hc.census_from_call_trace(calls, None, 2, None)
+        self.assertEqual(meta["calls_selected"], 3)
+
+    def test_census_inverted_range_is_refused(self):
+        calls = [(i, 100, 2, [1, 2]) for i in range(5)]
+        with self.assertRaises(ValueError):
+            hc.census_from_call_trace(calls, None, 4, 2)
+
+    def test_census_range_selecting_none_is_refused(self):
+        calls = [(i, 100, 2, [1, 2]) for i in range(5)]
+        with self.assertRaises(ValueError):
+            hc.census_from_call_trace(calls, None, 9, 12)
+
+    def test_join_honours_the_same_regime_range(self):
+        # the join must be takable over one regime, so the ceiling applies there
+        # too; an inverted range is refused exactly as in the census.
+        calls = [(i, 100, 2, [1, 2]) for i in range(6)]
+        plugin = [(0, 100, 1, 4), (0, 100, 2, 2)]
+        _p, trace, _m = hc.join_plugin_to_call_trace(calls, plugin, 2, 5)
+        self.assertEqual(sum(trace.values()), 6)
+        with self.assertRaises(ValueError):
+            hc.join_plugin_to_call_trace(calls, plugin, 4, 2)
+
     def test_from_call_trace_cli_writes_format_v1(self):
         with tempfile.TemporaryDirectory() as d:
             calls = os.path.join(d, "c.trace")

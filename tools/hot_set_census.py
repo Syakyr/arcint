@@ -497,25 +497,47 @@ def call_trace_to_v1(call_rows, layer_key_map=None, skip_batched=False,
                   "batched_tokens_skipped": skipped_tokens}
 
 
-def census_from_call_trace(call_rows, layer_key_map=None, from_seq=0):
+def _check_range(from_seq, to_seq):
+    """Refuse an inverted call-seq range. A regime is selected by a half-open
+    range, so a range that cannot select anything must fail loudly rather than
+    emit an empty census (or a silent all-zero join)."""
+    if to_seq is not None and to_seq < from_seq:
+        raise ValueError(
+            f"call_seq range [{from_seq}, {to_seq}) is inverted; the ceiling is "
+            f"exclusive and must be >= the floor")
+
+
+def census_from_call_trace(call_rows, layer_key_map=None, from_seq=0, to_seq=None):
     """[(layer, expert, count)] over EVERY routed id of every selected call.
 
     This is the aggregate census, and it is derived from the call trace
     itself, NOT from the decode-only v1 rows: a batched prefill call carries
     many tokens' ids and the aggregate needs no token label, so every id of
-    every call with `call_seq >= from_seq` is one routed access. `call_trace_
-    to_v1` remains the decode-only converter for the row-level consumers
-    (LRU replay, rounds-to-plateau), whose token labels are a reconstruction.
+    every call in the half-open range `[from_seq, to_seq)` is one routed
+    access. `call_trace_to_v1` remains the decode-only converter for the
+    row-level consumers (LRU replay, rounds-to-plateau), whose token labels are
+    a reconstruction.
+
+    **The range is how a REGIME is selected**, and that matters because
+    coverage is a property of the (seed x regime) pair, not of the seed alone:
+    on the served window 004 trace the same 5-slot seed covered 4.11% of the
+    PREFILL and 13.86% of the DECODE, and a seed calibrated on the prefill
+    doubled the prefill coverage (8.11%) at the same budget. A served trace
+    starts with the load-time probe, then the batched prefill calls, then the
+    decode calls, so prefill-only is `[call_seq_start, decode_start)`.
 
     Returns `(summary, meta)`; `summary` is sorted by `(layer, expert)` in the
     trace's decoder-layer space (ascending export order by default).
     """
     calls = len(call_rows)
-    selected_rows = [r for r in call_rows if r[0] >= from_seq]
+    _check_range(from_seq, to_seq)
+    selected_rows = [r for r in call_rows
+                     if r[0] >= from_seq and (to_seq is None or r[0] < to_seq)]
     if not selected_rows:
+        where = (f"call_seq >= {from_seq}" if to_seq is None
+                 else f"call_seq in [{from_seq}, {to_seq})")
         what = ("the call trace is empty" if calls == 0
-                else f"call_seq >= {from_seq} selects none of the {calls} "
-                     f"call(s)")
+                else f"{where} selects none of the {calls} call(s)")
         raise ValueError(
             f"{what}; refusing to emit an empty census (not a census)")
     lk_index = layer_key_index_map([r[1] for r in selected_rows], layer_key_map)
@@ -537,27 +559,31 @@ def census_from_call_trace(call_rows, layer_key_map=None, from_seq=0):
     meta = {"calls": calls, "calls_selected": selected,
             "batched_calls": batched, "decode_calls": decode,
             "tokens_observed": tokens, "accesses": accesses,
-            "from_call_seq": from_seq, "layers": len(lk_index)}
+            "from_call_seq": from_seq, "to_call_seq": to_seq,
+            "layers": len(lk_index)}
     return summary, meta
 
 
-def join_plugin_to_call_trace(call_rows, plugin_rows, from_seq=0):
+def join_plugin_to_call_trace(call_rows, plugin_rows, from_seq=0, to_seq=None):
     """Cross-check patch 0013's CSV against the call-trace census on
     `(weight_offset, expert)`.
 
     The call trace already carries the raw `layer_key` (patch 0018's
     weight-file offset, the same value patch 0013 writes as `weight_offset`),
     so this join needs no export-order assumption and no decoder-index map.
+    The same half-open `[from_seq, to_seq)` range as the census applies, so a
+    join can be taken over one REGIME.
     Returns `(plugin_counts, trace_counts, mismatches)` keyed by
     `(layer_key, expert)`; a mismatch is a key whose counts differ or which is
     absent on one side.
     """
+    _check_range(from_seq, to_seq)
     plugin = defaultdict(int)
     for _lay, off, e, c in plugin_rows:
         plugin[(off, e)] += c
     trace = defaultdict(int)
     for seq, lk, _top_k, ids in call_rows:
-        if seq < from_seq:
+        if seq < from_seq or (to_seq is not None and seq >= to_seq):
             continue
         for e in ids:
             trace[(lk, e)] += 1
@@ -780,7 +806,8 @@ def _cmd_census_from_call_trace(args):
         layer_keys = {int(k): int(v) for k, v in raw.items()}
     prov = read_provenance_file(args.provenance)
     require_attribution(prov)
-    summary, meta = census_from_call_trace(call_rows, layer_keys, args.from_call_seq)
+    summary, meta = census_from_call_trace(call_rows, layer_keys, args.from_call_seq,
+                                           args.to_call_seq)
     lines = ["# census summary (patch 0044 call trace; batched calls counted)"]
     for k, v in prov.items():
         lines.append(f"# {k}={v}")
@@ -808,8 +835,9 @@ def _cmd_join_plugin_call_trace(args):
     call_rows = parse_call_trace(args.call_trace)
     plugin_rows = read_plugin_csv(args.csv)
     plugin, trace, mismatches = join_plugin_to_call_trace(
-        call_rows, plugin_rows, args.from_call_seq)
-    print(f"# join on (weight_offset=layer_key, expert); from_call_seq={args.from_call_seq}")
+        call_rows, plugin_rows, args.from_call_seq, args.to_call_seq)
+    print(f"# join on (weight_offset=layer_key, expert); from_call_seq={args.from_call_seq} "
+          f"to_call_seq={args.to_call_seq}")
     print("# mismatches are keys where patch 0013's ALL-call CSV and the floored "
           "call-trace census disagree (the pre-floor/probe share when "
           "--from-call-seq > 0), not an instrument fault")
@@ -946,6 +974,9 @@ def build_parser():
                         "artifact_sha256= (or artifact=) and card=")
     p.add_argument("--from-call-seq", type=int, default=0,
                    help="count only calls with call_seq >= this floor")
+    p.add_argument("--to-call-seq", type=int, default=None,
+                   help="EXCLUSIVE ceiling; floor+ceiling select one REGIME "
+                        "(e.g. prefill-only = [call_seq_start, decode_start))")
     p.add_argument("--out", default="")
     p.add_argument("--layer-keys", default="")
     p.set_defaults(func=_cmd_census_from_call_trace)
@@ -956,6 +987,8 @@ def build_parser():
     p.add_argument("--call-trace", required=True)
     p.add_argument("--csv", required=True)
     p.add_argument("--from-call-seq", type=int, default=0)
+    p.add_argument("--to-call-seq", type=int, default=None,
+                   help="EXCLUSIVE ceiling; the same regime range as the census")
     p.set_defaults(func=_cmd_join_plugin_call_trace)
     return ap
 
