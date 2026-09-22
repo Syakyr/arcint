@@ -472,3 +472,39 @@ and the campaign stops. Every disposition carries an evidence class
     running) is the longer test; the chance baseline is analytic; and NO served
     throughput is claimed — the speed row stays EMPTY, G stays UNPINNED, and no
     acceptance row moves.
+
+- 2026-09-21 (night) — **the long-decode census window (004) ran, and the
+  non-plateau is permanent at this corpus length.** [measured-here] One A770
+  (GPU.1, PCI 8086:56a0) served window, tree b6dbca5, the pinned KLD capture's
+  window 0 (2,735 token ids) with `ignore_eos` and a 4,096-token greedy
+  continuation, `--offload-ratio 99 --moe-cpu-tier`, KV u8, chunk 512. Trace
+  18,982,949 B, sha256 `bf32c87401d7ac444aa1aae89eb5a641f69cd84b8c43643f7222253ad5d2d304`,
+  197,184 calls; patch-0013 CSV sha256
+  `ea8b7a6d244b36afda78cb2cf72441bc7ff42e4a8f38b76857556a20c83a70f8`;
+  provenance sha256 `00b070cf18d1561e45f044d35881217971805eb93c8834f8b9f9697c2e3ac791`;
+  `call_seq_start=288`. Timing: load 1,880 s; prefill 2,735 tok in 3,646.45 s;
+  decode 4,096 tok in 7,114.16 s (0.6 t/s).
+  - **Census**: 3,893,280 accesses over 24,151 cells RAW; CORPUS (>=288)
+    196,896 calls, 3,278,880 accesses over 24,088 cells = 6,831 x 48 x 10
+    exactly; probe share 614,400. Raw-`layer_key` join: 24,151 keys,
+    **mismatches 0**, totals both 3,893,280. Corpus-floor join mismatches
+    9,343 (the probe).
+  - **Plateau**: NO plateau within 4,096 decode tokens at S = 6 or S = 10
+    (`rounds_to_plateau=None`, `plateau=False`), the selected set changing at
+    every prefix including 2,048 -> 4,096. S = 6 coverage at prefixes
+    1,2,4,8,...,4096: 0.600, 0.5625, 0.4771, 0.4781, 0.3949, 0.2780, 0.2363,
+    0.2217, 0.1964, 0.1781, 0.1582, 0.1565, 0.1632; S = 10: 1.0, 0.7906,
+    0.6734, 0.6737, 0.5566, 0.4008, 0.3478, 0.3257, 0.2856, 0.2590, 0.2310,
+    0.2258, 0.2317. **Verdict: V3's failing shape is permanent at this corpus
+    length.**
+  - **Seed**: corpus layer 0 top-6 = 333, 88, 269, 261, 158, 169 (counts 903,
+    823, 802, 740, 681, 659), which differs from window 003's (269, 309, 199,
+    117, 306, 11); aggregate S = 6 coverage 11.37 % (003: 9.36 %). The corpus
+    ranking MOVED with an 8x longer decode.
+  - **Stability**: the window-004 prefill-only census (23,609 cells,
+    1,312,800 accesses) is BYTE-IDENTICAL to window 003's, so the prefill
+    counts remain the stable comparand.
+  - **Rate**: decode did not degrade with 8x context (0.576 vs 0.534 t/s in
+    003), consistent with the host-COMPUTE-bound reading.
+  - Teardown clean: no `arcint` process, units inactive as found, wake lock
+    untouched. The speed row stays EMPTY and G UNPINNED.

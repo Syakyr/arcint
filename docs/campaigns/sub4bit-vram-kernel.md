@@ -657,3 +657,28 @@ fusion-impact profile, not a kernel micro-benchmark) applies.
   kernels — one card window with the GPU-dispatch counter, the rate and the
   correctness reading. No card was taken; the running served census window
   holds the host CPU, so the measurement waits for it to clear.
+
+- 2026-09-21 (late) — **the native decode compiles on the card, and the served
+  per-expert path faults before serving; the root cause of the historical build
+  failure is found and fixed.** [measured-here + code] Patch 0045 was corrected
+  during the card window: the plugin compiles a primitive's kernels into ONE
+  program, so the per-expert `.cl` body appears once per kernel and its
+  file-scope helpers (`expert_gate_up_gemv_u4`, `expert_down_gemv_u4`,
+  `load_x_interleaved`) were defined twice — the `clBuildProgram`
+  `CL_BUILD_PROGRAM_FAILURE` on xe2 that the 2026-09-17 record saw and never
+  localised. 0045 now wraps every file-scope helper (and the native tables)
+  in a persistent `#ifndef` guard, so the concatenated copies define them
+  once. With that, the native d48n artifact **loads and compiles** on the
+  24 GB card (GPU.0, PCI 8086:e211): `lgc load: language model ready in 23.4 s
+  (paged); device-resident 8.06 GiB`, at both ratio 99 and ratio 80 with
+  `--moe-per-expert-dispatch`. Then the served path **faults before the HTTP
+  server starts**: `xe … Faulted Address 0x0000d556aa740000, Fault response:
+  Unsuccessful -ENOENT` on the blit engine (`EngineClass: 3 bcs`, engine
+  reset) with an `arcint` `segfault … in libc.so.6` (memcpy) at the same
+  instant, three independent launches (two ratio 99, one ratio 80). No
+  `per_expert_gpu_invocations` was read. The decode arithmetic itself is
+  pinned device-free (16 cells) and the fault is DOWNSTREAM of it — the
+  slot upload (`fill_weights_memory`), the per-expert sentinel/gather path, or
+  the dispatch bookkeeping; that is the next localisation. The card was left
+  clean (sampler, SIGTERM, no leftover process); a fresh wake lock would be
+  needed for a leg past the coordinator's.

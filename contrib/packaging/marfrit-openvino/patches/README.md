@@ -997,9 +997,31 @@ and the native tables. The version stamp stays deliberate at `marfrit-p19`
 (0003–0043's stamp), so the 0045 build is identified by its
 `expert_gate_up_native` symbol, not only the version string. The device-free
 cells are **16 green** (`tests/python/test_native_expert_gemv.py`).
-OWED: the one card window (served native artifact through the native
-per-expert kernels, with the GPU-dispatch counter) and its rate and
-correctness reading; no card was taken for this patch.
+
+The per-expert `.cl` also had a **pre-existing** build blocker, found on the
+card: the plugin compiles a primitive's kernels into ONE program, so the
+`.cl` body appears once per kernel and its file-scope helpers
+(`expert_gate_up_gemv_u4`, `expert_down_gemv_u4`, `load_x_interleaved`)
+were defined twice -> `clBuildProgram` `CL_BUILD_PROGRAM_FAILURE` on xe2.
+That is why patch 0039/0040's per-expert kernel had never built on a card
+(the 2026-09-17 record). 0045 wraps every file-scope helper in a persistent
+`#ifndef` guard so the concatenated copies define them once; the native
+kernel then compiles (`lgc load: language model ready`, device-resident
+8.06 GiB).
+
+MEASURED (2026-09-21, 24 GB card GPU.0 = PCI 8086:e211, native d48n, ratio
+99 and 80, per-expert dispatch): the model **loads and compiles**, but the
+served per-expert path then **faults before the HTTP server comes up** --
+`xe ... Faulted Address 0x0000d556aa740000, Fault response: Unsuccessful
+-ENOENT` on the blit engine (`EngineClass: 3 bcs`), engine reset, and an
+`arcint` `segfault ... in libc.so.6` (memcpy) at the same instant; no
+`per_expert_gpu_invocations` was measured. The fault is a finding to
+localise (the upload/gather/sentinel path, not the decode arithmetic,
+which the device-free cells pin), recorded in the campaign status and the
+handoff.
+
+OWED: the served native per-expert reading -- a fix for the card fault,
+then the GPU-dispatch counter, rate and correctness.
 
 ## Deliberately NOT applied
 

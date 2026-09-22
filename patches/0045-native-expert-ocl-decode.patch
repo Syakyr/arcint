@@ -47,7 +47,25 @@
 diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe_expert_swiglu.cl b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe_expert_swiglu.cl
 --- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe_expert_swiglu.cl
 +++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe_expert_swiglu.cl
-@@ -387,6 +387,176 @@
+@@ -68,6 +68,17 @@
+ #    define DEQUANT_4BIT_HI(v) convert_half((v) >> 4)
+ #endif
+ 
++// The plugin builds the kernels of one primitive into ONE program
++// (KernelGenerator::build_code -> batch compilation), so this .cl body appears
++// once per kernel (gate_up and down) in that program. Every file-scope helper
++// below -- the affine GEMV pairs, load_x_interleaved, the native tables and
++// helpers -- must be defined once, not twice; the guard persists across the
++// concatenated copies (the per-kernel JIT undef loop only removes the JIT
++// constants). Patch 0039 shipped without this, so the per-expert kernel never
++// compiled on a card; patch 0045 fixes it.
++#ifndef ARCINT_PER_EXPERT_CL_HELPERS_DEFINED
++#define ARCINT_PER_EXPERT_CL_HELPERS_DEFINED
++
+ // ---------------------------------------------------------------------------
+ // Gate/up GEMV inner loop: 2 output rows, u4 packed weights.
+ // Identical to moe_3gemm_swiglu_mlp.cl gate_up_gemv_n2x_u4.
+@@ -387,6 +398,185 @@
      }
  }
  
@@ -76,6 +94,13 @@ diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe_expert_swiglu.cl b
 +// bytes (the u32 entry's four magnitudes in order).
 +// ===========================================================================
 +#if defined(NATIVE_GATE_UP_ENABLE) || defined(NATIVE_DOWN_ENABLE)
++// The plugin builds the kernels of one primitive into ONE program
++// (KernelGenerator::build_code -> batch compilation), so the .cl body appears
++// once per native kernel (gate_up and down) in that program. Define the tables
++// and helpers once, not twice: the guard persists across the concatenated
++// copies (the per-kernel JIT undef loop only removes the JIT constants).
++#ifndef ARCINT_NATIVE_DECODE_DEFINED
++#define ARCINT_NATIVE_DECODE_DEFINED
 +__constant char NATIVE_IQ4NL_TABLE[16] = {
 +    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
 +};
@@ -218,13 +243,15 @@ diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe_expert_swiglu.cl b
 +    }
 +    return sub_group_reduce_add(acc);
 +}
++#endif  // ARCINT_NATIVE_DECODE_DEFINED
 +#endif  // NATIVE_GATE_UP_ENABLE || NATIVE_DOWN_ENABLE
++#endif  // ARCINT_PER_EXPERT_CL_HELPERS_DEFINED
 +
 +
  #ifdef GATE_UP_ENABLE
  // ===========================================================================
  // Stage 1: gate + up for a single expert.
-@@ -505,3 +675,139 @@
+@@ -505,3 +695,139 @@
  #endif
  }
  #endif  // DOWN_ENABLE
