@@ -25,7 +25,14 @@ RUN dnf -y --nodocs --setopt=install_weak_deps=False install \
       curl which binutils \
   && dnf clean all && rm -rf /var/cache/dnf/*
 
-ARG OV_PIN=71640275
+# Full 40-char SHA — git fetch only serves arbitrary commits by full object
+# id; the 8-char pin from the deb recipes fails with "couldn't find remote
+# ref" (measured: run 35749870402, 2026-09-22).
+ARG OV_PIN=71640275d29692354223572e77ef717e92b891d9
+# Short form for the version string: the nightly reports itself as
+# 2026.4.0-22849-71640275d29, i.e. the 11-char short SHA. The deb recipe
+# built that as ${PIN}d29 off an 8-char pin; here it is spelled out.
+ARG OV_PIN_SHORT=71640275d29
 # The version string must parse for ov_parse_ci_build_number: the build-number
 # FIELD stays numeric, the patch level rides in the free-form tail.
 ARG PATCHLEVEL=marfrit-p16
@@ -58,7 +65,7 @@ RUN cd /opt/ov && shopt -s nullglob && \
 # debug caps OFF, no python/samples/tests/wheel).
 RUN cmake -S /opt/ov -B /opt/ov/build -G Ninja \
       -DCMAKE_BUILD_TYPE=Release \
-      -DCI_BUILD_NUMBER="2026.4.0-22849-${OV_PIN}d29-${PATCHLEVEL}" \
+      -DCI_BUILD_NUMBER="2026.4.0-22849-${OV_PIN_SHORT}-${PATCHLEVEL}" \
       -DENABLE_INTEL_GPU=ON -DENABLE_INTEL_CPU=ON -DENABLE_INTEL_NPU=ON \
       -DENABLE_DEBUG_CAPS=OFF -DENABLE_GPU_DEBUG_CAPS=OFF \
       -DENABLE_PYTHON=OFF -DENABLE_SAMPLES=OFF -DENABLE_TESTS=OFF -DENABLE_WHEEL=OFF \
