@@ -94,6 +94,29 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
   arithmetic (GDN, hyper-connections, the native experts) sits at that
   1% floor everywhere; the gate's 0.06-nat bar needs a reference that
   shares this model's routing noise.
+- **The served per-expert path: the fault, the fix and the first reading**
+  (patch 0047). The native OpenCL decode (patch 0045) compiles, but the
+  served `--moe-per-expert-dispatch` path faulted on the 24 GB card before
+  the HTTP server started — a host memcpy past a buffer end in
+  `libc.so.6` plus a blit-engine page fault (`Faulted Address
+  0x0000d556aa740000`, `-ENOENT`). The localisation is patch 0041: when
+  per-expert dispatch is on it gives each routed-expert Constant a
+  **1-expert placeholder**, but that buffer is the slot pool —
+  `fill_weights_memory` copies each resident expert to `slot × per-expert
+  bytes` and the per-expert kernels index it by `slot_index`, so the first
+  slot past 0 writes out of bounds. The engine/plugin slot-count off-by-one
+  (ceil 6 vs integer 5 at ratio 99) is **disproven**: at ratio 75 both give
+  128 and the same fault recurs. Patch 0047 allocates the resident slot pool
+  in the per-expert branch while still skipping the constant data
+  (`upload_bytes = 0`, `skip_evict`, no device-pool charge). Served on the
+  24 GB card (native `d48n`, ratio 75, KV u8, chunk 128):
+  `per_expert_gpu_invocations=135874`, hit 14.68%, 16 greedy tokens 28.21 s
+  (**0.6 t/s**), answer ` Paris. Paris is the most populous city in France` —
+  the counter and the served native route the campaign owed. The remaining
+  load-time delay is the CPU tier's scalar native decode (seven
+  `moe_cpu_expert` threads at ~90% CPU during the load probe), not a JIT and
+  not a deadlock; it terminates. The rate win stays open (resident fraction,
+  hot-set/LRU HELD).
 
 ### The serving-shape MoE block fuses (campaign: sub4bit-vram-kernel)
 

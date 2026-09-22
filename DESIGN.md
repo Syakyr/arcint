@@ -9499,6 +9499,103 @@ expert on the host tier), so residency alone moves no compute; the dependency is
 engine-side host/card readback that does not exist, and is not asserted from
 code.
 
+#### 7.0.2cd The per-expert native serve: the fault was patch 0041's 1-expert slot pool, the stall is the CPU tier's scalar decode (2026-09-22)
+
+Campaign: `docs/campaigns/sub4bit-vram-kernel.md`; design note
+`docs/design-routing-aware-expert-execution.md` §2.3, §3.2; plugin patch 0047
+(on top of 0043–0046). This closes the "served per-expert path faults on both
+cards" open item that 0045's device-free decode left.
+
+**The fault, measured.** [measured-here] Patch 0045's native per-expert decode
+compiled cleanly (the 2026-09-21 helper-duplication fix), and the served path
+with `--moe-per-expert-dispatch` then faulted on the B60 before the HTTP server
+started: a host write past a buffer end (`arcint … segfault … error 6 in
+libc.so.6`, the memcpy vector) and, at the same instant, a GPU blit-engine page
+fault (`xe 0000:0f:00.0 … Faulted Address 0x0000d556aa740000, Fault response:
+Unsuccessful -ENOENT`, `engine_class=bcs`, engine reset). Three independent
+launches, at ratio 99 and ratio 80 (the 0045 leg); the discriminating run at
+ratio 75 is recorded below. A gdb attach during the deterministic
+reproducer puts the host crash in a single frame: `paged_forward → load_paged`
+(the load-time probe) → the OpenVINO `CPUStreamsExecutor` →
+`libopenvino_intel_gpu_plugin.so` → `libigdrcl.so` →
+`__memcpy_avx_unaligned_erms` — the plugin's slot upload copying an expert into
+the per-tensor slot buffer.
+
+**The mechanism, from code.** [code] Patch 0041, when `MOE_PER_EXPERT_DISPATCH`
+is on, gives every routed-expert Constant a 1-expert placeholder
+(`moe_offload_constant.cpp`: `upload_shape[0] = 1`, reinterpreted to the full
+constant layout). But the per-expert dispatch path uses that same buffer as its
+slot pool: `fill_weights_memory` (`moe_otd_runtime.cpp`) copies each resident
+expert to `dst_offset = lru_expert_no * (tensor bytes / num_expert)` and
+patches 0043/0045's per-expert kernels index it by `slot_index`
+(`set_otd_weight_pointers` → `exec_batched_gemv`). The FIRST slot with index
+≥ 1 therefore writes past the one-expert allocation; the pool is
+resident-sized (5 slots at ratio 99, 128 at ratio 75) and nothing in the path
+caps the index at the placeholder's size.
+
+**The off-by-one hypothesis is disproven.** [measured-here] The engine's fit
+ledger (`src/exec/fit.h expert_slot_bytes`) prices `ceil(512*(100-r)/100)` —
+6 slots at ratio 99 — while the plugin (`ops/moe.cpp`, `moe_offload_constant.cpp`)
+uses integer division — 5. The suspicion was a pointer one slot past a buffer
+sized by the engine's count. The discriminating run is a ratio where the two
+formulas agree: at ratio 75 both give 128. The fault did NOT disappear: the
+same `segfault … in libc.so.6` and the same `Faulted Address
+0x0000d556aa740000` recurred at ratio 75. The divergence is therefore not the
+mechanism; the fixed 1-expert placeholder is, and it is ratio-independent. (The
+engine's ceiling is only ever the reservation/ledger, never a plugin buffer
+size; `MOE_OTD_DEVICE_POOL_BYTES` is a byte budget set from an env var, not a
+slot count.)
+
+**The fix.** [code, measured-here] Patch 0047 allocates the resident slot pool
+in the per-expert-dispatch branch exactly as the ordinary OTD path does
+(`upload_shape[0] = min(num_expert, resident_expert_num)`), while keeping patch
+0041's compile-time behaviour: the constant data is still skipped
+(`upload_bytes = 0`), `hint_evict` stays suppressed, and no device pool budget
+is charged. The pool is host-mapped on these cards (the §7.0.2t two-ledger
+shape), so the device term stays small. Built as the plugin at prefix `ov-0047`
+(identified by the `expert_gate_up_native` symbol plus the new defensive
+assertion), on top of patches/0003–0046.
+
+**The served native reading.** [measured-here] B60 (GPU.0, PCI 8086:e211),
+native `d48n`, `--offload-ratio 75 --moe-cpu-tier --moe-per-expert-dispatch
+--paged-kv u8 --prefill-chunk 128`, one lane, the 0047 plugin
+(`f021de51b5812ee2`): `[OTD_PERF] … per_expert_dispatches=24676,
+per_expert_gpu_invocations=135874, gpu_hits=3623, gpu_misses=21053,
+gpu_hit_rate=14.68%, cpu_tier_pairs=187903, created_onednn_kernels=0`. 16
+greedy tokens took 28.21 s (**0.6 t/s**), prefill 5 tokens 14.72 s, and the
+answer is coherent: "The capital of France is" → ` Paris. Paris is the most
+populous city in France and one of the most visited`. The load took 845 s, and
+that is the stall (below). `per_expert_gpu_invocations > 0` is the counter the
+campaign owed; the resident route computes on the card, the misses on the host
+tier.
+
+**The stall is the CPU tier's scalar native decode, not a JIT.** [measured-here,
+code] With the fix the fault is gone and the B60 reaches the plateau probe
+(`0.37 GiB`, `probe-static`, the same figure the A770 showed), but the HTTP
+server then takes minutes to appear (845 s at `--prefill-chunk 128`; >25 min at
+512). Attaching to the live process during that window: the main thread sits in
+`paged_forward` (the load-time activation/plateau probe) waiting on the plugin,
+while exactly the seven `moe_cpu_expert` pool threads burn ~90% CPU each. The
+hot instruction is the scalar native row decoder (`moe_cpu_expert.cpp`, patch
+0043): `movzbl (byte) → cvtsi2ss → mulss (per-32 scale) → movss` — real decode
+work, not a spin and not a compile (no `ocloc`/`llvm-spirv` child, no
+`created_onednn_kernels`). Both cards' "stall" is therefore the per-expert
+dispatched load probe paying the scalar host decode for every routed expert;
+it terminates, and its length is the measured price of the tier, not a hang.
+The rate lever remains the native GPU decode plus the hot-set LRU (HELD): at
+ratio 75 only 25% of routed experts are resident.
+
+**What remains.** [documented] (1) The load-time probes run the CPU tier on
+every routed expert, making a per-expert native load 14 minutes at chunk 128;
+a served window that skips the probe (`--fit-ledger-dir` with a matching entry)
+or a cold-start fix is the practical route to rate measurement. (2) The ratio 75
+rate is 0.6 t/s, a lower bound, not a win — the win needs the resident fraction
+(the HELD hot-set/LRU campaign). (3) The affine per-expert path (patch 0040, u4
+artifact) is not re-measured under 0047; it shares the same allocation and is
+expected to be unblocked, but that cell is owed. (4) The A770 is not re-run
+under 0047; the B60 result and the shared mechanism make it the same class, but
+the card-specific row stands.
+
 #### 7.0.3 KV precision on the paged path — u8 is the lever, u4 is a tax
 
 The plugin accepts f16/u8/i8/u4/i4 for `KV_CACHE_PRECISION` on the paged path,

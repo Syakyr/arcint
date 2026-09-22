@@ -699,3 +699,54 @@ fusion-impact profile, not a kernel micro-benchmark) applies.
   — a JIT/dispatch stall to localise, not a numeric fault. Neither card has
   a served reading yet; the decode arithmetic stays pinned device-free (16
   cells).
+- 2026-09-22 (late morning) — **the fault is patch 0041's 1-expert slot-pool
+  placeholder; the off-by-one is disproven; the served native per-expert
+  reading is taken.** [measured-here + code]
+  - The fault, raw: B60 GPU.0 (`xe 0000:0f:00.0`), served native `d48n` with
+    `--moe-per-expert-dispatch` at ratio 99 and 80 (the 0045 leg; the ratio-75
+    discriminating run is below) — a host memcpy past a buffer
+    (`arcint … segfault at … error 6 in libc.so.6`, the memcpy vector) and, at
+    the same instant, `Faulted Address 0x0000d556aa740000, Fault response:
+    Unsuccessful -ENOENT`, `EngineClass: 3 bcs`, engine reset. A gdb attach
+    localises the host crash to `paged_forward → load_paged` → the plugin →
+    `libigdrcl.so` → `__memcpy_avx_unaligned_erms`: the slot upload copying an
+    expert into the per-tensor slot buffer.
+  - Mechanism (`code`): patch 0041's per-expert-dispatch branch gives the
+    routed-expert Constant a **1-expert placeholder** (`moe_offload_constant.cpp`,
+    `upload_shape[0] = 1`), but that same buffer IS the slot pool —
+    `fill_weights_memory` copies each resident expert to `dst_offset =
+    slot*(tensor bytes/num_expert)` and the 0043/0045 per-expert kernels index
+    it by `slot_index`. The first slot ≥ 1 writes past the allocation.
+  - **Off-by-one test (first hypothesis): KILLED.** The engine ledger
+    (`src/exec/fit.h`) prices `ceil(512*(100-r)/100)` = 6 at ratio 99, the
+    plugin integers = 5. The discriminating run is the ratio where both agree:
+    ratio 75, both 128 — the same segfault and the same
+    `Faulted Address 0x0000d556aa740000` recurred. The divergence is not the
+    mechanism; the fixed placeholder is, and it is ratio-independent. The
+    engine's ceiling only ever sizes the reservation/ledger, never a plugin
+    buffer (`MOE_OTD_DEVICE_POOL_BYTES` is an env-set byte budget).
+  - Fix: **patch 0047** (`0047-moe-per-expert-slot-pool-size.patch`,
+    mirror + contrib) allocates the resident slot pool in the per-expert
+    branch exactly as the ordinary OTD path does, keeping 0041's
+    `upload_bytes = 0`, `skip_evict`, no device-pool charge. Built clean as
+    the plugin at prefix `ov-0047` (plugin `f021de51b5812ee2`).
+  - **Served native reading** (B60 GPU.0 PCI 8086:e211, `d48n`,
+    `--offload-ratio 75 --moe-cpu-tier --moe-per-expert-dispatch --paged-kv
+    u8 --prefill-chunk 128`, one lane): `per_expert_gpu_invocations=135874`
+    (the owed counter), `per_expert_dispatches=24676`, `gpu_hits=3623`,
+    `gpu_misses=21053`, hit 14.68%, `cpu_tier_pairs=187903`,
+    `created_onednn_kernels=0`. Prefill 5 tok 14.72 s; decode 16 tok 28.21 s
+    (**0.6 t/s**); answer ` Paris. Paris is the most populous city in France
+    and one of the most visited`. Load 845 s.
+  - The stall is localised: with the fault gone, the load-time activation /
+    plateau probe runs `paged_forward` while the **seven `moe_cpu_expert` pool
+    threads** burn ~90% CPU each on the scalar native row decoder
+    (`movzbl → cvtsi2ss → mulss → movss`); no `ocloc`/`llvm-spirv` child and
+    `created_onednn_kernels=0`, so it is compute, not JIT and not a deadlock.
+    It terminates; the 0.6 t/s is the tier's price at 25% resident.
+  - Open: (1) a served window that skips the load probe (`--fit-ledger-dir`)
+    or a cold-start fix, for rate measurement without the 14-minute load;
+    (2) the rate win needs the HELD hot-set/LRU campaign; (3) the affine
+    per-expert path (0040, u4 artifact) is owed under 0047; (4) the A770 row
+    under 0047 is owed. The decode arithmetic stays pinned device-free (16
+    cells).

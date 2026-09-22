@@ -1103,6 +1103,59 @@ corpus S = 6 seed (one slot over the pool) was run first and REFUSED the load
 (integer division) while the fit ledger prices 6 (`ceil`); the served seed is
 the corpus top-5. The speed row stays EMPTY and G UNPINNED.
 
+### 0047-moe-per-expert-slot-pool-size.patch
+
+The per-expert dispatch path's slot pool must be resident-sized, not a
+1-expert placeholder (campaign `docs/campaigns/sub4bit-vram-kernel.md`,
+DESIGN §7.0.2cd). [code] Patch 0041, when `MOE_PER_EXPERT_DISPATCH` is on,
+gives
+every routed-expert Constant a 1-expert placeholder (`moe_offload_constant.cpp`:
+`upload_shape[0] = 1`, reinterpreted to the full constant layout) so that the
+data primitive exists and no mmap page is faulted. But the per-expert
+dispatch path uses that same buffer as its weight storage: the provider builds
+an LRU pool of `lru_expert_num` slots in it and `fill_weights_memory()` copies
+each resident expert to `dst_offset = slot × (tensor bytes / num_expert)`
+(`moe_otd_runtime.cpp`), while patches 0043/0045's per-expert OpenCL kernels
+index it by `slot_index` (`set_otd_weight_pointers` → `exec_batched_gemv`).
+The first slot with index ≥ 1 therefore ran past the 1-expert allocation.
+
+MEASURED (2026-09-22, 24 GB card / PCI 8086:e211): the served native `d48n`
+with `--moe-per-expert-dispatch` faulted before the HTTP server started —
+`arcint … segfault … error 6 in libc.so.6` (the memcpy vector) and, at the
+same instant, `xe 0000:0f:00.0 … Faulted Address 0x0000d556aa740000, Fault
+response: Unsuccessful -ENOENT` on the blit engine (`engine_class=bcs`, engine
+reset). A gdb attach localises the host crash to `paged_forward → load_paged`
+→ `libopenvino_intel_gpu_plugin.so` → `libigdrcl.so` →
+`__memcpy_avx_unaligned_erms`, i.e. the slot upload.
+
+**The engine/plugin slot-count off-by-one is disproven.** The fit ledger
+(`src/exec/fit.h expert_slot_bytes`) prices `ceil(512*(100-r)/100)` = 6 at
+ratio 99 while the plugin (`ops/moe.cpp`) integers to 5. The discriminating
+run is the ratio where both agree: ratio 75, both 128. The same segfault and
+the same fault address recurred there, so the divergence is not the mechanism;
+the fixed 1-expert placeholder is, and it is ratio-independent. The engine's
+ceiling only ever sizes the reservation/ledger, never a plugin buffer
+(`MOE_OTD_DEVICE_POOL_BYTES` is an env-set byte budget).
+
+Fix: allocate the resident slot pool exactly as the ordinary OTD path does
+(`upload_shape[0] = min(num_expert, resident_expert_num)`), while keeping the
+compile-time behaviour: `upload_bytes = 0` (deferred to runtime), `skip_evict`
+true (no mmap page faulting / VMA churn) and no device pool budget charged.
+A defensive `OPENVINO_ASSERT` states the (min()-guaranteed) pool ≤ full-layout
+invariant; it is not a runtime guard.
+
+MEASURED (2026-09-22, 24 GB card): the fault is gone, the plateau probe settles
+at `0.37 GiB` (`probe-static`), and the served path answers. On the native
+`d48n` at ratio 75 + tier, KV u8, chunk 128, one lane:
+`[OTD_PERF] … per_expert_dispatches=24676, per_expert_gpu_invocations=135874,
+gpu_hits=3623, gpu_misses=21053, gpu_hit_rate=14.6823%, cpu_tier_pairs=187903,
+created_onednn_kernels=0`; prefill 5 tokens 14.72 s, decode 16 tokens 28.21 s
+(0.6 t/s), answer ` Paris. Paris is the most populous city in France and one
+of the most visited`. The load takes 845 s — the residual stall is the CPU
+tier's scalar native decode during the load-time probe (seven
+`moe_cpu_expert` threads at ~90% CPU), not a JIT (no `ocloc`/`llvm-spirv`
+child) and not a deadlock; it terminates.
+
 ## Not carried either: the measurement instrument
 
 The arcint session's working tree also carries per-stage timing accumulators
