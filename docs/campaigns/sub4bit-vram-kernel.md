@@ -903,4 +903,162 @@ disk I/O in the counters). The owed cell is therefore closed as
 top-5 coverage (9.96 %) because a 256+64-token request does not sample the
 whole corpus — whether a longer served request at ratio 99 reaches the
 9.96 % coverage is the hot-set/LRU campaign's to measure; (3) the 5-slot
-pool's ledger/engine off-by-one (`docs/window-052.md`).
+pool's ledger/engine off-by-one (`docs/window-052.md`). [DATED IN PLACE
+2026-09-22 (V4 leg): item (3) is CLOSED as an intentional divergence, not an
+open defect — see the V4-quantification entry below.]
+
+- 2026-09-22 (V4 quantification leg) — **the card-vs-host arithmetic
+divergence on the native dispatch route is measured: the native per-expert
+kernels are NOT bit-identical to the host tier, and the affine per-expert
+kernels ARE.** [measured-here + code] This leg does not re-derive the V4
+finding; it quantifies it. Three results.
+
+  **(1) The text-level difference is a single early branch, not a tail
+drift.** The two A770 ratio-99 answers differ from token index 3 (0-based)
+of the 64-token greedy continuation: they share 17 characters
+(`           (*pos == `) and diverge at byte 18 (`'/'` vs `'>'`), after
+which **61 of 64 re-encoded token positions differ** (`tools`-free
+re-encode with the artifact's own `tokenizer.json`; incumbent 185 chars /
+64 tokens, census 210 chars / 60 re-encoded tokens, both 64 generated
+tokens). Command and raw output in the session's `v4-diff.txt`;
+`sha256` of the texts `55dff6f2…54550` and `2e7c508f…c10e`. This is the
+worst shape for admissibility: a one-token branch at position 3 that never
+re-converges.
+
+  **(2) The difference is CONFIG-deterministic, not run-to-run noise.**
+`measured-here`, A770 (GPU.1, PCI 8086:56a0), one fresh process per arm,
+native `d48n`, plugin `ov-0047` (`f021de51b5812ee2`), ratio 99, KV u8, one
+lane, the capture window-0's first 256 ids, greedy 64, temperature 0: the
+incumbent `splitmix64` seed produced `55dff6f2…` in its original run and its
+ledger-hit repeat; the census S5 seed produced `2e7c508f…` in its original
+run and in the repeat taken this leg (`logs/sub4bit-r99-cen-rep/`, sha256
+`2e7c508f…` again). Each seed reproduces its own digest; the two seeds keep
+differing. No arm failed to reproduce.
+
+  **(3) The numeric divergence, measured on a one-layer native MoE block
+(E = 64 experts, top-2, hidden 512, inter 256), one fresh process per arm.**
+[measured-here] Two arms differ only in `--moe-per-expert-dispatch`: the
+host-tier arm computes every routed expert through the CPU tier, the
+dispatch arm routes the resident experts through the GPU per-expert kernel.
+At the same ratio the graph, weights, router and shared expert are
+identical, so the difference is exactly the per-expert kernel's arithmetic.
+The affine control (u4 artifact) is the discriminator. Raw arms:
+
+      ARM mode=affine  E=64 ratio=50 dev=GPU.1 cap=32
+        max_abs=0.000000e+00 mean_abs=0.000000e+00 mean_abs/rms=0.000000e+00
+        frac_moved=0.0000 bit_identical=True repeat_bit_identical=True
+        [OTD_PERF] per_expert_gpu_invocations=40 ...
+      ARM mode=native  E=64 ratio=99 dev=GPU.1 cap=1
+        max_abs=8.270264e-03 mean_abs=1.753572e-04 mean_abs/rms=4.937727e-02
+        max_abs/rms=2.328750e+00 frac_moved=0.1250 bit_identical=False
+        repeat_bit_identical=True rms=3.551375e-03
+        [OTD_PERF] per_expert_gpu_invocations=4 ...
+
+      PROVENANCE NOTE (2026-09-23, coordinator): these arm lines were printed to
+      stdout by the leg and NOT saved by it, so the raw output was recovered
+      from the leg's own transcript and persisted on the operator-local evidence
+      path for this campaign (not in this PUBLIC repository); the recovered block
+      matches every figure quoted here, byte for byte. Recorded because a
+      measured claim whose raw output exists only in a transcript is one
+      session away from being unverifiable.
+      ARM mode=native  E=64 ratio=75 dev=GPU.1 cap=16
+        max_abs=1.093864e-02 mean_abs=6.558856e-04 mean_abs/rms=1.846850e-01
+        max_abs/rms=3.080115e+00 frac_moved=0.3748 bit_identical=False
+        repeat_bit_identical=True rms=3.551375e-03
+        [OTD_PERF] per_expert_gpu_invocations=20 ...
+      ARM mode=native  E=64 ratio=50 dev=GPU.1 cap=32
+        max_abs=1.093864e-02 mean_abs=1.058253e-03 mean_abs/rms=2.979840e-01
+        max_abs/rms=3.080115e+00 frac_moved=0.7495 bit_identical=False
+        repeat_bit_identical=True rms=3.551375e-03
+        [OTD_PERF] per_expert_gpu_invocations=32 ...
+      ARM mode=native  E=64 ratio=50 dev=GPU.0 cap=32
+        max_abs=1.093864e-02 mean_abs=1.058254e-03 mean_abs/rms=2.979843e-01
+        frac_moved=0.7495 bit_identical=False repeat_bit_identical=True
+        [OTD_PERF] per_expert_gpu_invocations=32 ...
+
+  Reading: the **affine per-expert route is bit-identical to the host tier**
+while dispatching (`per_expert_gpu_invocations=40`), so the dispatch
+mechanism, the slot indexing, the gather/reduce and the f16 output buffer
+are exonerated. The **native route is not**: 12.5 / 37.5 / 75.0 % of output
+elements move as the resident fraction grows (cap 1 / 16 / 32), max |diff|
+8.3e-3…1.1e-2 and mean |diff| 1.8e-4…1.1e-3 against a reference rms of
+3.55e-3 — a spread far beyond f16 ulp noise, deterministic across two
+compiles in-process (`repeat_bit_identical=True`), and **the same numbers on
+the 24 GB card as on the 16 GiB card** (card-independent, so it is the
+kernel, not the card).
+
+  **Named suspect, and what is exonerated.** [code + measured-here] The two
+per-expert kernel families differ in exactly one arithmetic place: the affine
+`expert_gate_up` writes `up(x)` into the f16 output first and then multiplies
+by `MOE_GATE_ACT(gate)` in place (a two-stage f16 rounding), matching the host
+tier's `h = f16(f16(up) * act(gate))` (`moe_cpu_expert.cpp` patch 0043); the
+native `expert_gate_up_native` casts the product once,
+`yrow[n] = (MOE_DTYPE)(su * MOE_GATE_ACT(sg))`, with `su` kept f32 (a
+one-stage rounding), and accumulates in f32 per element rather than the
+affine path's half FMA chains. The suspect is that coupling — the native
+gate_up's stage structure and its subgroup f32 reduction — against the host
+tier's staged f16 arithmetic. **Exonerated by measurement**: (a) the IQ4_NL
+decode and indexing, by a delta-input down GEMV on the standalone kernel
+(`mid = e_7`, so each output row isolates one decoded weight): max |diff|
+0.095 on values of rms 68.9 (~1.4e-3 relative, the f16 output ulp), i.e. the
+block decode is exact; (b) the IQ3_XXS decode, by a serial device-side dump
+of rows 0–2 against `native_expert`'s decode: `max=0.0`; (c) the slot
+addressing and the fill, by the affine route's bit-identity at the same
+slot stride. Not exonerated, and **not asserted**: the standalone subgroup
+GEMV harness did not reproduce the plugin's exact dispatch geometry, so the
+arithmetic attribution above is a suspect whose magnitude is bounded by (3),
+not a confirmed single-line cause. What would confirm it: a standalone
+per-expert GEMV harness built with the plugin's own `{1, SUBGROUP_SIZE,
+SUBGROUP_NUM}` geometry and `N_BLOCK`, compared against references for both
+rounding rules (two-stage vs one-stage), or a diagnostic plugin variant that
+rounds `up` to f16 before the gate multiply — a measurement, not the retired
+F1 bit-equalisation work.
+
+  **What it means for the policy (stated, not decided).** [measured-here]
+The divergence is not confined to the resident experts' own rows: at the
+ratio-99 VENICE budget only **3.77 %** of served expert pairs are resident
+(5 slots/layer), yet that fraction is enough to branch the greedy answer at
+token 3 of 64. So the native route's residency moves arithmetic, and a
+tiny resident fraction already changes the served text. The evidence favours
+limiting the native dispatch route to configurations where residency cannot
+move arithmetic — which, for this route, is no residency at all — unless the
+native kernel is made bit-equal to the host tier; the affine per-expert
+route (bit-identical, measured) is the one route on the record that
+satisfies §3.4 while dispatching. The choice between making the native
+kernel bit-equal, admitting the route only where arithmetic cannot move, or
+falling back to the affine route is the operator's; this leg decides none of
+them and does not start F1 work.
+
+  **Process.** One A770 window for the numeric arms (plugin `ov-0047`,
+staged runtime), one A770 served window for the census repeat; cards left
+clean, no `arcint` process, units inactive as found. Raw arms:
+`logs/v4-final/arms.txt`; the repeat: `logs/sub4bit-r99-cen-rep/`.
+
+- 2026-09-22 (slot off-by-one, CLOSED as intentional) — **the plugin's
+integer division is the SERVED TRUTH; the engine's `ceil` is a fit-side
+ledger ceiling only.** [measured-here + code] Operator decision. The plugin
+sizes the resident slot pool as `const_shape[0] * (100 - ratio) / 100`
+integer division (`moe_offload_constant.cpp`, `prepare_moe_otd_params`,
+both the ordinary OTD path and patch 0047's per-expert branch): at ratio 99
+with 512 experts that is **5** slots/layer. The engine's own ledger
+(`src/exec/fit.h`, `expert_slot_bytes_static`) prices `ceil(512*1/100) = 6`;
+that six was only ever a reservation/ledger figure, **never a plugin buffer
+size** — the ratio-75 discriminating run already showed the divergence is
+not the mechanism (both formulae give 128 there and the pre-0047 fault
+reproduced unchanged), and patch 0047's real fix (a resident-sized pool)
+removed it. Every served reading in this campaign and in
+`expert-hot-set-lru` is against the **5-slot** pool, and the served census
+seed is the corpus top-5 accordingly. The item is **CLOSED as an
+intentional divergence**, not an open defect: no plugin change to `ceil`, no
+ledger change to integer division, no code movement. Future sessions must
+not "fix" it.
+
+- 2026-09-22 (V4 leg, review) — **carry-forward, recorded not patched.**
+The V4 numeric harness is operator-local (it needs the staged `ov-0047`
+runtime and the dev host's card), so it is not committed as a `tools/`
+script; the reproducible command, the raw arm output and both served digests
+are on the persistent paths named above. The one-layer MoE block's
+`rms = 3.55e-3` makes `mean_abs/rms` a cancellation-sensitive ratio; the
+absolute `max_abs`/`mean_abs` are the stable reading. No acceptance row
+moves on this leg: `window-052.md`'s speed row is untouched, V1 stands, and
+the ratio-75 point stays a sweep point, not a gate.

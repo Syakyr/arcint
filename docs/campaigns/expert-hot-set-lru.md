@@ -794,3 +794,34 @@ and the campaign stops. Every disposition carries an evidence class
   cells; 134 tests green across the four ladders). This makes the measured V1
   lever actionable — whether to serve the prefill- or mixture-calibrated seed is
   still the operator's decision, and it is now a one-line flag, not a new tool.
+
+- 2026-09-22 (V4 quantification leg, cross-reference) — **the dispatch route's
+  quality row is scoped out of the PASS, and its divergence is now quantified.**
+  [measured-here] This campaign's quality row (PASS, no V4) was measured
+  WITHOUT `--moe-per-expert-dispatch`: every routed expert ran on the host
+  tier, so residency moved bytes, not arithmetic, and the census seed was
+  invisible. Under `--moe-per-expert-dispatch` the served greedy answer
+  DEPENDS on the resident seed, so **V4 fires on that route** and its quality
+  is OPEN, not PASS. The V4 leg quantified it: the two ratio-99 answers branch
+  at greedy token index 3 of 64 (61 of 64 token positions then differ), each
+  seed reproduces its own digest (incumbent `55dff6f2…`, census `2e7c508f…`,
+  both repeated), and a one-layer native MoE block measures the card-vs-host
+  arithmetic directly — **affine per-expert dispatch is bit-identical to the
+  host tier; native per-expert dispatch is not** (12.5 / 37.5 / 75.0 % of
+  output elements move as the resident fraction grows; max |diff| up to
+  1.1e-2; deterministic and card-independent). DESIGN §7.0.2cf,
+  `sub4bit-vram-kernel` status 2026-09-22 (V4 leg). **No acceptance row moves
+  here**: the speed row stays EMPTY, G stays pinned at 1.10, V1 stands, and the
+  ratio-75 point (0.842 t/s, 1.81×) stays a sweep point, not a gate. The scope
+  of that sweep point is undecided pending the V4 answer.
+
+- 2026-09-22 (slot off-by-one, CLOSED as intentional) — **the plugin's 5-slot
+  pool at ratio 99 is the SERVED TRUTH.** [measured-here + code, operator
+  decision] The plugin's integer division (`512*(100-ratio)/100` = 5) sizes
+  every served reading in this campaign, including the S = 5 census seed; the
+  engine's `fit.h` `ceil` (= 6) is a **fit-side ledger ceiling only**, never a
+  plugin buffer size (the ratio-75 run showed the two agree there and the
+  pre-0047 fault still reproduced, then patch 0047's resident-sized pool fixed
+  it). CLOSED as an intentional divergence: no plugin change to `ceil`, no
+  ledger change to integer division, no code movement, and no future session
+  should re-open it.

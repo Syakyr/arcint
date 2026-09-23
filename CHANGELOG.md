@@ -139,6 +139,26 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
   affine per-expert path (u4 `d48g`) serves under 0047 with a non-zero
   counter (rate not comparable: cold disk). Ratio 50 is refused on the
   16 GiB card and did not return on the 24 GB card.
+- **The V4 divergence, quantified (2026-09-22).** The dispatch route's
+  card-vs-host arithmetic is measured on a one-layer native MoE block
+  (E = 64, top-2): the **affine** per-expert kernels are bit-identical to the
+  host tier (0 elements moved, `per_expert_gpu_invocations=40`), the
+  **native** ones are not (12.5 / 37.5 / 75.0 % of output elements move as
+  the resident fraction grows to 1 / 16 / 32 slots; max |diff| 8.3e-3…1.1e-2,
+  mean |diff| 1.8e-4…1.1e-3 against a reference rms of 3.55e-3), deterministic
+  across compiles and identical on both cards. The served text consequence:
+  the two ratio-99 answers branch at greedy token index 3 of 64 (61 of 64
+  token positions then differ), and each resident seed reproduces its own
+  digest. The block decode and slot indexing are exonerated (IQ4_NL delta
+  GEMV and IQ3_XXS serial dump match `native_expert` exactly; the affine
+  route is bit-identical); the named suspect is the native gate_up's
+  one-stage f16 cast of `up·act(gate)` and its f32 subgroup reduction against
+  the host tier's staged f16 rounding — bounded, not yet confirmed. DESIGN
+  §7.0.2cf. No acceptance row moves: V1 stands, the ratio-75 point stays a
+  sweep point, and the native dispatch route's quality is OPEN. The
+  plugin/engine 5-vs-6 slot divergence is **CLOSED as intentional**: the
+  plugin's integer division (5 slots/layer at ratio 99) is the served truth
+  and the engine's `ceil` (6) is a fit-side ledger ceiling only.
 
 ### The serving-shape MoE block fuses (campaign: sub4bit-vram-kernel)
 

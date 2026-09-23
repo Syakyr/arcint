@@ -9680,6 +9680,89 @@ The host control runs the fused/tier path, whose `cpu_tier_pairs` counts
 differently (159,264) and has no card pairs; it is the rate baseline, not a
 share point.
 
+#### 7.0.2cf The native per-expert route's card-vs-host divergence, quantified: the affine kernels are bit-identical, the native kernels are not (2026-09-22)
+
+Campaign: `docs/campaigns/sub4bit-vram-kernel.md` (V4 quantification leg);
+plugin `ov-0047` (`f021de51b5812ee2`); acceptance `docs/window-052.md`.
+
+**The finding it quantifies.** [measured-here] §7.0.2ce recorded that VENICE
+clause V4 fires on the `--moe-per-expert-dispatch` route: the A770 ratio-99
+greedy answer depends on the resident seed (`splitmix64` `55dff6f2…` vs
+census `2e7c508f…`), because a resident expert is computed by the GPU
+per-expert kernel and a miss by the host tier and the two are not
+bit-identical. This section gives the divergence's size and localises it.
+
+**Text impact.** [measured-here] The two answers are 64-token greedy
+continuations that share **17 characters** and diverge at byte 18 (token
+index **3** of 64); after that **61 of 64 re-encoded token positions
+differ**. A one-token branch at position 3 that never re-converges — the
+worst shape for admissibility, not a tail drift.
+
+**Reproducibility.** [measured-here] One fresh process per arm, A770
+(`GPU.1`, PCI 8086:56a0), native `d48n`, plugin `ov-0047`, ratio 99, KV u8,
+one lane, the capture window-0's first 256 ids, greedy 64, temperature 0:
+the incumbent seed reproduced `55dff6f2…` in its original and ledger-hit
+repeat runs; the census S5 seed reproduced `2e7c508f…` in its original and
+in a repeat taken this leg. Each seed is stable, the two seeds differ, no
+arm failed to reproduce.
+
+**Numeric divergence, the smallest reproducible unit that still exercises
+the plugin path.** [measured-here] A one-layer native MoE block (E = 64
+experts, top-2, hidden 512, inter 256) with dispatch OFF (all routed experts
+on the host tier) against the same graph with dispatch ON (resident experts
+through the GPU per-expert kernel). The graph, weights, router and shared
+expert are identical across the two arms, so the difference is the
+per-expert kernel's arithmetic alone.
+
+| arm | ratio | resident slots | GPU invocations | frac moved | max abs | mean abs | mean abs / rms | bit-identical |
+|---|---|---|---|---|---|---|---|---|
+| affine | 50 | 32 | 40 | 0.0000 | 0 | 0 | 0 | **True** |
+| native | 99 | 1 | 4 | 0.1250 | 8.27e-3 | 1.75e-4 | 4.94e-2 | False |
+| native | 75 | 16 | 20 | 0.3748 | 1.09e-2 | 6.56e-4 | 0.1847 | False |
+| native | 50 | 32 | 32 | 0.7495 | 1.09e-2 | 1.06e-3 | 0.2980 | False |
+| native (24 GB card) | 50 | 32 | 32 | 0.7495 | 1.09e-2 | 1.06e-3 | 0.2980 | False |
+
+(reference rms 3.55e-3; `repeat_bit_identical=True` for every arm; the
+affine arm proves dispatches happened and are harmless). The **affine
+per-expert route is bit-identical to the host tier**, which exonerates the
+dispatch mechanism, the slot indexing, the gather/reduce and the f16 output
+buffer. The native route is not, monotonically in the resident fraction
+(12.5 → 75 % of elements moved), deterministic, and card-independent.
+
+**Named suspect, not asserted.** [code + measured-here] The affine and
+native gate_up kernels differ in one arithmetic place: affine writes `up(x)`
+to the f16 output first and multiplies in place (two-stage f16 rounding,
+matching the host tier), native casts `up·act(gate)` once with `up` kept
+f32 (one-stage) and accumulates f32 per element rather than the affine
+path's half FMA chains. Exonerated by measurement: the IQ4_NL decode and
+indexing (a standalone delta-input down GEMV matches `native_expert` to
+1.4e-3 relative, the output f16 ulp) and the IQ3_XXS decode (a serial
+device-side row dump matches exactly). The subgroup GEMV harness did not
+reproduce the plugin's exact dispatch geometry, so the arithmetic
+attribution is a suspect whose magnitude is bounded by the table above, not
+a confirmed single-line cause. What would confirm it: a standalone GEMV
+harness built with the plugin's own `{1, SUBGROUP_SIZE, SUBGROUP_NUM}`
+geometry and `N_BLOCK`, compared against both rounding rules.
+
+**What it means for the policy (stated, not decided).** [measured-here] At
+the ratio-99 VENICE budget only **3.77 %** of served expert pairs are
+resident, and that fraction already branches the greedy answer at token 3 of
+64; residency moves arithmetic and even a tiny resident fraction changes the
+served text. The evidence favours confining the native dispatch route to
+configurations where residency cannot move arithmetic (for this route, no
+resident expert) unless the native kernel is made bit-equal to the host
+tier; the affine route is the one dispatching route on the record that is
+bit-identical and therefore §3.4-safe. The choice is the operator's; no F1
+work is started.
+
+**Slot-pool off-by-one, CLOSED as intentional.** [measured-here + code] The
+plugin's integer division (`const_shape[0]*(100-ratio)/100` = 5 at ratio 99)
+is the **served truth** every served reading is taken against; the engine's
+`fit.h` `ceil` (= 6) is a **fit-side ledger ceiling only**, never a plugin
+buffer size — the ratio-75 run (both give 128, fault unchanged) and patch
+0047's resident-sized pool settled it. No code moves; the item is closed so
+no future session "fixes" it.
+
 #### 7.0.3 KV precision on the paged path — u8 is the lever, u4 is a tax
 
 The plugin accepts f16/u8/i8/u4/i4 for `KV_CACHE_PRECISION` on the paged path,
