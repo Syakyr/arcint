@@ -5,7 +5,8 @@ Campaign: `docs/campaigns/nvme-direct-expert-tier.md` (0.5.3 LISBON).
 Companion recon: the campaign's 2026-09-23 recon and convergence entries.
 External source: `~/src/arcwell` (`dev`, tree hash `e7d326e`).
 Device-free: no card leg, no module load, no expert-store mutation. The B60
-probe is named at §7, not run.
+probe is named at §7, not run. [UPDATED 2026-09-23, later: the B60 probe of §7
+**was** run — the plateau and async-budget clauses are measured; see §7 and §9.]
 
 **Evidence classes.** Every disposition carries `paper`, `code` or
 `measured-here`. All arcwell performance numbers are **arcwell's own** on
@@ -161,7 +162,13 @@ zero points**: the device wants scales `[group][oc]`, the file carries
 (`code`: `patches/0011-…:75-90`, `patches/0006-…:291`). The weights
 (gate/up/down) are `[oc][ic]` in both, so a naive DMA of the whole 2,457,600 B
 slice lands the weights correctly and the scales transposed. The resolution is a
-**store-layout decision**: the ext4 store is arcint's own artifact, so either
+**store-layout decision**, and it is **not yet made**: [DATED IN PLACE
+2026-09-23 (B60 probe): the store the campaign measured is **not** a laid-out
+arcint expert artifact — it is synthetic arcwell test data (one deterministic
+4096-byte block repeated 600× per file), carrying no expert tensors and no
+scales/zp, so neither order can be exercised against it. The decision
+therefore remains open and is to be built with the artifact-format step.]
+When arcint lays its own expert artifact out, either
 lay each expert file out in device order (and adapt the host tier's scale
 indexing — patch 0011's CPU kernel reads `s` in FILE order, `[oc][group]`), or
 keep arcwell to the weight tensors and move the small scale/zp tensors through
@@ -283,7 +290,12 @@ reached by accident. That cell is not written in this leg.
    to a steady state while an out-of-regime seed drifts monotonically
    (`census-prefill` scored on decode: 58.76 → 39.27 → 35.22 at 128). Every
    figure is a `(seed × regime)` property.
-2. **Criterion 4's literal hardware clauses are still OWED.** The convergence
+2. **Criterion 4's literal hardware clauses were OWED at this note's date.**
+   [UPDATED 2026-09-23, later: the `MOE_OTD_PERF_LOG` plateau probe's
+   device-byte plateau at the high-80s ratios and the async-batch upload budget
+   are now **MEASURED on the B60** — see §7 and §9. The *consumer* integration
+   and the campaign gate stay OWED; nothing in those measurements discharges
+   them.] Original text kept as written: The convergence
    clause is answered device-free; the `MOE_OTD_PERF_LOG` plateau probe's actual
    device-byte plateau and per-forward timing at the high-80s ratios, and the
    async-batch upload budget, need a card leg. So do criterion 4's *consumer*
@@ -333,7 +345,7 @@ Read from `~/src/FreeToken-ref` (`code`). The note must not blur the two.
 
 ---
 
-## §7 — the B60 probe spec (the next leg, unambiguous)
+## §7 — the B60 probe spec (the next leg, unambiguous; RUN 2026-09-23 — items 1–3 measured, item 4 owed)
 
 Operator decision 2026-09-23: the B60 is free for this campaign's gate, B60 legs
 are allowed **with the determinism caveat recorded** (byte-identity claims only
@@ -425,3 +437,20 @@ confirmation.
   No card leg, no module load, no expert-store mutation. Next: review, then
   commit, then the B60 probe of §7. The campaign gate, its byte-identity rows
   and the DESIGN §7.0.2 record remain owed.
+- 2026-09-23, later — **B60 probe (§7 items 1–3) run; recorded** in
+  `docs/campaigns/nvme-direct-expert-tier.md`. Results: the device-byte plateau
+  is **0.37 GiB at ratios 86 (71 slots) and 83 (87 slots)** with
+  **`evictions = 0`** (under the static partition the pool is host-mapped —
+  `device_slot_buffers = 0`, host-side ceiling 7.91 / 9.67 GiB — so the device
+  term is the small working set, the two-ledger shape). The pinned-fill async
+  budget is 2.71 GB/s (71 experts: submit 20.9 ms of a 64.5 ms batch) and
+  2.94 GB/s (87 experts: 28.3 / 72.8 ms) at DEPTH=4; `AW_IOC_STATS` delta
+  `via_host_bounce = 0`, `max_inflight` 213/261, `batches`/`batch_reads`/
+  `segments` nonzero. The full-slice fill's byte-transparency is **OWED** — the
+  ext4 store is synthetic arcwell test data (a repeated 4096-byte block), not a
+  laid-out expert artifact, so the scales/zp transpose (`code`:
+  `patches/0011`, `0006`) cannot be resolved from it. §7 item 4 (the gate),
+  the serving step with the fill overlapping, and the D2/D3 integration remain
+  owed. B60 determinism caveat recorded: timing is
+  admissible, no byte-identity claim made; the cold-TTFT delta stays a
+  projection over arcwell's own 2.91 GB/s, labelled arcwell's.

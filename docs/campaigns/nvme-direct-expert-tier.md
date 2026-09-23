@@ -79,7 +79,7 @@ its evidence class:
 | 1 | ext4-backed expert store | **met** | `measured-here` | 1700 files, 2,457,600 B each, one per expert, `fallocate`d on a single ext4 partition. **Every file resolves to exactly ONE extent** (`filefrag` over all 1700: `1700 1`; flags `last,eof`), and the file→absolute-LBA translation byte-verifies against the raw device for all 1700 (`aw_fiemap` GREEN), with the red leg (`--mutate`) failing on content. One extent means one *request*, not one DMA segment — see the recon note below. |
 | 2 | a card (B60) | **met by operator decision** | operator decision, 2026-09-23 | The B60 is free for this campaign's later gate. Not a measurement: a seat decision. The A770 stays backlogged (arcwell README; `KERNEL_FACTS.md` — its PCIe path goes unresponsive under load). |
 | 3 | module installed and loadable | **met** | `measured-here` | DKMS module installed and built for the running kernel; `modprobe arcwell` returns 0, `lsmod` shows it, `/dev/arcwell` appears, `dmesg` carries only the two load info lines (no `pr_err`/`pr_warn`), and `AW_IOC_STATS` reads (`via_host_bounce=0`). Host restored to as-found (unloaded; no carve created — `modprobe` alone does not carve). |
-| 4 | a consumer | **partially met** (2026-09-23, device-free) | `measured-here` + `code` | [DATED IN PLACE 2026-09-23: NOT discharged in full. The convergence CLAUSE of RED-C-02 is answered device-free from the served window-004 routing stream — see the "Convergence measurement" status entry below: the served static-partition policy's resident set is a pure function of configuration, fixed at `bind()`, so its composition converges at position 0 with zero evictions/thrash; the one mechanism that does NOT converge is a ROLLING census (`rounds_to_plateau=None` at every budget), which the design therefore excludes (pin once from an offline census). The literal RED-C-02 HARDWARE clauses — the `MOE_OTD_PERF_LOG` plateau probe's device-byte plateau and per-forward timing at the high-80s ratios, and the async-batch upload completing inside one inference step's budget — are **OWED** (no card leg was run), and the "a consumer" integration artifact (the design note / prefetch wiring) does not exist yet; that is the next step. Original text kept as written: "The residency policy arcwell would feed is not proven to converge at Flash-Next's admission ratio: RED-C-02 is open and unmeasured (`docs/design-qwen-flash-next.md`:207, :211, :215, :496). **Do not build this tier against it.**"] |
+| 4 | a consumer | **partially met** (2026-09-23 device-free; RED-C-02's hardware clauses MEASURED on the B60 same day) | `measured-here` + `code` | [DATED IN PLACE 2026-09-23: NOT discharged in full. The convergence CLAUSE of RED-C-02 is answered device-free from the served window-004 routing stream — see the "Convergence measurement" status entry below: the served static-partition policy's resident set is a pure function of configuration, fixed at `bind()`, so its composition converges at position 0 with zero evictions/thrash; the one mechanism that does NOT converge is a ROLLING census (`rounds_to_plateau=None` at every budget), which the design therefore excludes (pin once from an offline census). The literal RED-C-02 HARDWARE clauses — the `MOE_OTD_PERF_LOG` plateau probe's device-byte plateau and per-forward timing at the high-80s ratios, and the async-batch upload completing inside one inference step's budget — are **OWED** (no card leg was run), and the "a consumer" integration artifact (the design note / prefetch wiring) does not exist yet; that is the next step. [DATED IN PLACE 2026-09-23 (B60 probe): the two literal RED-C-02 HARDWARE clauses are now MEASURED — the plateau is 0.37 GiB at ratios 86/83 with evictions 0, and the pinned-fill async budget is measured (the "B60 probe" section below). What stays OWED is the GATE (cold TTFT both arms in one window, byte-identity across arms and two cold boots, decode non-regression), the serving step with the fill overlapping, the full-slice fill's byte-transparency (the store-layout precondition), and the design-note D2/D3 integration.] Original text kept as written: "The residency policy arcwell would feed is not proven to converge at Flash-Next's admission ratio: RED-C-02 is open and unmeasured (`docs/design-qwen-flash-next.md`:207, :211, :215, :496). **Do not build this tier against it.**"] |
 
 Criterion 1's only caveat is the layout claim's second half (one *request* vs
 one *segment*), corrected by arcwell's own item 24 and reflected below.
@@ -593,3 +593,204 @@ device-byte plateau/per-forward timing at the high-80s ratios and the
 async-upload budget inside one step, with `AW_IOC_STATS` as a delta
 (`via_host_bounce = 0`, `max_inflight > 1`). No card leg was run here; the B60
 was left idle and the expert store and module untouched.
+
+---
+
+## B60 probe — RED-C-02's hardware clauses measured; the full-slice fill stays OWED on the store layout (2026-09-23)
+
+[`measured-here` on the B60; `code` for the layout fact] This leg ran the design
+note's §7 probe. One card leg at a time; the B60 (GPU.0, PCI `8086:e211`) was
+the only card touched, the A770 was idle and untouched. Protocol reproduced
+from the `sub4bit-vram-kernel` precedent (one fresh process per arm, the sampler
+started before the leg, plugin `ov-0047`, graceful stop so `[OTD_PERF]` dumps).
+Raw logs are on the operator-local persistent card-host path (handoff packet);
+the commands below use placeholders for it.
+
+### 1. The device-byte plateau and per-forward timing (design note §7.1)
+
+**Arm protocol** (`measured-here`): fresh process; plugin `ov-0047`
+(`f021de51b5812ee2…`, patches 0003–0047); served binary tree `wt-b6dbca5`
+(`f6abb402…`); artifact `qwen38-flash-next-d48n-ov` (`641fcb18…`, bin
+77,492,280,673 B); B60 `GPU.0` = PCI `8086:e211`; `--moe-cpu-tier` (the static
+partition is the plugin default: `MOE_CPU_TIER_STATIC_PARTITION=1`,
+`seed_source=splitmix64`, `slots` = the plugin's integer division); KV u8;
+chunk 512; n_ctx 8192; one lane; `MOE_OTD_PERF_LOG=1`; the same greedy 64-token
+France prompt (temperature 0, `ignore_eos`) in both arms. No
+`--moe-per-expert-dispatch`: the probe is the ordinary OTD slot pool.
+
+Ratio 86 — plugin integer division `512*(100-86)/100 = 71` slots/layer:
+
+```
+lgc  load: language model ready in 34.7 s (paged); device-resident 8.06 GiB
+lgc  load: expert slots: plateau probe settled at 0.37 GiB after distinct-token chunks (source: probe-static)
+lgc  load: expert slots host-side: 7.91 GiB (GTT, source: config)
+lgc  load: expert slot pool: pinned-pool ceiling 7.91 GiB (source: config) against 0.37 GiB measured resident (source: probe-static) -- the difference is what the driver keeps host-mapped
+lgc  slot 0: prefill     5 tok in 11.11 s (  0.5 t/s) | graph 11.10 s, ...
+lgc  slot 0: decode     64 tok in 115.21 s (  0.6 t/s) | graph 115.18 s, ...
+[OTD_PERF] ... slots=71 static_partition=1 seed_source=splitmix64 ...
+[OTD_PERF] gpu_hits=5616, gpu_misses=47310, gpu_hit_rate=10.611%, ... evictions=0, acquisitions=52926, device_slot_buffers=0, host_slot_buffers=382, alloc_fallbacks=0, staging_bytes=352256000
+```
+`props ready` after 1925 s (admission wall).
+
+Ratio 83 — `512*(100-83)/100 = 87` slots/layer (the fit-ledger `ceil` = 88):
+
+```
+lgc  load: language model ready in 26.6 s (paged); device-resident 8.06 GiB
+lgc  load: expert slots: plateau probe settled at 0.37 GiB after distinct-token chunks (source: probe-static)
+lgc  load: expert slots host-side: 9.67 GiB (GTT, source: config)
+lgc  load: expert slot pool: pinned-pool ceiling 9.67 GiB (source: config) against 0.37 GiB measured resident (source: probe-static) ...
+lgc  slot 0: prefill     5 tok in 10.43 s (  0.5 t/s)
+lgc  slot 0: decode     64 tok in 120.01 s (  0.5 t/s)
+[OTD_PERF] ... slots=87 static_partition=1 seed_source=splitmix64 ...
+[OTD_PERF] gpu_hits=6894, gpu_misses=46037, gpu_hit_rate=13.0245%, ... evictions=0, acquisitions=52931, device_slot_buffers=0, host_slot_buffers=382, alloc_fallbacks=0, staging_bytes=352256000
+```
+`props ready` after 1750 s.
+
+**Verdict.** `measured-here`. The plateau is **0.37 GiB at both ratios** and
+**`evictions = 0`** — no capacity thrash. This is RED-C-02's hardware clause
+measured: the offload-ratio machinery does not break at Flash-Next's admission
+ratio. Two limits are stated, not hidden: (a) the probe terminates on its own
+two-non-increasing-reads condition and reports the high-water figure; this
+build emits no per-forward device-byte series, so "does not oscillate" is the
+plugin's own convergence assertion, not an independently printed series;
+(b) the plateau **is not the pinned pool**. Under the static partition
+`device_slot_buffers = 0`: the pool is host-mapped and the device term is a
+0.37 GiB working set against a 7.91 / 9.67 GiB host-side ceiling — the
+two-ledger shape the design note carries. The per-forward served time is
+1.80 s/token (ratio 86; 115.21/64) and 1.88 s/token (ratio 83; 120.01/64 =
+1.875 rounded); the plugin times no individual probe forward.
+
+### 2. The async pinned-fill budget (design note §7.2)
+
+**Protocol** (`measured-here`; chosen deliberately **without arcint** — the
+serving integration the note schedules does not exist yet, so the budget is
+measured standalone by arcwell's own harness shape — a documented **narrowing**
+of §7.2, which asks submit/collect "while the serving stream runs"; that
+integration is OWED, so what is measured here is the pinned-fill batch budget
+itself. Client
+`aw_fill_budget`, derived from arcwell's `stub/test/aw_async_test.c` (same
+contract checks, plus `--n`/`--depth` and a full `AW_IOC_STATS` delta); run on
+the card host against the ext4 store **read-only**; DEPTH=4 batches in flight,
+the design note's one-batch-per-layer schedule; B60 `renderD129`.
+
+n = 71 (ratio 86, one batch per layer):
+
+```
+MAP_BUFFER ok handle=1 out_flags=0x1
+ONE BATCH n=71: submit=20919 us complete=64463 us polls=25764 eagain=1
+  collected bytes=174489600 completed=71 segments=213 err=0
+  submit is 32.5% of the batch wall time
+  rate one batch: 2.71 GB/s
+DEPTH=4 submitted in 188108 us (47027 us each); batches_inflight=4
+  all 4 collected, 697958400 bytes total
+```
+
+n = 87 (ratio 83):
+
+```
+MAP_BUFFER ok handle=2 out_flags=0x1
+ONE BATCH n=87: submit=28260 us complete=72802 us polls=25409 eagain=1
+  collected bytes=213811200 completed=87 segments=261 err=0
+  submit is 38.8% of the batch wall time
+  rate one batch: 2.94 GB/s
+DEPTH=4 submitted in 242459 us (60615 us each); batches_inflight=4
+  all 4 collected, 855244800 bytes total
+```
+
+**Reading** (`measured-here`, against arcwell's own comparand — **arcwell's
+numbers, not ours**: submit ~9.7 ms/64-expert idle, ~42 ms at 4 outstanding;
+2.91 GB/s at `max_inflight=193`). Submit returns in 32.5 % / 38.8 % of the
+batch wall, so the split is real and the fetch is hidden behind the transfer;
+one-batch rate 2.71 GB/s is inside arcwell's measured 2.18–2.91 GB/s band, and
+2.94 GB/s is marginally above arcwell's 2.91 GB/s ceiling (the larger batch, 87
+experts); segments are ≈3/expert (213/71, 261/87), the bio floor. Submit cost scales with bytes
+queued: 47 / 61 ms each at depth 4 for 71 / 87 experts, above arcwell's 42 ms
+comparand — consistent with arcwell's "smaller, more frequent batches". The
+serving step's own wall time with the fill *overlapping* is **OWED**: it needs
+the integration (design note D2), which does not exist.
+
+### 3. `AW_IOC_STATS` as a delta (design note §7.3)
+
+Module loaded fresh (`modprobe`; carve-on-demand, no `carve_all`); the baseline
+read all-zero. The client reads the delta across its own work (module-global
+counter, never absolute):
+
+```
+n=71 run:  via_host_bounce 0 -> 0   max_inflight 0 -> 213   batches 0 -> 5
+           batch_reads 0 -> 355   segments 0 -> 1065   bytes +872448000
+n=87 run:  via_host_bounce 0 -> 0   max_inflight 213 -> 261  batches 5 -> 10
+           batch_reads 355 -> 790   segments 1065 -> 2370   bytes +1069056000
+```
+`peer2peer=1`, `out_flags=0x1` (`AW_MAP_F_REQUIRE_P2P`); dmesg
+`MAP_BUFFER … peer2peer=1`. Requirement met: `via_host_bounce` delta 0,
+`max_inflight > 1`, `batches`/`batch_reads` nonzero, `segments` reported.
+
+### 4. The store-layout precondition — **OWED** (design note §3/§7)
+
+`code`: the plugin's device slot layout and the weight-file layout differ for
+scales/zp — device `[group][oc]`, file `[oc][group]`; `maybe_transpose_scale_zp`
+transposes on upload (`patches/0011-…:75-90`, `0006-…:291`). The weights are
+`[oc][ic]` in both, so a byte-transparent full-slice DMA would land the weights
+correctly and the scales transposed.
+
+`measured-here`: the store as-built cannot resolve this. The ext4 expert store
+is **arcwell test data**, not an arcint expert artifact: it was populated by a
+synthetic builder that writes, per file, one deterministic 4096-byte block
+repeated 600 times (`expert_0000.bin`: 600/600 blocks identical, 1 distinct
+block; distinct files differ by seed). It carries no expert tensors and no
+scales/zp, so neither a device-order store nor the transpose decision can be
+exercised or verified against it.
+
+**Disposition: the full-slice fill's byte-transparency is OWED**, with that
+specific reason. Resolving it is a store-layout decision (lay files in device
+order, or move the small scale/zp tensors through the existing host path) and
+belongs to the artifact-format step, not this probe. No correct fill is claimed.
+
+### 5. Determinism caveat (operator decision 2026-09-23)
+
+The B60 is a timing/statistics card here. Every number above is admissible as a
+measurement on the B60; **no byte-identity claim is made** in this leg. The two
+arms' greedy answers happened to be literally identical (both
+`Paris. The capital of Germany is Berlin. …`), which is an observation, not a
+§3.4 discharge: the gate's byte-identity rows need the two cold boots and, where
+the B60 is not known bit-readable, an A770 confirmation
+(`served-prefill-determinism`).
+
+### 6. Card, lock, module state
+
+- Before: the two served units were inactive+disabled as found (not touched);
+  `pgrep -x arcint` empty; no `/dev/dri` holders; `arcwell` not loaded,
+  `/dev/arcwell` absent, no carve this boot; B60 `power/control=on`, runtime
+  active.
+- One card leg at a time; the B60 alone. The A770 was idle throughout.
+- Wake lock on the coordinator host: found none set; taken for 6 h with the
+  reason recorded (operator-local), released when card work was done — no
+  foreign lock overwritten.
+- Sampler per SOP on the **physical host** (driver/USM-host memory is charged
+  there; the container's `MemAvailable` is cgroup-limited), watchdog
+  `MemAvailable < 4 GiB`: minimum observed 20,473,296 kB = 19.5 GiB (ratio 86) /
+  18,287,308 kB = 17.4 GiB (ratio 83) / 60,631,024 kB = 57.8 GiB (arcwell arms);
+  **0 watchdog trips**.
+- The expert store was read-only; file mtimes unchanged. No relayout, no write.
+- After: no `arcint`; the `arcwell` module was **left loaded** (carved,
+  `peer2peer=1`). Unloading a carved GPU is the documented half-state hazard in
+  the arcwell tree's own `~/src/arcwell/KERNEL_FACTS.md` ("do not leave a carved
+  GPU idle with arcwell unloaded"); the carve cannot be released short of a
+  device rebind, and the wake lock's expiry lets the host clear it at its next
+  sleep.
+
+### 7. What remains (the gate, design note §7.4)
+
+Not this leg: cold TTFT arcwell vs host-fed in one window, byte-identity across
+arms and two cold boots, decode non-regression at the reference cell. The
+`aw_fill_budget` numbers are a standalone pinned-fill budget, not the
+integrated gate; the "serving step with the fill overlapping" and the
+cold-TTFT delta (still a projection over arcwell's own 2.91 GB/s — **arcwell's
+number, never arcint's**) are **OWED**. Criterion 4's "a consumer" integration
+(design note D2/D3) is still the unbuilt artifact.
+
+**Evidence classes, this leg.** Plateau/timing/OTD_PERF, the async budget, and
+the `AW_IOC_STATS` delta: `measured-here` (B60). The scale/zp layout divergence:
+`code`. The store's synthetic content: `measured-here`. arcwell's 1.125 ms /
+2.91 GB/s / submit comparands: arcwell's own `measured-here`, labelled. The
+store-layout resolution and the gate: **OWED**.
