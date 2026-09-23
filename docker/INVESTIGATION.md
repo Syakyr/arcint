@@ -292,6 +292,17 @@ host, so the ExecStart shape carries over verbatim.
   resolves. Requires a full tier-1 rebuild (~90 min) — layer cache is
   not configured across runs.
 
+- **2026-09-23, BUILD GREEN.** Run 35830512461: tier 2 passed end to
+  end — compile, full device-free unit ladder, in-container stub smoke
+  test — and pushed `ghcr.io/syakyr/arcint:investigation`
+  (`sha256:e5d09a34e17c9b39af3a50c26287a24a7bf59372a1c037c3faec8bff298b8e34`)
+  plus immutable `:20260923T071234`, on base
+  `arcint-ov:2026.4.0-marfrit-p15`
+  (`sha256:99b28425a0cde5b7482524cdf3a557c5cc06aba7c8abdccc6416d21dd91f776e`).
+  Anonymous pull verified via the registry API (`measured-here`). The
+  B60 leg is unverified — that is the next session, per
+  `HANDOFF-B60.md`.
+
 ## 9. Testing on the Pro B60 box
 
 Once `ghcr.io/syakyr/arcint:investigation` exists:
