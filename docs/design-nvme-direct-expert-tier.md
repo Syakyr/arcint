@@ -176,6 +176,22 @@ the existing host path. This is a **precondition of the fill path**, checked in
 §7; until it is resolved the byte path is not byte-transparent for the full
 slice.
 
+[RESOLVED 2026-09-23, artifact-format step — evidence
+`code` + `measured-here`, no card leg. A REAL store now exists on the ext4
+partition (3,408 files of 2,457,600 B, one plain extent each, whole-device
+byte-verified) and the resolution is DECIDED: **the slice is the three packed
+u4 weight tensors only, in device order**; the weights are `[oc][ic]` in both
+file and device, so a naive full-slice DMA is byte-transparent, and scales/zp
+are EXCLUDED from the DMA slice and stay on the host path that already
+transposes. The arithmetic is why: weights 2,457,600 B = 600 pages / 4,800
+LBAs exactly, while weights + serving-shape scales/zp = 2,553,600 B = 623.4375
+pages (not page-aligned, and the plugin's per-tensor scale destinations are
+unaligned too). The device-order-in-the-file alternative is implemented and
+tested (`tools/q4e/expert_store.py --with-scale-zp`;
+`transpose_scale_zp_to_device`) but is not the default because it cannot be one
+page-aligned request. See the campaign's "Artifact-format step" section. What
+this does NOT discharge: the integrated fill (D2/D3) and the gate.]
+
 ### How many are in flight, and the arithmetic
 
 **arcwell's numbers, labelled as arcwell's.** One expert is 2,457,600 B
@@ -454,3 +470,18 @@ confirmation.
   owed. B60 determinism caveat recorded: timing is
   admissible, no byte-identity claim made; the cold-TTFT delta stays a
   projection over arcwell's own 2.91 GB/s, labelled arcwell's.
+- 2026-09-23, later — **artifact-format step (§3's precondition RESOLVED); the
+  full-slice fill's byte-transparency is now decided, not owed.** A REAL ext4
+  expert store exists: 3,408 files of 2,457,600 B (`8,375,500,800 B`), every
+  file exactly ONE plain extent (`filefrag` 3408→1), `aw_fiemap` byte-verifies
+  all 3,408 against the raw device and its `--mutate` leg fails on content; a
+  24-expert sample is code-exact and dequantises to the u4 half-step (worst
+  err/bound 1.000001). The verdict: the slice is the three u4 weight tensors in
+  device order (byte-transparent); scales/zp are excluded and stay on the
+  transposing host path (the page-alignment arithmetic in §3). New writer
+  `tools/q4e/expert_store.py` + red-first `tools/test_expert_store.py` (15
+  cells; mutants: role order, non-fallocate, wrong transpose, short file,
+  f32-sidecar pass-through).
+  Dependency 1–2 of `docs/window-053.md` are cleared; §7 item 4 (the gate)
+  and the D2/D3 consumer integration stay **OWED**. No card leg, no module
+  load; the synthetic store was not touched.

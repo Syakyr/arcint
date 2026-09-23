@@ -256,6 +256,12 @@ things block it today. Every one is recorded, not worked around.
    4096-byte block repeated 600×** (600/600 blocks identical, distinct files
    differ only by seed). It carries **no expert tensors and no scales/zp**.
    Nothing can be filled correctly from it today.
+   [CLEARED 2026-09-23, artifact-format step: a REAL store now exists on the
+   ext4 partition — 3,408 files of 2,457,600 B (`8,375,500,800 B`), every file
+   exactly ONE plain extent, `aw_fiemap` byte-verifying all 3,408 against the
+   raw device with its `--mutate` leg failing on content, and a 24-expert
+   byte-exactness sample exact to the u4 half-step. See the campaign's
+   "Artifact-format step" section. The synthetic store itself was NOT touched.]
 2. **The scales/zp store-layout precondition is OWED and belongs to the
    artifact-format step.** `code`: the plugin's device slot layout and the
    weight-file layout differ for scales/zp — device `[group][oc]`, file
@@ -266,14 +272,27 @@ things block it today. Every one is recorded, not worked around.
    the host tier's scale indexing, or move the small scale/zp tensors through
    the existing host path) is a **store-layout decision** owed to the
    artifact-format step, not to this gate. No correct fill is claimed.
+   [RESOLVED 2026-09-23, artifact-format step: the verdict is **weights-only,
+   device order** — the 2,457,600-byte slice is the three u4 weight matrices,
+   which are byte-identical file↔device, so a naive full-slice DMA is
+   byte-transparent; scales/zp are EXCLUDED from the DMA slice (adding them
+   gives 2,553,600 B = 623.4375 pages, not page-aligned, and the plugin's
+   per-tensor scale destinations are unaligned too) and stay on the existing
+   host path that transposes. The device-order alternative is implemented for
+   a future integration and tested. See the campaign's "Artifact-format step"
+   section, §2.]
 3. **The consumer does not exist.** The `AW_IOC_SUBMIT_BATCH`/`AW_IOC_BATCH_WAIT`
    fill's timing is measured standalone (submit 20.9 ms of a 64.5 ms batch;
    2.71 GB/s at 71 experts; `via_host_bounce` delta 0), but the D2/D3
    integration that runs it inside the serving loop is **OWED**. The
    "serving step with the fill overlapping" has no number.
 
-**Consequence:** the three rows stay **OPEN**. The gate's own bytes cannot be
-laid down. This document is the criteria, not a measurement.
+**Consequence:** the three rows stay **OPEN**. [UPDATED 2026-09-23,
+artifact-format step: dependencies 1 and 2 are CLEARED, so the gate is no
+longer blocked on "nothing can be filled correctly". It is now blocked ONLY on
+dependency 3, the D2/D3 consumer integration, with its three rows still OPEN.]
+The gate's own bytes cannot be laid down. This document is the criteria, not a
+measurement.
 
 ## Harness and tools the measurement will use (named now)
 
@@ -349,3 +368,14 @@ paths, lock, raw output) live only in the git-ignored packet
   precondition mean nothing can be filled correctly today. No measurement, no
   card leg, no wake lock, no host/store/module mutation. Review before commit
   (reviewer subagent); corrections in place with dates.
+- 2026-09-23, later — **artifact-format step: the store precondition is
+  CLEARED.** A REAL expert store was built on the ext4 partition (3,408 files
+  of 2,457,600 B, `8,375,500,800 B`), every file exactly ONE plain extent,
+  `aw_fiemap` byte-verifying all 3,408 and its red leg failing on content; the
+  scales/zp layout verdict is **weights-only, device order**, with scales/zp
+  excluded from the DMA slice and left on the transposing host path. Dependencies
+  1 and 2 are cleared; dependency 3 (the D2/D3 consumer integration) remains,
+  so the three gate rows stay **OPEN** and the gate is blocked only on that
+  integration. No card leg, no module load, no wake lock; the arcwell module was
+  found loaded/carved (inherited) and left as found; the synthetic store was
+  not touched.

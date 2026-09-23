@@ -821,3 +821,188 @@ use is named in `docs/window-053.md` (served binary + `ov-0047`, OTD_PERF
 plateau probe, the arcwell `aw_fill_budget` client with an `AW_IOC_STATS`
 delta, `os.wait4`/`ru_maxrss`, the SOP physical-host sampler, `--fit-ledger-dir`).
 No card leg, no module load, no store mutation, no wake lock.
+
+---
+
+## Artifact-format step — a REAL expert store and the scales/zp layout verdict (2026-09-23); the store precondition CLEARED
+
+[`measured-here` + `code`; NO card leg, NO module load, NO synthetic-store
+mutation. The arcwell module was found loaded and carved (the probe's
+inherited state) and was left as found.] This leg resolves both store
+blockers LISBON-001 recorded: the ext4 store was synthetic arcwell test data,
+and the scales/zp layout precondition was OWED. A real store now exists on the
+ext4 partition and the layout question is decided.
+
+### 1. What the synthetic store was, and why it blocked the fill (carried)
+
+`measured-here` (B60 probe 2026-09-23): the store was 1,700 files of
+2,457,600 B, each one plain extent — but each file was one deterministic
+4096-byte block repeated 600×, so it carried no expert tensors and no
+scales/zp. The full-slice fill therefore had no correct source. That is the
+blocker this leg removes.
+
+### 2. The layout verdict: the slice is the three weight tensors, device order
+
+`code` + `measured-here`. One Flash-Next expert slice is 2,457,600 B, and that
+is exactly the three u4 weight matrices (`code`:
+`src/exec/flash_next_offload.h:45`; re-derived
+`3 * 2560 * 640 * 0.5`). The plugin's device slot and the OTD weight-file
+layout are IDENTICAL for the weights (`[oc][ic]`, row-major, even linear index
+low nibble) and DIFFERENT for scales/zp — device `[group][oc]` / `[group][oc/2]`,
+file `[oc][group]`, transposed on upload by `maybe_transpose_scale_zp` (`code`:
+`patches/0011-…:75-90`, `0006-…:291`).
+
+**Verdict.** The store file carries the three packed u4 weight tensors,
+concatenated gate | up | down, each `[oc][ic]` with the C++ nibble contract
+(`src/core/gguf_repack.h:90`, `gguf_repack.cpp:225`). These bytes are
+byte-identical in the file and on the device, so a naive full-slice DMA is
+byte-transparent — **given the D2/D3 integration contract that the per-expert
+device BO is the concatenated record** (the plugin today keeps three separate
+per-tensor memories; this contiguous gate|up|down layout is the integration's,
+not an existing device layout). **Scales and zero-points are NOT in the DMA
+slice**; they stay on the existing host upload path, which already applies the
+transpose. That is the design note §3's second option, and the alignment
+arithmetic is decisive:
+
+    weights                         2,457,600 B = 600 pages = 4,800 x 512 B LBAs
+    serving-shape scale/zp (g=128)  scales 76,800 B + zp 19,200 B = 96,000 B
+    weights + scales + zp           2,553,600 B = 623.4375 pages -> NOT page-aligned
+
+The plugin's per-tensor scale destinations are themselves unaligned
+(`dst_offset = slot * per_expert_size`; at g=128 every scale tensor is 25,600 B),
+so a scale/zp DMA on the existing device-slot offsets is not page-aligned
+(`code`: `USING_ARCWELL.md` §6). Padding the record or giving scales/zp their
+own page-aligned files is conceivable, but the chosen route is the one that
+keeps the DMA ONE page-aligned request at the pinned 2,457,600-byte slice
+WITHOUT changing the plugin's device-slot offsets — and the plugin's CPU kernel
+and existing host path read the FILE `[oc][group]` order, so scales/zp need no
+new indexing on that path (`code`: `patches/0011-…:79-80`).
+
+The alternative — scales/zp file-resident already in DEVICE order — is
+implemented for a future integration (`--with-scale-zp`;
+`transpose_scale_zp_to_device`, a transcription of `maybe_transpose_scale_zp`'s
+`src[o*group_count+g] -> dst[g*oc+o]`, with the f32 scale rounded to the f16
+bits the artifact carries) and is exercised by a writer-level cell and a
+sidecar-size cell, but it is not the default because it cannot be one
+page-aligned request.
+
+### 3. The writer tool and its red-first ladder
+
+`code` + `measured-here`, device-free. New `tools/q4e/expert_store.py` writes
+per-expert files through the existing fill machinery (`q4e.expert_fill`'s
+`ExpertFiller`, `q4e.gguf_feed`): it gathers only the pinned experts BEFORE
+dequantising, quantises to the u4 grouped-affine form, packs with the C++
+contract, and writes with `os.posix_fallocate` first so the blocks are allocated
+contiguously. Files are named `expert_NNNN.bin` — the arcwell reference tool's
+own convention (`stub/tools/aw_fiemap.c` builds `expert_%04d.bin`) — and a
+`manifest.json` maps each ordinal back to `(layer, expert)`.
+
+`tools/test_expert_store.py` carries **15 cells** (green: `Ran 15 tests … OK`,
+one geometry cell skipped where the temp filesystem does not report fallocated
+blocks). Red-first by mutation, raw output in the store packet
+(`cells-green.txt`, `redfirst-mutants.txt`):
+
+| mutant | cell that fails |
+|---|---|
+| role order swapped (gate,d​own,​up) | `test_record_is_gate_up_down_in_that_order` |
+| `truncate` instead of `posix_fallocate` | `test_fallocate_is_called_and_size_is_exact` |
+| scale transpose made identity | `test_scale_transpose_matches_moe_otd_mapping` + `test_sidecar_scales_are_f16_bits` |
+| short-payload refusal removed | `test_short_payload_is_refused` |
+| sidecar scales passed through as f32 | `test_record_offsets_and_sidecar_size` + `test_sidecar_scales_are_f16_bits` |
+
+A writer-level cell runs ONE expert through the whole writer (record offsets
+gate `[0,819200)` / up `[819200,1638400)` / down `[1638400,2457600)` and the
+96,000-byte f16-bit sidecar); the byte-exactness cell packs a real
+quantisation, writes it, reads the FILE back, unpacks it with a transcription
+of the C++ (`gguf_repack.cpp:225`), dequantises with the IR's own chain, and
+asserts the reconstruction is within half a group step — AND that the bound is
+tight, so it is not vacuous.
+
+### 4. The bounded real store
+
+`measured-here`. Pinned set: patch 0018's static partition at the gate's ratio
+86 — `512*(100-86)/100 = 71` slots/layer (`code`: patches 0041/0047) × 48 layers
+= **3,408 experts**, seed `0xF2A17C0DE5EED` (patch 0018's `kStaticPartitionSeed`).
+Membership is a pure function of `(seed, layer_key)`; `layer_key` is the layer's
+first OTD weight-file offset (`code`: patch 0018).
+
+    slice           = 2,457,600 B
+    experts         = 71 x 48 = 3,408
+    pinned bytes    = 3,408 x 2,457,600 = 8,375,500,800 B = 7.80 GiB
+
+It fits on the same ext4 partition as the synthetic store (187 G, 17 G free
+after; `du` 7.9 G). The synthetic store was NOT touched — a `measured-here`
+`stat` of its first and last files shows their mtimes unchanged from 2026-09-15
+— and the GGUF and artifact were not modified.
+
+**Membership caveat, stated not smoothed.** This store holds the *splitmix64*
+ratio-86 set — the plugin's default seed, which is what the acceptance harness
+(`docs/window-053.md`, plugin `ov-0047`, no census seed) pins. The design note
+§5 prefers pinning once from an offline census seed (patch 0046); a gate run
+with a census seed has a different membership and needs the writer re-pointed at
+that seed file (`--pinned` / `--layer-keys`). The store is keyed by
+`(layer, expert)`, so the mechanism is seed-agnostic; only the materialised
+membership is not.
+
+### 5. Geometry proof on the real store (raw)
+
+Pasted raw output on the persistent packet; the accepted lines, verbatim:
+
+```
+## extent count over all 3408 (filefrag)
+   3408 1
+## non-plain flags, every 7th file (487)
+0
+## last,eof, every 7th file (487)
+487
+## verbose sample
+File size of expert_0000.bin is 2457600 (600 blocks of 4096 bytes)
+   0:        0..     599:   47775744..  47776343:    600:             last,eof
+## st_blocks sample
+expert_0000.bin 2457600 4800
+## alignment
+2457600/4096=600 r0; /512=4800 r0; /65536=37 r32768
+```
+
+`aw_fiemap` (repo `stub/tools/aw_fiemap.c`) byte-verifies ALL 3,408 files
+against the raw device through the partition-start translation, and its
+`--mutate` red leg fails on CONTENT:
+
+```
+3408 files, 3408 extents total (1.00 per file), 3408 verified against the raw device
+RESULT=PASS -- FIEMAP + partition offset gives the correct absolute LBA
+RED: <store>/expert_0000.bin ... -> lba=382205952 ... MISMATCH
+RESULT=FAIL -- raw device at the computed LBA is not the file's bytes
+```
+
+Every file is 600 pages and 4,800 LBAs; the three weight tensors' record is
+byte-transparent to the device weights layout.
+
+### 6. Byte-exactness on the real store
+
+`measured-here`. Manifest size+sha256 over all 3,408 files: **0 mismatches**.
+A 24-expert sample (× 3 roles) recomputed from the GGUF source: the file's bytes
+unpack to exactly the quantised codes, and the dequantised reconstruction sits
+within the u4 half-step — worst error/bound **1.000001**, i.e. at the
+representation's floor (the `_BOUND_SLACK = 1e-5` measured in
+`tests/python/test_expert_fill.py`).
+
+### 7. What this changes, and what stays OWED
+
+This clears `docs/window-053.md` dependencies 1 and 2 (the synthetic store and
+the scales/zp precondition). The gate is no longer blocked because *nothing can
+be filled correctly* — a correct source now exists. What stays OWED is
+unchanged and is NOT discharged here: the integrated load-time fill (the
+`AW_IOC_SUBMIT_BATCH` / `AW_IOC_BATCH_WAIT` schedule wired inside the serving
+loop, design note D2/D3), the red cell that a synchronous `AW_IOC_READ_BLOCKS`
+on the decode path is refused, and the three gate rows themselves (cold TTFT
+both arms in one window, byte-identity across arms and two cold boots, decode
+non-regression). No card leg was run.
+
+**Evidence classes, this leg.** Slice bytes and the layout divergence: `code`
+(`flash_next_offload.h:45`; patches 0011/0006) plus `measured-here` arithmetic.
+The writer, its ladder and mutants: `code` (the tool) + `measured-here` (the
+runs). The store's geometry, extent count, raw-device verification and
+byte-exactness: `measured-here` on the ext4 partition. The seed and pinned-set
+arithmetic: `code` (patch 0018; patches 0041/0047). The gate and the consumer
+integration: **OWED**.
