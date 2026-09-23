@@ -79,7 +79,7 @@ its evidence class:
 | 1 | ext4-backed expert store | **met** | `measured-here` | 1700 files, 2,457,600 B each, one per expert, `fallocate`d on a single ext4 partition. **Every file resolves to exactly ONE extent** (`filefrag` over all 1700: `1700 1`; flags `last,eof`), and the file→absolute-LBA translation byte-verifies against the raw device for all 1700 (`aw_fiemap` GREEN), with the red leg (`--mutate`) failing on content. One extent means one *request*, not one DMA segment — see the recon note below. |
 | 2 | a card (B60) | **met by operator decision** | operator decision, 2026-09-23 | The B60 is free for this campaign's later gate. Not a measurement: a seat decision. The A770 stays backlogged (arcwell README; `KERNEL_FACTS.md` — its PCIe path goes unresponsive under load). |
 | 3 | module installed and loadable | **met** | `measured-here` | DKMS module installed and built for the running kernel; `modprobe arcwell` returns 0, `lsmod` shows it, `/dev/arcwell` appears, `dmesg` carries only the two load info lines (no `pr_err`/`pr_warn`), and `AW_IOC_STATS` reads (`via_host_bounce=0`). Host restored to as-found (unloaded; no carve created — `modprobe` alone does not carve). |
-| 4 | a consumer | **not met** | `code` | The residency policy arcwell would feed is not proven to converge at Flash-Next's admission ratio: RED-C-02 is open and unmeasured (`docs/design-qwen-flash-next.md`:207, :211, :215, :496). **Do not build this tier against it.** |
+| 4 | a consumer | **partially met** (2026-09-23, device-free) | `measured-here` + `code` | [DATED IN PLACE 2026-09-23: NOT discharged in full. The convergence CLAUSE of RED-C-02 is answered device-free from the served window-004 routing stream — see the "Convergence measurement" status entry below: the served static-partition policy's resident set is a pure function of configuration, fixed at `bind()`, so its composition converges at position 0 with zero evictions/thrash; the one mechanism that does NOT converge is a ROLLING census (`rounds_to_plateau=None` at every budget), which the design therefore excludes (pin once from an offline census). The literal RED-C-02 HARDWARE clauses — the `MOE_OTD_PERF_LOG` plateau probe's device-byte plateau and per-forward timing at the high-80s ratios, and the async-batch upload completing inside one inference step's budget — are **OWED** (no card leg was run), and the "a consumer" integration artifact (the design note / prefetch wiring) does not exist yet; that is the next step. Original text kept as written: "The residency policy arcwell would feed is not proven to converge at Flash-Next's admission ratio: RED-C-02 is open and unmeasured (`docs/design-qwen-flash-next.md`:207, :211, :215, :496). **Do not build this tier against it.**"] |
 
 Criterion 1's only caveat is the layout claim's second half (one *request* vs
 one *segment*), corrected by arcwell's own item 24 and reflected below.
@@ -346,6 +346,11 @@ with `via_host_bounce=0`, host restored to as-found unloaded with no carve);
 criterion 4 **not met** (`code`: RED-C-02 open/unmeasured — a consumer must not
 be built against it).
 
+> [SUPERSEDED 2026-09-23: criterion 4's status was re-measured device-free — see
+> the "Convergence measurement" entry below. It is now **partially met**: the
+> convergence clause is answered, the RED-C-02 hardware clauses and the consumer
+> integration stay OWED. This line is kept as the recon date's record.]
+
 The **64 KiB anomaly is resolved, not a violation**: the rule is on the xe VRAM
 BO (`USING_ARCWELL.md` §6 `BO requirements`; `KERNEL_FACTS.md`), which the
 client rounds up to a 64 KiB multiple (`aw_expert_test.c`), while the file need
@@ -361,3 +366,183 @@ number, not arcint's). Also owed: the design note
 routing warning comes from, and the fallback for a fetch that has not landed —
 and criterion 4's convergence measurement (RED-C-02). No arcint card leg was run
 here; the B60 was left idle.
+
+---
+
+## Convergence measurement — criterion 4's convergence clause answered device-free (2026-09-23); criterion 4 partially met
+
+[measured-here, one device-free run; NO card leg, B60 idle] Entry criterion 4
+("a consumer") asked whether the residency policy arcwell would feed converges
+at the admission ratio a large MoE needs. It was measured from the routing
+stream already on disk, using the repository's own policy arithmetic.
+
+**The trace.** Served window-004 (`venice-census-004`), sha256
+`bf32c87401d7ac444aa1aae89eb5a641f69cd84b8c43643f7222253ad5d2d304`, 197,184
+calls / 3,893,280 routed accesses, on the persistent census path (operator-local
+detail in the handoff packet). The served artifact is **Flash-Next itself**
+(`qwen38-flash-next-d48n-ov`): depth 48, 512 experts per layer, `top_k` 10, KV
+u8, `tier=static`, provenance `offload_ratio=99`. So the routing stream is
+Flash-Next's own served router, and the admission ratio is directly varied by
+the slot budget.
+
+**Instrument + cells (deliverable 3).** New `tools/expert_convergence.py`
+(+ `tools/test_expert_convergence.py`, **18 red-first cells**, green; ladder now
+146 cells = 81 census + 33 policy-compare + 14 census-seed + 18 convergence).
+The cells pin: access-position deciles (including the sub-decile case of fewer
+accesses than buckets); `convergence_decile`; pinned-only fill
+and `calls_to_last_new`; a two-quiet-forward plateau (the engine's
+`plateaued < 2`); TRUE-LRU promotion (FIFO is distinguishable and understates
+the comparand); a rolling prefix series that reports a plateau only on an
+unchanged set; and refusals for a negative LRU budget and a zero rolling
+budget (a zero budget would otherwise falsely "plateau" on an empty set).
+Red-first shown by mutation: dropping `move_to_end` and an off-by-one
+ordinal bucket fails 5 cells (3 decile + end-to-end + TRUE-LRU); counting
+unpinned ids, declaring a plateau on any quiet forward, and always reporting a
+plateau fails 3 cells.
+Raw: `cells-green.txt`, `redfirst-mutant{A,B}.txt` on the census path.
+
+**Definitions.** Regimes are half-open call ranges on the served sequence:
+`probe [0,288)` (the 6 load-time forwards, 48 calls each), `prefill [288,576)`
+(288 batched calls, 2,735 tokens), `decode [576,end)` (196,608 single-token
+calls, 4,096 tokens), `corpus [288,end)` (the served request). Position is
+ACCESS position (a batched prefill call contributes many accesses). Seeds: the
+incumbent `static-splitmix64` (patch 0018) and four frequency seeds calibrated
+on one regime each (probe / prefill / decode / mixture). Budgets are the
+plugin's integer-division slot count `512*(100-ratio)/100`.
+
+**Budget correction, dated in place.** The brief named "ratio 75 → 16
+slots/layer". Source and measurement disagree: `resident_expert_num =
+const_shape[0]*(100-otd_ratio)/100` (`patches/0041-…:78`, `0047-…:62`) with
+`const_shape[0]=512` gives **128** at ratio 75 — and 128 is exactly what the
+measured ratio-75 sweep point pins (`window-052` rate leg, census top-128). No
+integer offload ratio gives 16 at 512 experts (512·(100−r)/100 = 16 ⇒ r =
+96.875; nearest integer 97 → **15**). The two SERVED budgets below are ratio 99
+→ **5** and ratio 75 → **128**; **16** is included because the brief named it,
+labelled as mapping to no served ratio.
+
+**Command** (trace path operator-local, recorded in the handoff packet):
+
+    python3 tools/expert_convergence.py --trace <w004.trace> \
+        --slots 5,16,35,51,71,87,107,128 --out <w004-authoritative.json>
+
+Raw stdout `w004-authoritative.txt` (sha256 `a4da92f8…`), JSON
+`w004-authoritative.json` (sha256 `73c47bb3…`), tool sha256 `af5ac229…`, both
+on the persistent census path. Accepted lines, verbatim.
+
+**1. Resident-set composition vs position. Met, trivially.** Under the SERVED
+static partition the set is a pure function of `(seed, layer_key, expert,
+slots)`, fixed at `bind()` (`code`: patch 0018; patch 0046 validates the census
+membership at construction and applies it at `bind()`). Membership changes =
+**0** at every position; **time-to-convergence = 0 routed calls**. No history
+input exists, so there is no warm-up, no oscillation and no eviction.
+
+The ROLLING census — the set recomputed from a growing prefix, i.e. what a
+periodic re-calibration would pin — does **not** converge at any budget or
+regime (`code`+`measured-here`). Verbatim at ratio 75 / 128 slots:
+
+    rolling probe    rounds_to_plateau=None plateau=False changed=[None, 1, 2, 4, 8, 16, 32, 48, 48, 30]
+    rolling prefill  rounds_to_plateau=None plateau=False changed=[None, 1, 2, 4, 8, 16, 32, 48, 48, 32]
+    rolling decode   rounds_to_plateau=None plateau=False changed=[None, 1, 2, 4, 8, 16, 32, 47, 48, 48, 48, 48, 48, 48]
+    rolling corpus   rounds_to_plateau=None plateau=False changed=[None, 1, 2, 4, 8, 16, 32, 48, 48, 35, 24, 40, 40, 48]
+
+Identical shape at every budget 5…128. This is the V3 failing shape, now shown
+to be a property of the ROUTING distribution, not of the served policy: the
+census ranking keeps moving past 4,096 decode tokens. **Design consequence:
+a consumer must pin ONCE from an offline calibration census and must not
+re-derive the hot set from live traffic; a rolling refresh would thrash
+membership.**
+
+**2. Hit rate over sequence position. (seed × regime) property, never one
+number.** Verbatim:
+
+    ratio 99 (5 slots)
+    decode   splitmix64      early=  1.17% steady=  0.97% tail=  0.96% tail-steady= -0.01pt conv@d1 fill= 80.0% lastnew=191481 plateau=True
+    decode   census-decode   early=  7.90% steady= 14.99% tail= 15.59% tail-steady= +0.61pt conv@d4 fill=100.0% lastnew=51321 plateau=True
+    decode   census-mixture  early=  8.97% steady= 14.37% tail= 14.66% tail-steady= +0.29pt conv@d4 fill=100.0% lastnew=43640 plateau=True
+    prefill  census-prefill  early=  9.40% steady=  8.08% tail=  7.09% tail-steady= -0.98pt conv@d9 fill=100.0% lastnew=47 plateau=True
+    ratio 75 (128 slots)
+    decode   splitmix64      early= 25.75% steady= 25.02% tail= 24.97% tail-steady= -0.05pt conv@d1 fill= 79.5% lastnew=196380 plateau=True
+    decode   census-decode   early= 68.17% steady= 85.81% tail= 83.96% tail-steady= -1.85pt conv@d9 fill=100.0% lastnew=136653 plateau=True
+    prefill  census-prefill  early= 66.58% steady= 63.60% tail= 55.68% tail-steady= -7.91pt conv@d10 fill=100.0% lastnew=286 plateau=False
+    prefill  census-mixture  early= 46.44% steady= 50.52% tail= 46.56% tail-steady= -3.96pt conv@d9 fill= 98.9% lastnew=283 plateau=False
+    ratio 86 (71 slots; Flash-Next admission)
+    decode   census-decode   early= 51.12% steady= 70.30% tail= 68.05% tail-steady= -2.25pt conv@d9 fill=100.0% lastnew=93753 plateau=True
+    decode   census-mixture  early= 55.65% steady= 66.14% tail= 62.98% tail-steady= -3.16pt conv@d9 fill= 99.4% lastnew=140591 plateau=True
+
+Reading: (a) the incumbent `splitmix64` is flat at analytic chance `slots/512`
+(≈0.98 % at 5 slots, 25.0 % at 128) — expected of a frequency-free seed, and
+it converges by decile 1 because it has no signal to converge to; (b) a
+regime-matched census seed rises to a steady state (`convergence_decile` 4–10,
+tail within ~2–4 pt of steady); (c) a seed calibrated on the WRONG regime
+drifts monotonically (e.g. `census-prefill` scored on decode at 128: 58.76 →
+39.27 → 35.22) — the (seed × regime) law again. The ratio-86 point is the
+design's own ~8 GiB / ~86 % row (`docs/design-qwen-flash-next.md`:346), the LOW
+edge of the stated "high 80s to low 90s" admission range (`:379`); 71 is the
+plugin's integer-division value for the design's 72, and 86 is the low edge of
+that range, not a single "admission" ratio.
+
+**3. Eviction / thrash per 1000 routed calls.** Static partition: **0** at
+every budget and regime (no eviction path; non-resident experts take the host
+tier). Demand-warm LRU comparand, verbatim:
+
+    ratio 99 (5 slots)
+    decode   lru-per-layer   hit=  2.27% evict=1921297 per1kcalls=    9772.2 per1kacc=  977.2
+    ratio 75 (128 slots)
+    decode   lru-per-layer   hit= 77.34% evict=439354 per1kcalls=    2234.7 per1kacc=  223.5
+    prefill  lru-per-layer   hit= 81.58% evict=235701 per1kcalls=  818406.2 per1kacc=  179.5
+    ratio 86 (71 slots)
+    decode   lru-per-layer   hit= 65.59% evict=673170 per1kcalls=    3423.9 per1kacc=  342.4
+
+Per-call rates are NOT comparable across regimes (prefill calls are batched,
+455 accesses/call; decode calls are single-token, 10 accesses/call); the
+per-1,000-ACCESS rate is the comparable figure. The static partition pays no
+thrash at all; the LRU comparand pays ~180–977 evictions per 1,000 accesses.
+
+**4. Tail (last decile vs steady).** Regime-matched census seed: within
+−1.9…−4.1 pt of steady (stable); incumbent: within ±0.2 pt (flat); an
+out-of-regime seed drifts further (e.g. `census-prefill` on corpus at 128:
+−14.18 pt) — the (seed × regime) law.
+
+**5. Fill / plateau-probe proxy (device-free).** The pinned-set demand is
+monotone at every budget (no oscillation); `calls_to_last_new` is the
+device-byte plateau point under the static partition (uploads are never freed).
+At the load-time probe regime the fill is **not** complete for a seed not
+calibrated on the probe: `splitmix64` reaches only **38.2 %** of its pinned set
+after the 6 forwards, yet the trace's corpus begins at call 288 — the engine
+terminated at 6 forwards while the demand proxy was still adding new pinned
+experts. That matches the recorded two-ledger finding that the driver keeps
+most of the pinned pool host-mapped, so `device_resident_bytes` flattens before
+every pinned expert has been demanded. **The actual device-byte plateau, the
+probe's per-forward timing and the async-batch upload budget are hardware
+claims and are OWED — this measurement cannot make them, and does not fake
+them.**
+
+**Verdict — partially met; NOT discharged in full.** The convergence CLAUSE of
+RED-C-02 ("does not oscillate/thrash") is answered device-free: the policy
+arcwell would feed (the served static partition, pinned once from an offline
+census seed) is a pure function of configuration, converges at position 0 and
+evicts nothing. But two halves remain unmade: (a) the literal RED-C-02 HARDWARE
+clauses — the `MOE_OTD_PERF_LOG` plateau probe's device-byte plateau and
+timing at the high-80s ratios, and the async-batch upload budget — need a card
+leg and are **OWED**; and (b) criterion 4 is literally "a consumer": no
+integration artifact exists, and the design note is the next step. So this leg
+unblocks the design note; it does NOT license building the tier against an
+unmeasured engine plateau probe. Note also that a regime-matched seed's hit
+series settles at `convergence_decile` 4–10 (relative to the trace end), which
+is CONVERGENCE, not ADEQUACY: at the ratio-99 budget that steady value is only
+~15 % of decode accesses (the measured V1 regime shortfall, `window-052`), a
+separate speed-gate matter.
+
+**OWED, named and not faked:** (a) the plateau probe's actual device-byte
+plateau and per-forward timing at the high-80s ratios on the B60; (b) the
+async-batch upload path completing inside one inference step's budget; (c) the
+campaign GATE itself — cold TTFT (arcwell vs host-fed, one window), answer
+byte-identity across arms and two cold boots, decode non-regression at the
+reference cell — plus the design note
+(`docs/design-nvme-direct-expert-tier.md`), the next step.
+
+**Evidence classes.** ratio→slots arithmetic: `code` (`fit.h`; patches
+0041/0047). Fixed-set composition and zero evictions: `code` (patch 0018/0046).
+Every convergence number above: `measured-here` (device-free replay of the
+served window-004 trace). That the trace is Flash-Next's own served router:
+`measured-here` (provenance `run=venice-census-004`, depth 48, 512 experts).
