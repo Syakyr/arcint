@@ -9763,6 +9763,71 @@ buffer size — the ratio-75 run (both give 128, fault unchanged) and patch
 0047's resident-sized pool settled it. No code moves; the item is closed so
 no future session "fixes" it.
 
+#### 7.0.2cg The n-gram table is staged per forward: the served depth-4 window is byte-identical and takes 26.82 GiB off the host ledger (2026-09-23)
+
+Campaign: `docs/campaigns/ple-disk-backend.md`; design note
+`docs/design-ple-disk-backend.md`; git-ignored handoff packet
+`docs/handoff-ple-disk-backend.local.md`. The change is arcint-side; the
+plugin prefix is `ov-venice` (`b2754b8fe8a9b89b`), unchanged.
+
+**The finding.** [measured-here] The served path pinned the Flash-Next n-gram
+table as 26.82 GiB of USM host memory for the life of the process
+(`bind_ngram_ports` allocated a host `USM_HOST_BUFFER` per port and made one
+full `memcpy`). The reference ships a DISK backend as its **default** (`code`:
+`~/src/FreeToken-ref`, `ple_backend = "disk"`, `models/qwen4_exp/ple_disk.py`,
+staging bounded by `max_graph_rows`/`max_extend_tokens`), and arcint's port
+contract already carried the hashed row ids host-side (`ngram_chunk_ids` +
+`ngram_local_ids`), so the table never had to be resident. The pin was a
+CHOICE, not a constraint.
+
+**The mechanism.** [code] A single `ngram_table.0` port whose row count is
+BELOW the source tensor's is recognised as a per-forward STAGING WINDOW:
+`bind_ngram_ports` validates it (`check_staging_geometry`), opens the GGUF path
+for `pread`, allocates ONE `[S, row_bytes]` USM-host tensor and SKIPS the
+full-table copy; `feed_ngram_ports` stages exactly the rows the forward names
+(`ngram::stage_from_file`, slot `i` = the `i`-th named row) and feeds slot ids
+with chunk id 0. The emitter declares it via
+`build_serving_shape_ir(..., ngram_staging_rows=N)` and
+`tools/export_serving_artifact.py --ngram-staging-rows N`.
+
+**The served gate.** [measured-here] Depth-4 scope (the n-gram mechanism is
+depth-independent), ONE binary (scratch `wt-ple`, sha256 `a6dac5b57cc5fa40`,
+carrying the staging branch; BOTH arms ran it), one A770 (`GPU.1`, PCI
+8086:56a0), plugin `ov-venice` `b2754b8fe8a9b89b`, one fresh process per arm,
+identical flags, the capture's first 256 ids, greedy 32, temperature 0.
+
+A CONFOUND was found and removed before comparing: the stale pinned depth-4
+artifact predates the corrected fill (`output_gate_type`, `gdn_key_head_map`,
+§7.0.2bz), so a pinned TWIN was exported from the same tree and the two
+`config.json` files were `CONFIG_IDENTICAL`. A staged-vs-stale comparison
+would have measured the backbone, not the PLE.
+
+| quantity | pinned twin (7 ports) | staged (1 port) | verdict |
+|---|---|---|---|
+| answer sha256 | `d7f998cd…2ea5b8f` | `d7f998cd…2ea5b8f` | **byte-identical** |
+| n-gram resident | 26.82 GiB USM host, 37.5 s copy | 2.884 MiB staging, no copy | the 26.82 GiB term is off the ledger |
+| container VmRSS peak | 19.79 GiB | 4.93 GiB | Δ 14.86 GiB |
+| physical MemAvailable min | 9.89 GiB | 32.91 GiB | Δ 23.02 GiB |
+
+The staged load line reads `ngram table STAGED: 1 port(s) of 33600 rows x 90 B
+= 2.884 MiB of USM host staging … (the 320001536-row table stays on disk, read
+per forward)`, and a staged repeat reproduced the same digest. The
+pre-correction pinned arm returned `c983da7e…`; it is discarded for gate
+purposes and kept only to show the corrected fill is what moved that answer.
+
+**Caveats.** [measured-here] Coverage/the staging bound is `max_tokens × Hn`
+(33600 rows at the served geometry); the table still must exist on disk at full
+size, which is admission's business. Scope is depth 4 of 48 — the mechanism and
+the freed term are depth-independent, and a full-depth window remains open.
+Cost: cold-table first staged run props 370 s / request 56.5 s, warm re-run 45 s
+/ 25.6 s against pinned 155 s / 33.2 s. io_uring and dedup are out of scope, as
+the design note states.
+
+**What it means.** [measured-here] The 26.82 GiB pin is no longer a
+requirement: a 32/44 GiB host can carry this model's n-gram table from disk,
+the way the reference default does, and the freed term returns to the expert
+host pool. LISBON-001's RSS-bounded-through-boot cell is where that is read.
+
 #### 7.0.3 KV precision on the paged path — u8 is the lever, u4 is a tax
 
 The plugin accepts f16/u8/i8/u4/i4 for `KV_CACHE_PRECISION` on the paged path,

@@ -288,6 +288,33 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
   renumbered — the 0046 build is identified by its seed env/parse symbols,
   as `contrib/packaging/marfrit-openvino/patches/README.md` discloses).
 
+### The n-gram table, staged from disk (campaign: ple-disk-backend)
+
+- **The 26.82 GiB pin is off the ledger.** The served path bound the
+  Flash-Next n-gram table as 26.82 GiB of USM host memory for the life of the
+  process. A single `ngram_table.0` port whose row count is BELOW the source
+  tensor's is now recognised as a per-forward STAGING WINDOW:
+  `bind_ngram_ports` validates it (`check_staging_geometry`) and skips the
+  full copy, and `feed_ngram_ports` stages exactly the rows the forward names
+  straight from the GGUF (`pread`), slot `i` = the `i`-th named row. Declared
+  by the emitter via `build_serving_shape_ir(..., ngram_staging_rows=N)`, and
+  exposed as `--ngram-staging-rows N` on
+  `tools/export_serving_artifact.py`.
+- **Measured served gate (A770, ONE binary for both arms, one fresh process
+  per arm, depth 4 of 48)**: staged against a pinned TWIN exported from the
+  same tree (the two `config.json` files identical, so the comparison is the
+  n-gram ports and not the backbone) → answer sha256 `d7f998cd…2ea5b8f` on
+  BOTH arms, byte-identical; n-gram resident 26.82 GiB with a 37.5 s copy →
+  2.884 MiB staging with no copy; container VmRSS peak 19.79 → 4.93 GiB
+  (Δ 14.86); physical MemAvailable min 9.89 → 32.91 GiB (Δ 23.02). A staged
+  repeat reproduced the same digest.
+- **Caveat**: depth 4 of 48 — the mechanism and the freed term are
+  depth-independent, and the full-depth window remains open. The staging bound
+  is `max_tokens × Hn` (33600 rows at the served geometry); the table still
+  exists at full size on disk, which admission owns.
+- **No plugin patch**: the change is arcint-side, and the runtime dependency is
+  unchanged.
+
 ## 0.5.0 — 2026-09-13
 
 Requires `marfrit-openvino 2026.4.0~dev20260821+p15` (patches 0003–0033) —

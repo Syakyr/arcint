@@ -310,8 +310,14 @@ campaign's numeric gate in device-free form.
   |---|---|---|---|
   | answer digest | `d7f998cd…2ea5b8f` | `d7f998cd…2ea5b8f` | **PASS, byte-identical** |
   | n-gram resident | 26.82 GiB USM host, 37.5 s copy | 2.884 MiB staging, no copy | **the 26.82 GiB term is off the ledger** |
-  | container VmRSS peak | 19.79 GiB (20,753,068 KB) | 4.85 GiB (5,173,232 KB) | Δ **14.86 GiB** |
+  | container VmRSS peak | 19.79 GiB (20,753,068 KB) | 4.93 GiB (5,173,232 KB) | Δ **14.86 GiB** |
   | physical MemAvailable min | 9.89 GiB | 32.91 GiB | Δ **23.02 GiB** |
+
+  **[DATED IN PLACE 2026-09-23: the staged VmRSS peak above was first written
+  4.85 GiB. The sampler's own `5,173,232 KB` is 4.93 GiB (÷1024²); the Δ
+  14.86 GiB was already the correct 19.79 − 4.93, so only the absolute staged
+  figure was mistyped. Corrected when the raw `sampler.log` was re-read during
+  review.]**
 
   The numeric difference is **zero** on the gate; the staging change is invisible
   under DESIGN §3.4 on this window. A difference would have been the finding; it
