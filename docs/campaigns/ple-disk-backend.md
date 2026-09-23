@@ -242,3 +242,16 @@ campaign's numeric gate in device-free form.
     BLOCKS the change. Until that window runs, the pin is still what the served
     path does — the staging path is implemented and proven device-free, not yet
     served.
+
+- 2026-09-23 — **the export entry point exposes the staging bound.**
+  [code] `tools/export_serving_artifact.py` gained `--ngram-staging-rows N`, passed
+  into `build_serving_shape_ir` at the export call site, so an artifact can be
+  written with the staging window declared. One avenue is CLOSED and worth
+  recording: the existing full-depth artifact **cannot** be turned into a staging
+  IR by editing its XML, because the artifact declares **three** chunked
+  `ngram_table.K` ports (the whole table under the per-object cap) while staging
+  needs **one** — the port COUNT changes, so the graph changes, so an export is
+  required. The cheap acceptance path is therefore a TRUNCATED export
+  (`--layers 4`), which is legitimate for this gate: the n-gram table is a
+  property of the model, not of the depth, so a depth-4 staging artifact exercises
+  the same mechanism and the same freed 26.82 GiB term.
