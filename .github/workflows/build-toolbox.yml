@@ -44,22 +44,41 @@ env:
   REGISTRY: ghcr.io
 
 jobs:
-  # Resolve the lowercase namespace once: GHCR requires it and
-  # github.repository_owner preserves the account's capitalisation.
+  # Resolve the lowercase namespace AND the tier selection once, in shell,
+  # where the evaluation is visible in the log. A previous run skipped
+  # tier2 despite tiers=arcint with the equivalent inline expression
+  # (run 35829326673; the dispatch inputs are not exposed via the API,
+  # so the inline evaluation could not be audited after the fact) —
+  # computing the booleans here makes the decision auditable instead of
+  # expression-magic.
   ns:
     runs-on: ubuntu-latest
     outputs:
       owner: ${{ steps.ns.outputs.owner }}
       build_ts: ${{ steps.ns.outputs.build_ts }}
+      build_ov: ${{ steps.tiers.outputs.build_ov }}
+      build_arcint: ${{ steps.tiers.outputs.build_arcint }}
     steps:
       - id: ns
         run: |
           echo "owner=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
           echo "build_ts=$(date +%Y%m%dT%H%M%S)" >> "$GITHUB_OUTPUT"
+      - id: tiers
+        run: |
+          T='${{ github.event.inputs.tiers }}'
+          bo=false; ba=false
+          case "${T,,}" in
+            all) bo=true; ba=true ;;
+            *) case "$T" in *ov*) bo=true ;; esac
+               case "$T" in *arcint*) ba=true ;; esac ;;
+          esac
+          echo "raw tiers input: '$T' -> ov=$bo arcint=$ba" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "build_ov=$bo" >> "$GITHUB_OUTPUT"
+          echo "build_arcint=$ba" >> "$GITHUB_OUTPUT"
 
   tier1-openvino:
     needs: ns
-    if: ${{ github.event.inputs.tiers == 'all' || contains(github.event.inputs.tiers, 'ov') }}
+    if: needs.ns.outputs.build_ov == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
@@ -93,9 +112,14 @@ jobs:
 
   tier2-engine:
     needs: [ns, tier1-openvino]
+    # always() so a skipped tier1 does not auto-skip this; then gate on
+    # the ns-computed booleans and tier1's actual result.
     if: >-
-      ${{ (github.event.inputs.tiers == 'all' || contains(github.event.inputs.tiers, 'arcint'))
-          && (needs.tier1-openvino.result == 'success' || needs.tier1-openvino.result == 'skipped') }}
+      ${{ always()
+          && needs.ns.result == 'success'
+          && needs.ns.outputs.build_arcint == 'true'
+          && needs.tier1-openvino.result != 'failure'
+          && needs.tier1-openvino.result != 'cancelled' }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
