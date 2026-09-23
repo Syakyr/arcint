@@ -259,6 +259,48 @@ def test_the_ngram_table_travels_as_ports_that_partition_the_vocabulary(built):
     assert not baked, f"the table is still a constant: {baked}"
 
 
+def test_a_staging_bound_turns_the_table_into_one_small_port():
+    """campaign `ple-disk-backend`: with `ngram_staging_rows`, the IR declares
+    ONE `ngram_table.0` port sized to a FORWARD (max_tokens x Hn rows), not to
+    the table. Being SMALLER than the source tensor is exactly how
+    `bind_ngram_ports` recognises a staging window -- a per-forward `pread`
+    instead of the 26.82 GiB USM-host pin.
+
+    RED before the parameter existed: the port covered the whole table.
+    """
+    cfg = pwe.real_config()
+    heads = (cfg.ngram_size - 1) * cfg.heads_per_ngram
+    staging = 512 * heads
+    V = pwe.REAL_GEOMETRY["ngram_total_vocab"]
+    assert staging < V, (staging, V)
+    arena = ss.SparseArena()
+    try:
+        model, report = ss.build_serving_shape_ir(arena=arena, n_layers=_CONTRACT_LAYERS,
+                                                  ngram_staging_rows=staging)
+        ports = {p.get_node().get_friendly_name(): p for p in model.inputs
+                 if p.get_node().get_friendly_name().startswith("ngram_table.")}
+        assert list(ports) == ["ngram_table.0"], sorted(ports)
+        shape = [d.get_length() for d in ports["ngram_table.0"].get_partial_shape()]
+        assert shape == [staging, _NGRAM_ROW_BYTES], shape
+        assert shape[0] < V, (shape[0], V)
+        assert report["ngram_staging_rows"] == staging, report["ngram_staging_rows"]
+        assert report["ngram_table_rows"] == V, report["ngram_table_rows"]
+    finally:
+        arena.close()
+
+
+def test_without_a_staging_bound_the_ports_still_cover_the_whole_table(built):
+    """The regression half: with no staging bound the port partition is
+    unchanged -- the pinned path's contract must not move."""
+    model, report, _ = built
+    assert report["ngram_staging_rows"] is None
+    V = pwe.REAL_GEOMETRY["ngram_total_vocab"]
+    rows = [d[0].get_length() for p in model.inputs
+            if p.get_node().get_friendly_name().startswith("ngram_table.")
+            for d in [p.get_partial_shape()]]
+    assert sum(rows) == V, (rows, V)
+
+
 def test_the_chunked_gather_is_the_whole_table_gather():
     """NUMERIC, on CPU, at a toy width: gathering through the chunked ports
     produces exactly the rows a Gather over the un-chunked table produces --

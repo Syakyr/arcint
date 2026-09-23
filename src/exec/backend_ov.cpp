@@ -31,6 +31,7 @@
 #include <set>
 
 #include <dirent.h>
+#include <fcntl.h>
 #include <unistd.h>
 #include <limits>
 #include <map>
@@ -74,6 +75,7 @@
 #include "exec/gguf_graph.h"
 #include "exec/graph_rewrites.h"
 #include "exec/ngram_ports.h"
+#include "exec/ngram_staging.h"
 #include "exec/ngram_table.h"
 #include "core/gguf_dequant.h"
 #include "exec/kquant_op.h"
@@ -8063,6 +8065,16 @@ private:
     // constants are derived once for the IR's PLE layer.
     ngram::PortPlan                 ngram_ports_;
     std::vector<ov::RemoteTensor>   ngram_table_tensors_;
+    // STAGING (campaign `ple-disk-backend`): when the IR's single `ngram_table`
+    // port is SMALLER than the source tensor, it is a per-forward staging
+    // WINDOW, not the pinned table. The table then stays on disk: the port
+    // holds only the rows one forward names, filled by `pread` in
+    // `feed_ngram_ports`, and the 26.82 GiB USM-host copy never happens.
+    bool                          ngram_staging_active_ = false;
+    ngram::StagingGeometry        ngram_staging_geom_{};
+    int                           ngram_staging_fd_     = -1;
+    uint64_t                      ngram_staging_base_   = 0;
+    ov::RemoteTensor              ngram_staging_tensor_;
     std::optional<ngram::HashParams> ngram_hash_;
 
     // Bind the table to the ports, once, after the lanes exist. The source
@@ -8107,8 +8119,39 @@ private:
             throw std::runtime_error(log::format("%s: no %s tensor to bind the ngram_table ports from",
                                                  gguf_path_.c_str(), ngram::kTableTensor));
         }
-        const std::string why = ngram::check_table_source(*t, gguf_file_->bytes(*t), ngram_ports_);
-        if (!why.empty()) throw std::runtime_error("ngram table source refused: " + why);
+        // STAGING (campaign `ple-disk-backend`): ONE port whose row count is
+        // BELOW the source's is a per-forward staging WINDOW, not the pinned
+        // table. The table stays on disk then -- only the rows a forward names
+        // are read -- and the full-table copy below never happens.
+        const bool staging = ngram_ports_.chunks.size() == 1 && t->dims.size() == 2 &&
+                             ngram_ports_.total_rows < static_cast<size_t>(t->dims[1]);
+        if (staging) {
+            ngram_staging_geom_.staging_rows = ngram_ports_.total_rows;
+            ngram_staging_geom_.row_bytes    = ngram_ports_.row_bytes;
+            ngram_staging_geom_.table_rows   = static_cast<uint64_t>(t->dims[1]);
+            const std::string why = ngram::check_staging_geometry(
+                *t, gguf_file_->bytes(*t), ngram_staging_geom_);
+            if (!why.empty())
+                throw std::runtime_error("ngram staging source refused: " + why);
+            ngram_staging_fd_ = ::open(gguf_path_.c_str(), O_RDONLY);
+            if (ngram_staging_fd_ < 0)
+                throw std::runtime_error(log::format(
+                    "ngram staging: cannot open %s for the per-forward row reads",
+                    gguf_path_.c_str()));
+            ngram_staging_base_ = static_cast<uint64_t>(gguf_file_->data_offset()) +
+                                  static_cast<uint64_t>(t->offset);
+            const ov::Shape sh{ngram_staging_geom_.staging_rows,
+                               ngram_staging_geom_.row_bytes};
+            ngram_staging_tensor_ = rctx.create_tensor(
+                ov::element::u8, sh,
+                {{ov::intel_gpu::shared_mem_type.name(), ov::intel_gpu::SharedMemType::USM_HOST_BUFFER}});
+            for (auto& lane : lanes_)
+                lane->req.set_tensor(ngram_ports_.chunks[0].name, ngram_staging_tensor_);
+            ngram_staging_active_ = true;
+        } else {
+            const std::string why = ngram::check_table_source(*t, gguf_file_->bytes(*t), ngram_ports_);
+            if (!why.empty()) throw std::runtime_error("ngram table source refused: " + why);
+        }
         if (device.rfind("GPU", 0) != 0) {
             throw std::runtime_error(log::format(
                 "the ngram_table ports need USM host memory to bind %zu rows x %zu B without a "
@@ -8143,27 +8186,40 @@ private:
         hp.validate();
         ngram_hash_ = std::move(hp);
 
-        const auto     t0   = std::chrono::steady_clock::now();
-        const uint8_t* base = gguf_file_->data(*t);
-        size_t         off  = 0;
-        for (const auto& chunk : ngram_ports_.chunks) {
-            const ov::Shape sh{chunk.rows, ngram_ports_.row_bytes};
-            ov::RemoteTensor rt = rctx.create_tensor(
-                ov::element::u8, sh,
-                {{ov::intel_gpu::shared_mem_type.name(), ov::intel_gpu::SharedMemType::USM_HOST_BUFFER}});
-            void* dst = rt.get_params().at(ov::intel_gpu::mem_handle.name()).as<void*>();
-            std::memcpy(dst, base + off, chunk.rows * ngram_ports_.row_bytes);
-            off += chunk.rows * ngram_ports_.row_bytes;
-            for (auto& lane : lanes_) lane->req.set_tensor(chunk.name, rt);
-            ngram_table_tensors_.push_back(std::move(rt));
+        if (ngram_staging_active_) {
+            log::info("load",
+                      "ngram table STAGED: %zu port(s) of %zu rows x %zu B = %.3f MiB of USM host "
+                      "staging from %s (the %llu-row table stays on disk, read per forward); "
+                      "id ports %s, conv_mask %s; hash ordinal 0",
+                      ngram_ports_.chunks.size(), ngram_ports_.total_rows, ngram_ports_.row_bytes,
+                      static_cast<double>(ngram_ports_.total_rows * ngram_ports_.row_bytes) / (1u << 20),
+                      ngram::kTableTensor,
+                      static_cast<unsigned long long>(ngram_staging_geom_.table_rows),
+                      ngram_ports_.declares_ids ? "declared" : "absent",
+                      ngram_ports_.declares_conv_mask ? "declared" : "absent");
+        } else {
+            const auto     t0   = std::chrono::steady_clock::now();
+            const uint8_t* base = gguf_file_->data(*t);
+            size_t         off  = 0;
+            for (const auto& chunk : ngram_ports_.chunks) {
+                const ov::Shape sh{chunk.rows, ngram_ports_.row_bytes};
+                ov::RemoteTensor rt = rctx.create_tensor(
+                    ov::element::u8, sh,
+                    {{ov::intel_gpu::shared_mem_type.name(), ov::intel_gpu::SharedMemType::USM_HOST_BUFFER}});
+                void* dst = rt.get_params().at(ov::intel_gpu::mem_handle.name()).as<void*>();
+                std::memcpy(dst, base + off, chunk.rows * ngram_ports_.row_bytes);
+                off += chunk.rows * ngram_ports_.row_bytes;
+                for (auto& lane : lanes_) lane->req.set_tensor(chunk.name, rt);
+                ngram_table_tensors_.push_back(std::move(rt));
+            }
+            log::info("load",
+                      "ngram table bound: %zu port(s), %zu rows x %zu B = %.2f GiB of USM host memory "
+                      "from %s in %.1f s; id ports %s, conv_mask %s; hash ordinal 0",
+                      ngram_ports_.chunks.size(), ngram_ports_.total_rows, ngram_ports_.row_bytes,
+                      static_cast<double>(off) / (1u << 30), ngram::kTableTensor, seconds_since(t0),
+                      ngram_ports_.declares_ids ? "declared" : "absent",
+                      ngram_ports_.declares_conv_mask ? "declared" : "absent");
         }
-        log::info("load",
-                  "ngram table bound: %zu port(s), %zu rows x %zu B = %.2f GiB of USM host memory "
-                  "from %s in %.1f s; id ports %s, conv_mask %s; hash ordinal 0",
-                  ngram_ports_.chunks.size(), ngram_ports_.total_rows, ngram_ports_.row_bytes,
-                  static_cast<double>(off) / (1u << 30), ngram::kTableTensor, seconds_since(t0),
-                  ngram_ports_.declares_ids ? "declared" : "absent",
-                  ngram_ports_.declares_conv_mask ? "declared" : "absent");
     }
 
     // The per-forward feeds the ports need: the hashed rows of this chunk's
@@ -8189,7 +8245,18 @@ private:
         const std::vector<int64_t> global = ngram::row_ids(*ngram_hash_, lane.ngram_ctx, tokens);
         std::vector<int32_t> chunk;
         std::vector<int64_t> local;
-        ngram::split_by_partition(global, ngram_ports_, chunk, local);
+        if (ngram_staging_active_) {
+            // one staging port: fill it with exactly the rows this forward
+            // names, then index it by the slot the plan assigned (local[i] = i)
+            void* dst =
+                ngram_staging_tensor_.get_params().at(ov::intel_gpu::mem_handle.name()).as<void*>();
+            local = ngram::stage_from_file(ngram_staging_fd_, ngram_staging_base_,
+                                           ngram_staging_geom_.row_bytes, global,
+                                           ngram_staging_geom_, static_cast<uint8_t*>(dst));
+            chunk.assign(local.size(), 0);
+        } else {
+            ngram::split_by_partition(global, ngram_ports_, chunk, local);
+        }
         const size_t heads = static_cast<size_t>(ngram_hash_->num_ngram_heads());
         if (ngram_ports_.declares_ids) {
             ov::Tensor ct(ov::element::i32, ov::Shape{1, n, heads});

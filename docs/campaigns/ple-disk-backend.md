@@ -213,3 +213,32 @@ campaign's numeric gate in device-free form.
   the one coordinated card window. The mechanism is implemented and proven
   device-free; the served acceptance needs a card and must not run beside
   another `arcint` leg.
+
+- 2026-09-23 — **the wiring landed: the emitter can declare a staging window, and
+  the runtime fills it per forward.** [code; `measured-here` for the cells]
+  - **Emitter** (`tools/q4e/serving_shape.py`): `build_serving_shape_ir(...,
+    ngram_staging_rows=N)` passes the STAGING BOUND to `ngram_table_ports`
+    instead of the table's row count, so the IR declares ONE `ngram_table.0`
+    port of `[N, 90]` — deliberately SMALLER than the source tensor, which is
+    exactly how `bind_ngram_ports` recognises staging. The report carries
+    `ngram_staging_rows` beside the unchanged `ngram_table_rows`. Two cells in
+    `tests/python/test_serving_shape.py`: the staging shape, and the regression
+    half (no bound -> the ports still cover the whole table). **RED-FIRST
+    MEASURED:** against the unpatched emitter both cells FAIL (`2 failed`); with
+    it they PASS (`2 passed`); the full suite is **36 passed, 1 skipped**.
+  - **Runtime** (`src/exec/backend_ov.cpp`): `bind_ngram_ports` recognises a
+    single port whose row count is below the source's, validates it with
+    `check_staging_geometry`, opens the GGUF path for `pread`, allocates ONE
+    `[S, row_bytes]` USM-host staging tensor, and SKIPS the full-table copy;
+    `feed_ngram_ports` then stages exactly the rows this forward names
+    (`ngram::stage_from_file`, slot `i` = the `i`-th named row) and feeds the
+    slot ids with chunk id 0. **Compile-verified with the production flags:**
+    `-fsyntax-only` against the OpenVINO toolchain returns **rc = 0 with no
+    diagnostics** under `-Wall -Wextra -Wpedantic`.
+  - **Still open, unchanged: the served card window.** Byte-identical answer
+    staged vs pinned, the freed host RAM measured (the 26.82 GiB term off the
+    ledger), and the load-time copy gone. It needs a card and must not run
+    beside another `arcint` leg. The acceptance is a numeric gate: a difference
+    BLOCKS the change. Until that window runs, the pin is still what the served
+    path does — the staging path is implemented and proven device-free, not yet
+    served.

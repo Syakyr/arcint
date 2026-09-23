@@ -1160,7 +1160,8 @@ def _ple_state(arena, config, layer=None, feed=None, census=None):
 def build_serving_shape_ir(config=None, arena=None, n_layers=None,
                            filler=None, feed=None,
                            ngram_chunk_cap_bytes=NGRAM_CHUNK_CAP_BYTES,
-                           rope_span=None, layer_range=None, expert_ports=None):
+                           rope_span=None, layer_range=None, expert_ports=None,
+                           ngram_staging_rows=None):
     """The full-geometry serving-shape backbone as an ov::Model, DYNAMIC IN T
     (feed-the-ports increment): no port, reshape or slice carries the block
     length. `T` below is the runtime token count of a forward.
@@ -1334,7 +1335,16 @@ def build_serving_shape_ir(config=None, arena=None, n_layers=None,
                           if hasattr(cfg, "ngram_total_vocab")
                           else pwe.REAL_GEOMETRY["ngram_total_vocab"])
             row_bytes = ngram_row_bytes(head_dim)
-            table_ports = (ngram_table_ports(ngram_rows, row_bytes,
+            # The port's row count is the STAGING BOUND when the caller asks for
+            # the disk-backed path (campaign `ple-disk-backend`): one port of
+            # `max_tokens x Hn` rows that the runtime fills per forward by
+            # `pread`, instead of one port spanning the whole table. The source
+            # tensor still has to be the full table -- that is admission's
+            # business -- so the port is deliberately SMALLER than the source,
+            # which is exactly how `bind_ngram_ports` recognises staging.
+            port_rows = (int(ngram_staging_rows) if ngram_staging_rows
+                         else ngram_rows)
+            table_ports = (ngram_table_ports(port_rows, row_bytes,
                                              ngram_chunk_cap_bytes)
                            if has_ple else [])
 
@@ -1452,6 +1462,8 @@ def build_serving_shape_ir(config=None, arena=None, n_layers=None,
             # the cap they were cut under. Not counted in graph_const_bytes --
             # it is not a constant any more, which is the point.
             "ngram_table_rows": int(ngram_rows),
+            "ngram_staging_rows": (int(ngram_staging_rows)
+                                   if ngram_staging_rows else None),
             "ngram_row_bytes": int(row_bytes),
             "ngram_chunk_cap_bytes": int(ngram_chunk_cap_bytes),
             "ngram_table_ports": [
