@@ -794,3 +794,30 @@ the `AW_IOC_STATS` delta: `measured-here` (B60). The scale/zp layout divergence:
 `code`. The store's synthetic content: `measured-here`. arcwell's 1.125 ms /
 2.91 GB/s / submit comparands: arcwell's own `measured-here`, labelled. The
 store-layout resolution and the gate: **OWED**.
+
+---
+
+## LISBON-001 — the acceptance commit, criteria pinned, rows EMPTY (2026-09-23)
+
+[`code` for the threshold; `measured-here` for cited inputs; NO measurement]
+`docs/window-053.md` is 0.5.3's acceptance commit, written before the LISBON
+card window exists. It pins the campaign gate's three rows — cold TTFT
+(arcwell vs host-fed, both arms in one window, arcwell at or below host-fed,
+**absolute threshold `X = 139.5 s`**) at a **depth-4** scope on the B60, RSS
+bounded through boot (`wait4` child `ru_maxrss` ≤ **32 GiB**, CF-KEYSTONERSS),
+and restart determinism (two cold boots, digest form) — and leaves every
+measured cell **EMPTY**. `X = T_boot 136 s + T_fill 0.387 s + T_prefill
+3.08 s`, all terms sourced (`code` byte counts over `measured-here` inputs);
+arcwell's 2.91 GB/s is used only as a labelled projection. Full depth is
+flagged as an **operator decision**, not assumed.
+
+**The gate is recorded as BLOCKED, not measurement-ready.** The ext4 expert
+store is synthetic arcwell test data (one repeated 4096-byte block, no expert
+tensors, no scales/zp), so nothing can be filled correctly today; the
+scales/zp store-layout precondition (device `[group][oc]` vs file `[oc][group]`)
+is **OWED to the artifact-format step**; and the D2/D3 consumer integration does
+not exist. The three gate rows stay **OPEN**. The harness the measurement will
+use is named in `docs/window-053.md` (served binary + `ov-0047`, OTD_PERF
+plateau probe, the arcwell `aw_fill_budget` client with an `AW_IOC_STATS`
+delta, `os.wait4`/`ru_maxrss`, the SOP physical-host sampler, `--fit-ledger-dir`).
+No card leg, no module load, no store mutation, no wake lock.
