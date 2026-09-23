@@ -290,6 +290,11 @@ the load is refused (Case 2).
 `AW_IOC_READ_BLOCKS` on the decode path is **refused by arcint's own code**
 (the campaign's red-first requirement), so the losing configuration cannot be
 reached by accident. That cell is not written in this leg.
+[DATED IN PLACE 2026-09-23, D2/D3 integration leg: the cell is written. It is
+`pinned_nvme_fill_refuses_a_synchronous_read_on_the_decode_path` in
+`tests/test_pinned_nvme_fill.cpp`, backed by `require_no_sync_read()` in
+`src/exec/pinned_nvme_fill.h` (the plugin twin in patch `0048`), and it is
+mutation-tested: removing the guard makes it fail.]
 
 ---
 
@@ -485,3 +490,20 @@ confirmation.
   Dependency 1–2 of `docs/window-053.md` are cleared; §7 item 4 (the gate)
   and the D2/D3 consumer integration stay **OWED**. No card leg, no module
   load; the synthetic store was not touched.
+- 2026-09-23, later — **D2/D3 integration leg: the schedule is wired and
+  compile-verified plugin-side (patch `0048`); the byte destination stays
+  OWED.** The load-time pinned fill's schedule now lives in the plugin's
+  `OffloadExpertWeightProvider` — one batch per layer, four batches in flight
+  over the arcwell batch surface, collect→`set_filled`, a load barrier that
+  retries once then REFUSES (never a silent demotion), and the red-first guard
+  refusing a synchronous `AW_IOC_READ_BLOCKS` on the decode path. The schedule
+  is tracked device-free as `src/exec/pinned_nvme_fill.h` and tested by
+  `tests/test_pinned_nvme_fill.cpp` (8 cells green; 3 mutants each fail their
+  named cell); patch `0048` applies on the full 0003–0048 series and compiles
+  clean. But the note's D2 presupposes a device destination: the static
+  partition's slots are host-mapped (`device_slot_buffers=0`, B60 probe) and
+  arcwell needs a dma-buf from an xe VRAM BO, so there is no BO for the fill to
+  land in. The transport and the per-expert dma-buf BO-backed slot destination
+  are OWED, and an enabled fill refuses the load. §7 item 4 (the gate) and the
+  three gate rows stay OWED/OPEN. No card leg, no module load; the arcwell
+  module was found loaded/carved and left as found.

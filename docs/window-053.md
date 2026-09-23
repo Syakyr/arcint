@@ -286,11 +286,28 @@ things block it today. Every one is recorded, not worked around.
    2.71 GB/s at 71 experts; `via_host_bounce` delta 0), but the D2/D3
    integration that runs it inside the serving loop is **OWED**. The
    "serving step with the fill overlapping" has no number.
+   [PARTLY ADDRESSED 2026-09-23, D2/D3 integration leg — dependency 3 STANDS.
+   The schedule now exists and is wired plugin-side in patch `0048` (one batch
+   per layer, four in flight, collect→`set_filled`, a load barrier that retries
+   once then REFUSES, and a red-first guard refusing a synchronous
+   `AW_IOC_READ_BLOCKS` on the decode path); it applies on the full 0003–0048
+   series and compiles clean, and its 8-cell ladder plus 3 mutants is green/red
+   as designed. But the fill cannot LAND: the static partition's slot buffers
+   are host-mapped (the B60 probe's `device_slot_buffers=0`) and arcwell
+   requires a dma-buf from an xe VRAM BO, so there is no destination a
+   byte-transparent fill can land in. The transport and the per-expert
+   dma-buf BO-backed slot destination are OWED, and with them the "serving
+   step with the fill overlapping" number. See the campaign's "D2/D3 consumer
+   integration" section.]
 
 **Consequence:** the three rows stay **OPEN**. [UPDATED 2026-09-23,
 artifact-format step: dependencies 1 and 2 are CLEARED, so the gate is no
 longer blocked on "nothing can be filled correctly". It is now blocked ONLY on
 dependency 3, the D2/D3 consumer integration, with its three rows still OPEN.]
+[UPDATED 2026-09-23, D2/D3 integration leg: dependency 3 STANDS — the schedule
+is built, wired and compile-verified (patch `0048`), but there is no dma-buf
+VRAM destination for the fill, so nothing lands and the overlapping-step number
+still does not exist. The three rows stay OPEN.]
 The gate's own bytes cannot be laid down. This document is the criteria, not a
 measurement.
 
@@ -379,3 +396,19 @@ paths, lock, raw output) live only in the git-ignored packet
   integration. No card leg, no module load, no wake lock; the arcwell module was
   found loaded/carved (inherited) and left as found; the synthetic store was
   not touched.
+- 2026-09-23, later — **D2/D3 integration leg: the schedule is built, wired and
+  compile-verified; dependency 3 STANDS.** Patch `0048` adds the load-time
+  pinned-fill schedule plugin-side (one batch per layer, four in flight,
+  collect→`set_filled`, a load barrier that retries once then REFUSES, and a
+  red-first guard refusing a synchronous `AW_IOC_READ_BLOCKS` on the decode
+  path), tracked device-free as `src/exec/pinned_nvme_fill.h` and tested by
+  `tests/test_pinned_nvme_fill.cpp` (8 cells green; 3 mutants each fail their
+  named cell). It applies on the full 0003–0048 series and compiles clean with
+  the production target. But the fill cannot LAND: the static partition's slot
+  buffers are host-mapped (B60 probe `device_slot_buffers=0`) and arcwell needs
+  a dma-buf from an xe VRAM BO, so the per-expert dma-buf BO destination and
+  the arcwell transport are OWED, and an enabled fill refuses the load. The
+  three gate rows stay **OPEN**; the gate is now blocked on the BO-backed slot
+  destination, not on a missing schedule. No card leg, no module load, no wake
+  lock, no store/host mutation; the arcwell module was found loaded/carved and
+  left as found.

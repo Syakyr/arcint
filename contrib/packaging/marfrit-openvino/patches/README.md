@@ -1025,6 +1025,13 @@ then the GPU-dispatch counter, rate and correctness.
 
 ## Deliberately NOT applied
 
+> [CORRECTED 2026-09-23: only **0001** and **0002** below are genuinely not
+> applied — they live at the repository top level and not in this directory,
+> so `build-openvino.sh`'s `patches/*.patch` glob skips them. **0046**, **0047**
+> and **0048** are in this directory and ARE applied by that glob, in numeric
+> order. The heading above is stale for those three entries; they are kept in
+> place with this date rather than moved, so the correction stays visible.]
+
 These live in the arcint repository's `patches/` as records of measurements.
 They are listed here so that nobody re-derives the decision by trying them.
 
@@ -1159,6 +1166,62 @@ takes 845 s on the 24 GB card — the residual stall is the CPU
 tier's scalar native decode during the load-time probe (seven
 `moe_cpu_expert` threads at ~90% CPU), not a JIT (no `ocloc`/`llvm-spirv`
 child) and not a deadlock; it terminates.
+
+### 0048-moe-otd-pinned-nvme-fill.patch
+
+The load-time pinned NVMe fill's schedule, wired into the static partition
+(campaign `docs/campaigns/nvme-direct-expert-tier.md`, design note
+`docs/design-nvme-direct-expert-tier.md` D2/D3). Membership is the pinned set
+patch 0018/0046 already fixes at `bind()`; the fetch is arcwell's batch
+surface (`AW_IOC_SUBMIT_BATCH` / `AW_IOC_BATCH_WAIT`), one batch per MoE
+layer, four batches in flight, collected and marked filled before the first
+routed call. There is **no fetch on the decode path**.
+
+New file `pinned_nvme_fill.hpp` (deliberately OpenVINO-free): the schedule —
+an injected `Transport` with setup/submit/collect and no synchronous read
+primitive, a `Scheduler` at depth 4 that fills the window before collecting
+the oldest, retries a short batch once, and REFUSES the load (never a silent
+demotion to the host tier) if a pinned expert is still not landed. It is the
+byte-identical twin of arcint's tracked `src/exec/pinned_nvme_fill.h`, checked
+by `tests/test_pinned_nvme_fill.cpp`, which is the one the device-free ladder
+tests.
+
+`expert_weight_providers.{hpp,cpp}`: the env opt-in `MOE_OTD_PINNED_NVME_FILL`
+(read once at construction, inert when unset); `reserve_static_partition()`
+factorised out of `bind()` so the coordinator can reserve every layer's slots
+before it marks them filled; `pinned_nvme_fill_batch()` (this layer's pinned
+membership as one batch); and `apply_pinned_nvme_fill_slot()` (the cache
+`set_filled(slot)` the note's §3.4 requires on collect). A translation-unit
+global coordinator starts at the first layer's `bind()`, enumerates the live
+providers in structural `layer_key` order, and runs the barrier. A failure
+anywhere in setup or the barrier throws — a load failure, per D3.
+
+`require_no_sync_read()` is the campaign's own red-first guard: a would-be
+synchronous `AW_IOC_READ_BLOCKS` is refused once serving has begun, so the
+losing configuration cannot be reached.
+
+MEASURED (2026-09-23, device-free): the patch applies cleanly to a pristine
+checkout of the pin **through the full sequential series 0003–0047**
+(`git apply --check` + apply, 45/45 then 0048), and compiles clean against the
+0047 tree (`ninja openvino_intel_gpu_plugin`, rc 0; only
+`expert_weight_providers.cpp` and `moe_3gemm_swiglu_opt.cpp` rebuilt). The
+schedule's ladder is 8 cells green in `tests/test_pinned_nvme_fill.cpp`; three
+mutants (guard removed, refusal replaced by a silent fill, depth ignored) each
+fail their named cell — raw output in the campaign's evidence packet. The
+version stamp stays at `marfrit-p19` (disclosed, the same as 0046/0047): the
+0048 plugin is identified by its `MOE_OTD_PINNED_NVME_FILL` / `pinned NVMe fill`
+symbols, not the stamp.
+
+**OWED, stated not faked.** The `Transport` has no production implementation
+in this patch: under the static partition the expert slot pool is host-mapped
+(`MOE_OTD_PERF_LOG` reports `device_slot_buffers=0`), and arcwell requires a
+dma-buf from an xe VRAM BO, so there is no destination a byte-transparent fill
+can land in yet. The per-expert dma-buf BO the artifact-format step named as
+the D2/D3 contract, the arcwell ioctl transport, and the card validation are
+OWED. Until they exist, an ENABLED `MOE_OTD_PINNED_NVME_FILL` refuses the load
+with that reason — exactly the note's "arcwell cannot be set up at all is a
+load failure" rule. With the env unset, patch 0018/0046/0047 behaviour is
+unchanged.
 
 ## Not carried either: the measurement instrument
 

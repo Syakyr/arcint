@@ -1006,3 +1006,178 @@ runs). The store's geometry, extent count, raw-device verification and
 byte-exactness: `measured-here` on the ext4 partition. The seed and pinned-set
 arithmetic: `code` (patch 0018; patches 0041/0047). The gate and the consumer
 integration: **OWED**.
+
+---
+
+## D2/D3 consumer integration — the load-time pinned fill's schedule, wired plugin-side; the byte destination OWED (2026-09-23)
+
+[`code` + `measured-here`; NO card leg, NO module load, NO expert-store
+mutation, NO host/store change. The arcwell module was found loaded and carved
+(the B60 probe's inherited state, re-confirmed on the card host) and was left
+as found. Cards idle.] This leg builds the D2/D3 consumer the design note
+schedules — the last item between the real store and the LISBON gate — and
+records, without smoothing, the one part that cannot land yet.
+
+### 1. Where it lives, and why: plugin-side provider
+
+The design note's §3.4 fixes the handshake in the **plugin**: an expert the
+batch surface collected "must call the cache's `set_filled(slot)`"
+(`code`: patch 0018). The pinned membership is also plugin-side
+(`static_partition_resident_experts`, patch 0018; the census seed, patch 0046),
+and the slot the fill must mark is the plugin's LRUCache slot. So the
+integration is **plugin-side**, in `OffloadExpertWeightProvider` — not an
+arcint-side runtime that would have to reach into the plugin's cache through a
+new interface. The schedule's contract is tracked device-free as
+`src/exec/pinned_nvme_fill.h` (the header the arcint test ladder exercises) and
+shipped to the plugin byte-identically as `moe/pinned_nvme_fill.hpp` in patch
+0048, because the plugin build cannot see `src/exec` (`code`; a drift-guard
+cell asserts the two copies are byte-identical).
+
+### 2. The scheduled behaviour (what the cells pin)
+
+`paper` + `code`. Membership is taken once at `bind()` from the static
+partition — never re-derived from live traffic (RED-C-02's finding). The
+schedule is:
+
+- **One batch per layer.** `FillBatch` is one MoE layer's pinned set (71
+  requests at ratio 86, 128 at ratio 75; both under `AW_BATCH_MAX = 256`).
+- **Four batches in flight.** The `Scheduler` fills the window to depth 4
+  before collecting the oldest, so the NVMe queue depth is used (the note's
+  measured four-overlap shape).
+- **Collect marks filled.** Every request of a fully collected batch calls the
+  caller's `on_filled`, wired to `LRUCache::set_filled(slot)`, so the existing
+  first-use `fill_weights_memory` branch never fires on the decode path.
+- **No fetch on the decode path.** The `Transport` interface exposes only
+  setup/submit/collect; it has no synchronous read. `require_no_sync_read()`
+  refuses a would-be synchronous `AW_IOC_READ_BLOCKS` once serving has begun.
+- **A short batch is retried once, in full, then REFUSED.** Partial completion
+  does not name which request landed, so the whole layer is re-issued; if it is
+  still short, the barrier returns false with a reason naming the layer, and
+  nothing from that layer is marked filled. **The refusal is terminal** — the
+  phase becomes `kRefused`, and a second barrier refuses too, so a partially
+  filled configuration can never resume into serving. No silent demotion to the
+  host tier — a demoted expert would make this boot's residency differ from a
+  clean boot and break the byte-identity the gate measures across two cold
+  boots (§3.4).
+- **Setup failure is a load failure.** If arcwell cannot be set up at all, the
+  barrier refuses for the whole configuration; there is no host-bounce path.
+
+In the plugin, a translation-unit global coordinator starts at the first
+layer's `bind()`, enumerates the live providers in structural `layer_key`
+order (not the run-to-run construction permutation), reserves every layer's
+slots first (a layer whose own `bind()` has not run has no pinned slot to
+mark), then runs the barrier. Any failure throws — a load failure, per D3. The
+whole path is opt-in (`MOE_OTD_PINNED_NVME_FILL`); unset, patch
+0018/0046/0047 behavior is unchanged.
+
+### 3. The byte destination is OWED — measured, not guessed
+
+`measured-here` (B60 probe, carried) + `code`. The note's D2 presupposes a
+per-expert **device** destination: arcwell's contract is a dma-buf exported
+from an xe VRAM BO (`code`: `aw_uapi.h`, `USING_ARCWELL.md` §6), and the
+artifact-format step named "the per-expert device BO is the concatenated
+record" as the D2/D3 contract (not an existing device layout). But under the
+static partition the plugin's expert slot pool is **host-mapped**: the B60
+probe's own `[OTD_PERF]` line reads `device_slot_buffers=0` at both ratio 86
+(71 slots) and ratio 83 (87 slots), with `host_slot_buffers=382` and the
+0.37 GiB device term a small working set against a 7.91 / 9.67 GiB host-side
+ceiling (`measured-here`, this campaign's B60 probe section). The slot buffers
+are `allocation_type::usm_host` (`code`: `moe_otd_runtime.cpp`), so there is no
+dma-buf VRAM BO for the fill to land in, and arcwell has no host-bounce path by
+design. **The transport therefore has no production implementation in this
+patch.** An enabled fill refuses the load with that reason — exactly the note's
+"arcwell cannot be set up at all is also a load failure" rule — and the three
+gate rows stay OPEN.
+
+**OWED, named and not faked:** the per-expert dma-buf BO-backed slot
+destination, the arcwell ioctl `Transport`, the integrated serving step with
+the fill overlapping, and the card validation of the D2/D3 wiring (design note
+§7). None of these is discharged here.
+
+### 4. Deliverable 1, build evidence
+
+`measured-here`. Patch
+`patches/0048-moe-otd-pinned-nvme-fill.patch`, sha256
+`3f94609c7e8ccacdca81b39c8625cd205e40e0667248bb6f008338749c419347`, mirrored
+byte-for-byte into the packaging series. It applies cleanly to a **pristine
+checkout of the pin through the full sequential series 0003–0047** and then
+0048:
+
+```
+$ for p in .../patches/*.patch; do git apply --check "$p" && git apply "$p"; done
+applied 0003-...  ...  applied 0047-moe-per-expert-slot-pool-size.patch
+$ git apply --check /.../0048-moe-otd-pinned-nvme-fill.patch && git apply ...
+0048 APPLIED on the full sequential series
+$ git status --porcelain | grep pinned_nvme
+ M src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.cpp
+ M src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/expert_weight_providers.hpp
+?? src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/pinned_nvme_fill.hpp
+```
+
+Compile-verified against the 0047 tree with the production target (rc 0; the
+two changed TUs plus the include-dependent `moe_3gemm_swiglu_opt.cpp`):
+
+```
+$ ninja openvino_intel_gpu_plugin
+[2/6] Building CXX object .../moe/expert_weight_providers.cpp.o
+[3/6] Building CXX object .../moe/moe_3gemm_swiglu_opt.cpp.o
+[4/6] Linking CXX static library .../libopenvino_intel_gpu_graph.a
+[5/6] Linking CXX shared module .../libopenvino_intel_gpu_plugin.so
+```
+
+No card leg; nothing was installed; the working tree was restored to its
+0047 state after the check.
+
+### 5. Deliverable 2/3 — the red-first cells and their mutation evidence
+
+`measured-here`, device-free. New `tests/test_pinned_nvme_fill.cpp`
+(`code`), sha256 `c9a76a96077b664ac16ed57af41e018e1bc93ce2552c97d76c06ad77301f7596`,
+built into `arcint-test` (`build` tree, stub backend — the schedule is pure
+C++). **8 cells green**:
+
+```
+$ ./arcint-test pinned_nvme_fill
+8 cases run, 0 failed, 0 skipped
+```
+
+The two cells the campaign names:
+
+- `pinned_nvme_fill_refuses_a_synchronous_read_on_the_decode_path` — the
+  losing configuration: `require_no_sync_read` does not throw during the load
+  phase and **does** throw once the barrier has advanced to serving.
+- `pinned_nvme_fill_refuses_a_pinned_expert_that_never_lands` — the barrier
+  returns false, names the layer, never marks that layer's requests filled, and
+  becomes terminally refused (`kRefused`); exactly one retry is issued, and a
+  second barrier call refuses rather than resuming.
+
+Batch accounting (`one_batch_per_layer`, `holds_four_batches_in_flight`) and
+the collect→filled transition (`collect_marks_filled` in the one-batch cell;
+retry-then-land in `short_batch_is_retried_then_lands`) are pinned beside them.
+
+**Mutation evidence** (raw in the evidence packet; each mutant edits the
+tracked header in place, rebuilds, runs the named cell, restores the header
+byte-identically):
+
+| mutant | named cell | result |
+|---|---|---|
+| `require_no_sync_read` guard removed (no throw) | `refuses_a_synchronous_read_on_the_decode_path` | **1 failed** (`expected: threw_serving`) |
+| refusal replaced by a silent fill (`on_filled` for every batch, return true) | `refuses_a_pinned_expert_that_never_lands` | **1 failed** (barrier true; layer 3 filled; phase serving) |
+| depth gate ignored (submit all before collecting) | `holds_four_batches_in_flight` | **1 failed** (`max_inflight` 10, expected 4) |
+
+### 6. What this changes
+
+`docs/window-053.md` dependency 3 ("the consumer does not exist") is **partly**
+answered: the schedule exists, is wired into the plugin's `bind()`/load
+barrier, applies on the full series, and compiles; the red cell the campaign
+named is written and mutation-tested. But the fill cannot LAND — no
+transport, no BO destination — so the gate's "serving step with the fill
+overlapping" still has no number. Dependency 3 therefore **stays standing**,
+updated in place with this date, and the three rows stay OPEN. The gate is now
+blocked on the dma-buf BO-backed slot destination, not on a missing schedule.
+
+**Evidence classes, this leg.** Placement and the schedule (batch count, depth,
+collect, refusal, guard): `paper` (design note §3/§4) + `code` (patch 0048,
+`src/exec/pinned_nvme_fill.h`). The destination finding: `measured-here` (B60
+probe's `device_slot_buffers=0`) + `code` (`aw_uapi.h`; `moe_otd_runtime.cpp`).
+The patch/apply/compile evidence and the cell ladder: `measured-here`. The BO
+destination, transport and card validation: **OWED**.
