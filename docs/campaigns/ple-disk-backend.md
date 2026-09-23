@@ -243,6 +243,106 @@ campaign's numeric gate in device-free form.
     path does — the staging path is implemented and proven device-free, not yet
     served.
 
+  **[DATED IN PLACE 2026-09-23: the served window RAN and the gate PASSED —
+  see the entry below. The paragraph above stands as the pre-window state.]**
+
+- **2026-09-23 (served acceptance — GATE PASSES, `measured-here`).** Scope
+  approved as depth-4 (the n-gram mechanism is depth-independent). One card,
+  one binary, one fresh process per arm.
+
+  **The confound found first, and why a twin was required.** The obvious pinned
+  arm is the stale pinned artifact `qwen38-flash-next-d4-ov` (window-050 §4.9, tree `wt+6743ffb`,
+  `lm_xml_sha 2910a860bf9dc6bb`). Diffing its `config.json` against the staged
+  artifact's showed two extra keys in the staged one:
+  `"output_gate_type": "sigmoid"` and `"gdn_key_head_map": "tiled"` — the
+  corrected fill (DESIGN §7.0.2bz), absent from the stale 2026-09-13 artifact.
+  A staged-vs-stale comparison would have measured the backbone, not the PLE.
+  So a **pinned twin** was exported from the SAME tree `0d9bb3d`, with the SAME
+  corrected fill, differing ONLY in the n-gram ports:
+
+      artifact alias `qwen38-flash-next-d4p-ov`  --ngram-staging-rows omitted
+        ports ['ngram_table.0'..'ngram_table.6'] (47718400 rows each; last 33691136)
+        lm_xml_sha 9a65886dc653e0ad, lm_bin_bytes 9270599581
+        export: build 595.4 s + save 64.4 s + hash 15.0 s, peak host 20.11 GiB
+      artifact alias `qwen38-flash-next-d4s-ov`  --ngram-staging-rows 33600
+        ports [['ngram_table.0', 33600, 3024000]]
+        lm_xml_sha 823997733f0b4b07, lm_bin_bytes 9270599557
+
+  Their `config.json` files are `CONFIG_IDENTICAL`; the two differ only in the
+  n-gram port partition. (The stale d4-ov pinned arm was also run as a
+  cross-check and returned `c983da7e…`; that is the pre-correction answer and is
+  **discarded for gate purposes**, kept only to show the fill is what moved.)
+
+  **Setup.** The serving binary built from the scratch qfndev tree (`wt-ple`) sha256
+  `a6dac5b57cc5fa40` (carries the staging branch; both arms on this ONE binary).
+  The measurement plugin prefix sha256 `b2754b8fe8a9b89b`.
+  Card GPU.1 = PCI `8086:56a0` (Arc A770; DRM `card0`), identified by PCI id.
+  Flags identical for both arms: `--device GPU.1 --ngram-gguf <the checkpoint's
+  shard 2> --prefill-chunk
+  512 --n-ctx 8192 --parallel 1 --offload-ratio 99 --moe-cpu-tier --paged-kv u8
+  --no-logits-slice`. Prompt: the pinned capture (first 256 ids),
+  `max_tokens=32`, `temperature=0`, `ignore_eos=true`.
+
+  **Pinned-twin arm** (window log directory `ple-staging/pinned_twin/`), raw:
+
+      lgc  load: ngram table bound: 7 port(s), 320001536 rows x 90 B = 26.82 GiB
+           of USM host memory from per_layer_token_embd.weight in 37.5 s;
+           id ports declared, conv_mask declared; hash ordinal 0
+      SHA256_TEXT=d7f998cd8bff32d71a1b1b9153ad8874f5bff61d684c6fad268c3b1325ea5b8f
+      peak rss_kb=20753068 peak vmhwm_kb=20753160 min memavail_kb=31780445
+      physical-host window: min MemAvailable 10,368,488 KB = 9.89 GiB;
+           ZFS ARC fell 38.05 -> 10.15 GiB
+
+  **Staged arm** (window log directory `ple-staging/staged2/`), raw:
+
+      lgc  load: ngram table STAGED: 1 port(s) of 33600 rows x 90 B = 2.884 MiB
+           of USM host staging from per_layer_token_embd.weight (the 320001536-row
+           table stays on disk, read per forward); id ports declared, conv_mask
+           declared; hash ordinal 0
+      SHA256_TEXT=d7f998cd8bff32d71a1b1b9153ad8874f5bff61d684c6fad268c3b1325ea5b8f
+      peak rss_kb=5173232 peak vmhwm_kb=5178752 min memavail_kb=44706027
+      physical-host window: min MemAvailable 34,503,944 KB = 32.91 GiB;
+           ZFS ARC 25.28 -> 21.87 GiB
+
+  **The gate, row by row.**
+
+  | row | pinned twin | staged | verdict |
+  |---|---|---|---|
+  | answer digest | `d7f998cd…2ea5b8f` | `d7f998cd…2ea5b8f` | **PASS, byte-identical** |
+  | n-gram resident | 26.82 GiB USM host, 37.5 s copy | 2.884 MiB staging, no copy | **the 26.82 GiB term is off the ledger** |
+  | container VmRSS peak | 19.79 GiB (20,753,068 KB) | 4.85 GiB (5,173,232 KB) | Δ **14.86 GiB** |
+  | physical MemAvailable min | 9.89 GiB | 32.91 GiB | Δ **23.02 GiB** |
+
+  The numeric difference is **zero** on the gate; the staging change is invisible
+  under DESIGN §3.4 on this window. A difference would have been the finding; it
+  is not there.
+
+  **The one confound, stated rather than smoothed.** The FIRST staged run (before
+  the twin existed) returned `d7f998cd…` against the stale pinned artifact's
+  `c983da7e…`, i.e. a numeric difference. Reading `config.json` showed the cause
+  was the corrected backbone fill in the newly-exported artifact, not staging:
+  the corrected twin reproduces `d7f998cd…` exactly, so the difference belonged
+  to `output_gate_type`/`gdn_key_head_map`, not to the PLE. The stale arm is
+  retained in the window log directory for the record.
+
+  **Perf observation, not a defect:** the first staged arm's plateau probe/load
+  was cold-table-bound (props 370 s, request 56.5 s); re-run with the table pages
+  warm it was props 45 s, request 25.6 s, against the pinned twin's 155 s / 33.2 s.
+  The staged load is now FASTER than pinned. Dedup and io_uring remain out of
+  scope.
+
+  **Local, uncommitted, scratch-only:** the scratch tree's
+  `src/core/model_registry.cpp`
+  gained two entries (`qwen38-flash-next-d4s-ov`, `qwen38-flash-next-d4p-ov`) so
+  the served binary admits the two new basenames; the pinned `qwen38-flash-next-d4-ov`
+  entry and artifact are untouched. **Not committed** (operator-local window
+  scaffolding).
+
+  **Remaining open:** LISBON-001's RSS-bounded-through-boot cell is where the
+  freed 26.82 GiB is read; `ngram_table_rows` in the export manifest still
+  reports the source table's row count beside the staging port (by design).
+  io_uring, dedup, and multi-PLE-layer IRs stay out of scope.
+
 - 2026-09-23 — **the export entry point exposes the staging bound.**
   [code] `tools/export_serving_artifact.py` gained `--ngram-staging-rows N`, passed
   into `build_serving_shape_ir` at the export call site, so an artifact can be
