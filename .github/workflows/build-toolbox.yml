@@ -141,14 +141,14 @@ jobs:
 
       # The device-free smoke test already ran inside the build (stub +
       # /props). Re-run here against the final image before publishing the
-      # channel tag (kyuz0's immutable→channel discipline).
+      # channel tag (kyuz0's immutable→channel discipline). Must run INSIDE
+      # the container: the stub binds 127.0.0.1 in the container's netns,
+      # so a host-side curl has nothing to connect to (measured: run
+      # 35830030865, curl (7) after the stub logged 'listening').
       - name: Smoke test
         run: |
-          docker run --rm ${{ env.REGISTRY }}/${{ needs.ns.outputs.owner }}/arcint:build-${{ needs.ns.outputs.build_ts }} \
-            --stub --port 8090 &
-          sleep 3
-          curl -fsS http://127.0.0.1:8090/props > /dev/null
-          kill %1
+          docker run --rm --entrypoint bash ${{ env.REGISTRY }}/${{ needs.ns.outputs.owner }}/arcint:build-${{ needs.ns.outputs.build_ts }} \
+            -c '/usr/bin/arcint --stub --port 8090 & S=$!; sleep 2; curl -fsS http://127.0.0.1:8090/props > /dev/null; R=$?; kill $S 2>/dev/null; wait $S 2>/dev/null; exit $R'
 
       - name: Push immutable + channel tags
         run: |
