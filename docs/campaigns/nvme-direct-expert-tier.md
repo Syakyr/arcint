@@ -546,3 +546,50 @@ reference cell — plus the design note
 Every convergence number above: `measured-here` (device-free replay of the
 served window-004 trace). That the trace is Flash-Next's own served router:
 `measured-here` (provenance `run=venice-census-004`, depth 48, 512 experts).
+
+---
+
+## Design note — the prefetch schedule, the routing warning horizon, and the fallback (2026-09-23); a verdict on the miss tier
+
+[`code` + carried `measured-here`; device-free] The note is
+`docs/design-nvme-direct-expert-tier.md`. Its verdict, on the campaign's own
+condition:
+
+**The warning horizon is zero layers, so a router-driven NVMe fetch cannot pay;
+as a miss tier LISBON keeps the host hop.** The serving loop makes a layer's
+top-k ids host-visible only inside that layer's own MoE primitive hook
+(`code`: `patches/0012-…:932,941`; patch 0017 hoists the read into one round
+trip but does not move it earlier; patch 0037's prefill paths are the same
+shape; patch 0044's trace has this exact granularity). There is no graph-level
+pre-pass computing a future layer's router (`code`: searched the series; one
+router per layer, `patches/0019-…:284-297`). So the fetch can only be issued at
+the layer that already needs the expert — depth 0, against arcwell's own
+1.125 ms. That is the losing configuration the Known section already describes.
+
+**The one path the loop reaches is the load-time pinned fill.** The static
+partition's membership is a pure function of configuration fixed at `bind()`
+(`code`: patch 0018; patch 0046), so its warning is unbounded — the whole pinned
+set is known before the first token. The note schedules it there: one batch per
+layer (71 requests at ratio 86, 128 at ratio 75), 4 batches in flight over
+`AW_IOC_SUBMIT_BATCH`/`AW_IOC_BATCH_WAIT`, no fetch on the decode path. Whether
+that fill pays cold TTFT is a projection only (arcwell's own 2.91 GB/s applied
+to arcint's bytes: 0.20/2.88/5.19 s at ratios 99/86/75) — **arcwell's numbers,
+never arcint's** — and the gate decides.
+
+**The fallback.** Two cases, decided at load (`code`: `patches/0018-…:716-780,800-870`): an expert the partition marks **non-resident** takes the host tier, at the existing static-partition `probe()` branch (`kCpuTierSentinelSlot` on decode; `acquire_one` → `std::nullopt` → `moe_cpu_expert` on prefill). A **pinned** expert whose fetch has not landed by the load barrier is a **load failure** — retried at the barrier, then refused; it is **not** silently demoted, because a demotion would make that boot's residency differ from a clean boot and break byte-identity across cold boots. A synchronous arcwell read on the decode path is **forbidden** (the campaign's *Out*).
+
+**Fidelity, and what the note must not oversell.** FreeToken-faithful: the PLE
+disk backend and an O_DIRECT-friendly container (`code`:
+`~/src/FreeToken-ref/.../ple_disk.py`, `.../checkpoint/ftw.py`). **Not**
+FreeToken's way: the per-forward NVMe DMA tier — the reference's runtime miss
+tier is the CPU executor + host bank (`code`: `.../moe/host_banks.py`,
+`expert_banks.py`, `cpu_executor.py`), i.e. exactly the host hop this campaign
+keeps. The consumer is pinned once from an offline census, per `(seed ×
+regime)`, never averaged across regimes; criterion 4's literal hardware clauses
+(the plateau probe and the async-upload budget) and the gate remain **OWED**.
+
+**The next leg is specified in the note (§7):** the B60 probe measures the
+device-byte plateau/per-forward timing at the high-80s ratios and the
+async-upload budget inside one step, with `AW_IOC_STATS` as a delta
+(`via_host_bounce = 0`, `max_inflight > 1`). No card leg was run here; the B60
+was left idle and the expert store and module untouched.
