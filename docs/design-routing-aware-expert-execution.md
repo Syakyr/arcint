@@ -505,7 +505,7 @@ resident subset. The host dispatch for non-resident experts is unchanged.
 | MoE layers | 48 | config |
 | per-expert-layer bytes (int4) | 2,457,600 (2.34 MiB) | `3 × hidden × moe_intermediate × 0.5`, `measured-here` |
 | full expert pool | 56.25 GiB | `512 × 2,457,600 × 48` |
-| PLE table | 26.82 GiB | `measured-here`, must be DRAM-resident |
+| PLE table | 26.82 GiB on disk | `measured-here` (`docs/window-050.md` §4.8 R3). **DATED IN PLACE 2026-09-22:** the earlier cell said "must be DRAM-resident"; that is **one configuration, not a requirement**. The reference's own default stages rows from disk (`code`: `~/src/FreeToken-ref/python/freetoken/engine/config.py`:32 `ple_backend: str = "disk"`; `models/qwen4_exp/ple_disk.py` `DiskRowTable`), and arcint's port contract already carries the row ids host-side, so the table becomes a bounded per-forward staging buffer (`T x heads x 90 B`). Campaign: `docs/campaigns/ple-disk-backend.md`; design note `docs/design-ple-disk-backend.md`. |
 
 ### §5.2 — projected performance (from WP6b, all bandwidth-bound projections)
 

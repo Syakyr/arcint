@@ -959,7 +959,7 @@ config must pin it; the GPU plugin auto-drops KV to u4 the moment it sees
 | term | params | size | where |
 |---|---|---|---|
 | routed experts (48 layers × gate/up/down) | 120.80 B | **56.25 GiB** int4 | offload pool (device working set + host remainder) |
-| PLE n-gram table | 51.20 B | **26.82 GiB** IQ4_NL | host-resident (mmapped) |
+| PLE n-gram table | 51.20 B | **26.82 GiB** IQ4_NL | host-resident: `NGramLookup`'s mmap path is genuinely lazy (`MADV_RANDOM`, rows paged on demand), but the **SERVED** `bind_ngram_ports` path does an eager full copy of all 26.82 GiB into USM host and retains it — the deviation from the mmap, and one configuration, not a requirement (the reference default is `disk`, `code`: `config.py`:32). **DATED IN PLACE 2026-09-22:** see `docs/campaigns/ple-disk-backend.md`. |
 | attention + GDN projections/state | 3.00 B | 1.40 GiB int4 | device |
 | token_embd + lm_head | 1.27 B | 0.59 GiB int4 | device |
 | shared expert + norms + misc backbone | 0.68 B | 0.31 GiB int4 | device |
