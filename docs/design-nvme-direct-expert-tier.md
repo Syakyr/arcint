@@ -586,3 +586,18 @@ confirmation.
   `cpu_info()` parse) was diagnosed and worked around operator-locally; no
   tracked change. No new tracked code; the A770 was untouched and the wake lock
   was left held.
+- 2026-09-24, later — **the LISBON-001 gate window ran; §7 item 4's remaining
+  half is measured — both arms in one window (cold TTFT), the `wait4` RSS row,
+  and the two-cold-boot determinism row — with the arcwell arm's byte-identity
+  OWED because arcwell is B60-only.** One B60 window (plugin `ov-0049`, ratio
+  86, `unshare -rm` CPU-view workaround): cold TTFT arcwell **92.492 s** vs
+  host-fed **99.679 s**
+  at prefetch depth **4 batches in flight**, both ≤ `X = 139.5 s`; `AW_IOC_STATS`
+  arcwell delta `bytes +697,958,400`, `via_host_bounce 0→0`, `max_inflight 220`;
+  host-fed delta `bytes +0`; decode arcwell 4.1 t/s vs host-fed 3.4 t/s, no
+  regression. `os.wait4` child `ru_maxrss` **3.697 GiB** both arms, mid-run
+  VmHWM prefix ≤ `wait4`; PLE term staged at 2.884 MiB. Restart determinism on
+  the **A770 host-fed arm** is byte-identical across two cold boots
+  (`9a7e2e77…9f`); the **arcwell arm's determinism is OWED** (arcwell is
+  B60-only; D3's load barrier governs it). The miss-tier verdict is unchanged:
+  **LISBON keeps the host hop**. Record: `docs/window-053.md` rows 1–3.

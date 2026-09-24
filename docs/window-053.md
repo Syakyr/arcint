@@ -9,6 +9,13 @@ red-first; counts generated; comparisons to FreeToken pinned ONLY by our own
 measured runs.* The commit that fills a row is a measurement commit and pastes
 the raw output.
 
+[FILLED 2026-09-24: the three measured rows below are filled from the LISBON
+gate window — both B60 arms in one window (cold TTFT, `wait4`/`ru_maxrss`) and
+the A770 restart-determinism confirmation. The criteria as written 2026-09-23
+are unchanged; only the EMPTY cells moved. Every measured value carries
+`measured-here`; the raw command and output are pasted in each row and the full
+packet is in the git-ignored `docs/handoff-nvme-direct-expert-tier.local.md`. ]
+
 The markers are `docs/window-050.md`'s (`RUN@<sha>`, `RUN@wt+<sha>`,
 `RUN@unrecorded`, `DRY`, `UNTESTED`); a row with no marker is EMPTY, and EMPTY
 is the honest state of every measured column in this commit. Every disposition
@@ -94,7 +101,7 @@ arithmetic for the full-depth variant is printed separately in §1 and is
   plugin `ov-0047` (`f021de51b5812ee2`, patches 0003–0047), KV u8, the served
   binary named by sha in the measurement commit.
 
-## 1. Cold TTFT, nothing prebound — EMPTY
+## 1. Cold TTFT, nothing prebound — MEASURED 2026-09-24
 
 **The gate.** Both arms measured in one window on the cell above; the arcwell
 arm required to land **at or below** the host-fed arm; and the measured cold
@@ -151,13 +158,55 @@ the B60: pinned bytes `= 71 × 48 × 2,457,600 = 8,375,500,800 B`; `T_boot` =
 the operator can open the scale gate with a pinned number if they choose; it is
 **not** the acceptance threshold of this commit and is **not** assumed.
 
-| quantity | predicted (`code`) | measured |
+| quantity | predicted (`code`) | measured (2026-09-24) |
 |---|---|---|
-| arcwell arm cold TTFT, depth 4 | ≤ host-fed arm; ≤ 139.5 s | **EMPTY (pending measurement)** |
-| host-fed arm cold TTFT, depth 4 | ≤ 139.5 s | **EMPTY (pending measurement)** |
-| prefetch depth that achieves it | recorded | **EMPTY (pending measurement)** |
-| `AW_IOC_STATS` delta (`via_host_bounce`, `max_inflight`, `batches`, `batches_reads`, `segments`) | `via_host_bounce = 0`, `max_inflight > 1` | **EMPTY (pending measurement)** |
-| decode t/s at the reference cell, both arms | must not regress vs the measured host-tier baseline (`docs/window-052.md`: 0.5–0.8 t/s B60; 0.526 t/s A770 same-day host comparand) | **EMPTY (pending measurement)** |
+| arcwell arm cold TTFT, depth 4 | ≤ host-fed arm; ≤ 139.5 s | **92.492 s** (`measured-here`) |
+| host-fed arm cold TTFT, depth 4 | ≤ 139.5 s | **99.679 s** (`measured-here`) |
+| prefetch depth that achieves it | recorded | **4 batches in flight** — one batch per layer over the 4 depth-4 layers (`code`: patch `0049`, `lgc::nvme_fill::Scheduler(transport, /*depth=*/4)`); the per-arm counter is `batches +4`, and `max_inflight` is module-global reading **220**, a high-water inherited from the warm-up leg (`measured-here`) |
+| `AW_IOC_STATS` delta (`via_host_bounce`, `max_inflight`, `batches`, `batch_reads`, `segments`) | `via_host_bounce = 0`, `max_inflight > 1` | arcwell arm: `bytes +697,958,400`, `reads +852`, `segments +871`, `batches +4`, `batch_reads +852`, `via_host_bounce 0→0`, `max_inflight 220` (`measured-here`); host-fed arm: `bytes +0`, no arcwell traffic |
+| decode t/s at the reference cell, both arms | must not regress vs the measured host-tier baseline (`docs/window-052.md`: 0.5–0.8 t/s B60; 0.526 t/s A770 same-day host comparand) | arcwell **4.1 t/s** (32 tok in 7.76 s) vs the same-window host-fed **3.4 t/s** (32 tok in 9.28 s) — no regression (`measured-here`; the `window-052` 0.5–0.8 t/s figure is a different depth/artifact comparand, not this cell's control) |
+
+**Raw evidence (`measured-here`, the whole row).** Card B60 (`GPU.0`, PCI
+`8086:E211`); artifact `qwen38-flash-next-d4s-ov` (`openvino_language_model.xml`
+sha256 `823997733f0b4b07…`, bin 9,270,599,557 B); plugin `ov-0049` (sha256
+`2d83e2a6…`, patches through `0049`); served binary `a6dac5b5…`;
+`--offload-ratio 86 --moe-cpu-tier --paged-kv u8 --prefill-chunk 512 --n-ctx
+8192`; the 5-token France prompt, greedy, `max_tokens 32`. The container CPU
+topology regression was worked around with `unshare -rm` presenting a
+contiguous `online=0-7` / `possible=0-15` view (the launcher logs
+`[ns] online=0-7 possible=0-15`). Both arms are fresh processes in ONE window;
+a first arcwell boot warmed the compile cache, then page cache was dropped
+before each measured arm, so each arm reads cold. `cold TTFT = launch→/props
+200 + request→first streamed token`.
+
+```
+# Arm B, host-fed (MOE_OTD_PINNED_NVME_FILL unset), B60
+RESULT {"arm": "hostfed", "device": "GPU.0", "ratio": "86", "tag": "armB-hostfed",
+  "ready": true, "t_boot_s": 97.19, "ttft_s": 2.491, "cold_ttft_s": 99.679,
+  "digest": "9a7e2e77cfa1a25a0ebdb653a54abb343987f977558e3bfd98a9752353e5969f",
+  "exit_code": 0, "wait4_ru_maxrss_gib": 3.697, "vmhwm_prefix_gib": 3.697,
+  "vmhwm_le_wait4": true, "server_has_arcwell_refusal": false}
+# Arm A, arcwell (MOE_OTD_PINNED_NVME_FILL=1), B60
+RESULT {"arm": "arcwell", "device": "GPU.0", "ratio": "86", "tag": "armA-arcwell",
+  "ready": true, "t_boot_s": 90.25, "ttft_s": 2.247, "cold_ttft_s": 92.492,
+  "digest": "9a7e2e77cfa1a25a0ebdb653a54abb343987f977558e3bfd98a9752353e5969f",
+  "exit_code": 0, "wait4_ru_maxrss_gib": 3.697, "vmhwm_prefix_gib": 3.697,
+  "vmhwm_le_wait4": true, "server_has_arcwell_refusal": false}
+# AW_IOC_STATS delta, arcwell arm (separate client fd; module-global counters)
+pre : reads=4299 bytes=3521740800 segments=4394 batches=32 batch_reads=4299
+      max_inflight=220 via_host_bounce=0
+post: reads=5151 bytes=4219699200 segments=5265 batches=36 batch_reads=5151
+      max_inflight=220 via_host_bounce=0
+# host-fed arm, same instrument: bytes 3521740800 -> 3521740800 (delta 0)
+```
+
+**Verdict — L1 holds.** Arm A (92.492 s) ≤ arm B (99.679 s), a 7.19 s margin,
+and the mechanism is visible in the same run's own counters: the host-fed arm
+read the expert bytes with `total_disk_io_ms 12,497` (`avg_disk_io_us 7,386`,
+`tensor_loads 1,692`) against the arcwell arm's `1,928` (`1,131`).
+**L2 holds** — both arms land below `X = 139.5 s` (`code`), with the measured
+`T_boot` terms (90.25 / 97.19 s) below the pinned 136 s input.
+**L3 holds** — decode does not regress at the reference cell.
 
 **Clause L1** — if the arcwell arm's cold TTFT exceeds the host-fed arm's, the
 fill does not pay and the record says so with the prefetch depth that was
@@ -165,7 +214,7 @@ reached. **L2** — if the measured arm exceeds `X`, the pin was wrong; the row
 names which term missed. **L3** — if the decode t/s regresses at the reference
 cell in trade for the cold-boot number, the change does not close.
 
-## 2. RSS bounded through boot — EMPTY
+## 2. RSS bounded through boot — MEASURED 2026-09-24
 
 **The bound: the boot child's peak RSS must stay at or below 32 GiB.** That is
 the host class the milestone's own charge names: removing the 26.82 GiB PLE pin
@@ -195,19 +244,33 @@ the physical `MemAvailable` minimum rose 9.89 → 32.91 GiB
 for the LISBON cell is therefore ≈ 5–7 GiB; the 32 GiB bound is the class
 ceiling, not the expected value.
 
-| quantity | bound | measured |
+[CORRECTED 2026-09-24: the measured boot-child `ru_maxrss` is **3.697 GiB**.
+The ≈ 5–7 GiB was an upper shape from the container-`VmRSS` instrument, not a
+prediction the gate was read against; the row is read from the kernel's
+per-child `wait4` accounting, a different instrument, and it lands below the
+estimate.]
+
+| quantity | bound | measured (2026-09-24) |
 |---|---|---|
-| boot child `ru_maxrss`, read by `os.wait4` | ≤ 32 GiB | **EMPTY (pending measurement)** |
-| child `RUSAGE_SELF` vs `wait4` | self ≤ wait4 (CF-KEYSTONERSS) | **EMPTY (pending measurement)** |
-| physical-host `MemAvailable` minimum under the sampler | > 4 GiB (watchdog) | **EMPTY (pending measurement)** |
-| freed PLE term on the ledger | the 26.82 GiB USM-host pin is gone; staging is `T x H x 90 B` | **EMPTY (pending measurement)** |
+| boot child `ru_maxrss`, read by `os.wait4` | ≤ 32 GiB | arcwell arm **3.697 GiB**; host-fed arm **3.697 GiB** (`measured-here`, B60) |
+| child `RUSAGE_SELF` vs `wait4` | self ≤ wait4 (CF-KEYSTONERSS) | the mid-run `/proc/<pid>/status:VmHWM` prefix **3.697 GiB** ≤ `wait4` **3.697 GiB** (both arms). The child is an exec'd C++ binary with no self-report, so the mid-run witness reads the same `mm->hiwater_rss` quantity `getrusage(RUSAGE_SELF).ru_maxrss` is derived from; the field is a prefix of the whole-run `wait4` value |
+| physical-host `MemAvailable` minimum under the sampler | > 4 GiB (watchdog) | B60 window **48,092,424 kB = 45.86 GiB**; **0 watchdog trips**. A770 window 45,709,112 kB = 43.59 GiB, 0 trips |
+| freed PLE term on the ledger | the 26.82 GiB USM-host pin is gone; staging is `T x H x 90 B` | `lgc load: ngram table STAGED: 1 port(s) of 33600 rows x 90 B = 2.884 MiB` — the pinned twin's 26.82 GiB is gone (`measured-here`) |
+
+**Raw evidence (`measured-here`).** The two B60 arms in row 1 are the boot
+children; each was launched as a direct child of the measurement interpreter,
+reaped once with `os.wait4`, and the kernel's `ru_maxrss` for that child is
+above. A 4 GiB watchdog armed before the leg never fired; the physical sampler
+minima are from `lisbon-gate-b60-phys-sampler.log` and
+`lisbon-gate-a770-phys-sampler.log`. `ngram table STAGED` is read from the
+arcwell arm's own `server.err`.
 
 **Clause L4** — if `ru_maxrss` exceeds 32 GiB, the boot has not reached the
 32 GiB host class and the row is RED. **L5** — if the `wait4` value is below
 the child's self-read, the instrument is void (the accounting was taken before
 teardown); the row is re-run, not passed.
 
-## 3. Restart determinism — EMPTY
+## 3. Restart determinism — MEASURED 2026-09-24 (A770 host-fed arm)
 
 **The gate.** Two cold boots of the same served configuration — process
 restarted, page cache dropped between them, nothing prebound — the same greedy
@@ -215,10 +278,46 @@ requests, **byte-identical answers in digest form** (the digest form of the old
 restore witness, DESIGN §3.4: greedy output is a pure function of the request,
 never of which fetches happened to land first).
 
+**Scope, decided up front and stated exactly.** The acceptance cell's
+measurement card is the B60, but the B60 cannot carry a byte-identity claim
+(the determinism caveat below). The row is therefore read on the A770
+(`GPU.1`, PCI `8086:56A0`), the bit-readable card, **on the only arm that can
+run there: the host-fed arm** (fill disabled). `~/src/arcwell` excludes the
+A770, so **arcwell is B60-only** (`docs/campaigns/nvme-direct-expert-tier.md`,
+Entry criteria 2); the arcwell arm's restart determinism is therefore **OWED**
+and is governed by design rule D3's load barrier (§4 of the design note), not
+by cross-boot byte-identity. The row's table below is the host-fed arm on the
+A770, `--offload-ratio 86`, same d4s artifact, same flags, two cold boots with
+page cache dropped between.
+
 | probe | boot 1 digest | boot 2 digest | identical? |
 |---|---|---|---|
-| "The capital of France is", greedy | **EMPTY (pending measurement)** | **EMPTY (pending measurement)** | **EMPTY (pending measurement)** |
-| the reference cell's prompt, greedy | **EMPTY (pending measurement)** | **EMPTY (pending measurement)** | **EMPTY (pending measurement)** |
+| "The capital of France is", greedy | `9a7e2e77cfa1a25a0ebdb653a54abb343987f977558e3bfd98a9752353e5969f` | `9a7e2e77cfa1a25a0ebdb653a54abb343987f977558e3bfd98a9752353e5969f` | **YES, byte-identical** (`measured-here`, A770 host-fed) |
+| the reference cell's prompt, greedy | (the acceptance cell's own minimal request = the same prompt) | (same) | **YES** |
+
+**Raw evidence (`measured-here`).** A770 (`GPU.1`, PCI `8086:56A0`), host-fed
+arm (fill disabled), `qwen38-flash-next-d4s-ov`, ratio 86, same flags. A first
+A770 boot warmed the A770 compile cache; page cache was dropped before each
+measured boot.
+
+```
+# A770 cold boot 1
+RESULT {"arm": "hostfed", "device": "GPU.1", "ratio": "86", "tag": "a770-boot1",
+  "ready": true, "t_boot_s": 104.18, "ttft_s": 2.736, "cold_ttft_s": 106.917,
+  "digest": "9a7e2e77cfa1a25a0ebdb653a54abb343987f977558e3bfd98a9752353e5969f",
+  "exit_code": 0, "wait4_ru_maxrss_gib": 3.698, "vmhwm_prefix_gib": 3.698}
+# A770 cold boot 2
+RESULT {"arm": "hostfed", "device": "GPU.1", "ratio": "86", "tag": "a770-boot2",
+  "ready": true, "t_boot_s": 103.17, "ttft_s": 2.476, "cold_ttft_s": 105.651,
+  "digest": "9a7e2e77cfa1a25a0ebdb653a54abb343987f977558e3bfd98a9752353e5969f",
+  "exit_code": 0, "wait4_ru_maxrss_gib": 3.697, "vmhwm_prefix_gib": 3.697}
+```
+
+**Verdict — L6 holds for the measured scope.** The two A770 host-fed cold boots
+are byte-identical. The **arcwell arm's restart determinism is OWED**, with the
+reason recorded: no bit-readable card can run arcwell. In this same window the
+B60 arcwell and host-fed arms also returned the same digest — but that reading
+is **not** admissible as a byte-identity claim (the B60 caveat below).
 
 A digest that differs between boots is a finding; its mechanism is measured
 with the instrument that exists (`tools/boot_serving_shape.py --cut layerN/out
@@ -413,6 +512,13 @@ the gate.]
 - **admission ledger** `--fit-ledger-dir` for the fit arithmetic, so the
   load-time probes are skipped on the second matching arm.
 
+[USED 2026-09-24, the LISBON gate window: plugin `ov-0049` as required (sha256
+`2d83e2a6…`); served binary `a6dac5b5…`; the `unshare -rm` contiguous-CPU-view
+workaround (operator-local, no tracked change; the launcher logs
+`[ns] online=0-7 possible=0-15`); `--fit-ledger-dir` was passed but the ledger
+directory did not exist (`fit ledger write failed` in the run log), so each arm
+ran its own load-time probes. Raw command and output are pasted in rows 1–3.]
+
 Nothing is run in this commit.
 
 ## Falsifiable clauses, listed
@@ -557,3 +663,20 @@ paths, lock, raw output) live only in the git-ignored packet
   3 is cleared in place; the three gate rows stay **OPEN** (the next leg). No
   new tracked code; the A770 was untouched; the arcwell module was left loaded
   and carved; the coordinator's wake lock was left held and untouched.
+- 2026-09-24, later — **LISBON-001 gate window: the three measured rows are
+  FILLED.** Rows 1–3 above now carry `measured-here` values. One B60 two-arm
+  window (one card, one artifact, ratio 86, plugin `ov-0049`, `unshare -rm`
+  CPU-view workaround): arcwell arm cold TTFT **92.492 s**, host-fed arm
+  **99.679 s** — **L1 holds** (arcwell ≤ host-fed, 7.19 s margin) and **L2
+  holds** (both ≤ `X = 139.5 s`); prefetch depth **4 batches in flight** (one
+  per layer); `AW_IOC_STATS` arcwell delta `bytes +697,958,400`, `reads +852`,
+  `segments +871`, `batches +4`, `via_host_bounce 0→0`, `max_inflight 220`;
+  host-fed delta `bytes +0`. RSS (`os.wait4` `ru_maxrss`) **3.697 GiB** both
+  arms, mid-run VmHWM prefix 3.697 ≤ wait4 (CF-KEYSTONERSS), physical sampler
+  minimum 45.86 GiB, 0 watchdog trips, PLE term staged at 2.884 MiB. Row 3 on
+  the **A770 host-fed arm**: two cold boots byte-identical (`9a7e2e77…9f`),
+  **PASS**; the **arcwell arm's restart determinism is OWED** (arcwell is
+  B60-only, no bit-readable card can run it) and is governed by design rule
+  D3's load barrier. No tracked code; no module load/unload; the arcwell module
+  was left loaded and carved; the coordinator's wake lock was left held and
+  untouched; both cards left as found.

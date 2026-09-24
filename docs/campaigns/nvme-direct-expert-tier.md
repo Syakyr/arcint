@@ -68,6 +68,23 @@ A verdict closes this campaign as legitimately as a landing: if the measured
 prefetch depth needed to hide 1.125 ms exceeds what the router gives warning
 of, the record says so with the number and LISBON keeps the host hop.
 
+[DATED IN PLACE 2026-09-24, LISBON-001 gate window — **the gate is MEASURED**.
+Evidence class `measured-here` for every number below; the record is
+`docs/window-053.md` rows 1–3. One B60 window (one card, one artifact, ratio
+86, plugin `ov-0049`, `unshare -rm` CPU-view workaround): cold TTFT **arcwell
+92.492 s vs host-fed 99.679 s** at prefetch depth **4 batches in flight** (one
+per layer; `max_inflight 220`), both ≤ `X = 139.5 s`; `AW_IOC_STATS` arcwell
+delta `bytes +697,958,400` exactly, `via_host_bounce 0→0`, `max_inflight 220`;
+host-fed delta `bytes +0`. Decode at the reference cell arcwell 4.1 t/s vs
+same-window host-fed 3.4 t/s — **no regression**. RSS via `os.wait4`
+`ru_maxrss` **3.697 GiB** both arms (≤ 32 GiB), PLE term staged at 2.884 MiB.
+Restart determinism is read on the **A770 host-fed arm** (host-fed two cold
+boots byte-identical `9a7e2e77…9f`, PASS); the **arcwell arm's determinism is
+OWED** because arcwell is B60-only and no bit-readable card can run it — it is
+guarded by design rule D3's load barrier. The campaign's miss-tier verdict
+stands and is unchanged: **LISBON keeps the host hop as a miss tier**; the
+load-time pinned fill does pay on cold TTFT at depth 4.]
+
 ## Entry criteria
 
 **Recon leg 2026-09-23** (operator-approved module load; operator declared the
@@ -1846,3 +1863,48 @@ plugin's own histogram). Store geometry/FIEMAP/manifest/byte-transparency:
 `measured-here` (ext4 partition). The integrated run, stats delta, OTD_PERF and
 timings: `measured-here` (B60). The CPU-plugin regression: `measured-here`
 (gdb + the namespace fix). The three gate rows: **OPEN/OWED**.
+
+## LISBON-001 gate window — the three rows measured; the campaign gate is MET with one OWED sub-row (2026-09-24)
+
+[`measured-here` + `code`. One B60 two-arm window, one A770 determinism
+window. NO tracked code. Record: `docs/window-053.md` rows 1–3.]
+
+The three gate rows are filled:
+
+1. **Cold TTFT, both arms in one window.** Card B60 (`GPU.0`, PCI `8086:E211`),
+   artifact `qwen38-flash-next-d4s-ov`, plugin `ov-0049`, ratio 86, the
+   `unshare -rm` CPU-view workaround. arcwell arm **92.492 s** (boot 90.25 s +
+   prefill 2.247 s), host-fed arm **99.679 s** (boot 97.19 s + prefill 2.491 s)
+   — **the arcwell arm is at or below the host-fed arm (L1 holds)** and both
+   are **≤ `X = 139.5 s` (L2 holds)**. Prefetch depth **4 batches in flight**
+   (one per layer over the 4 depth-4 layers; `max_inflight 220`).
+   `AW_IOC_STATS` arcwell delta `bytes +697,958,400` (the exact pinned
+   payload), `reads +852`, `segments +871`, `batches +4`, `via_host_bounce
+   0→0`, `max_inflight 220`; host-fed delta `bytes +0`. Decode at the
+   reference cell: arcwell **4.1 t/s**, host-fed **3.4 t/s** — no regression.
+   The mechanism is visible in the same run's counters: host-fed
+   `total_disk_io_ms 12,497` (`tensor_loads 1,692`) vs arcwell `1,928`.
+2. **RSS through boot.** `os.wait4` child `ru_maxrss` = **3.697 GiB** for both
+   arms (≤ 32 GiB, L4 holds); the mid-run `/proc/<pid>/status:VmHWM` prefix is
+   3.697 GiB ≤ the `wait4` value for both (L5 holds, CF-KEYSTONERSS). Physical
+   sampler minimum **45.86 GiB**, 0 watchdog trips. The PLE term is staged at
+   `2.884 MiB` (the pinned twin's 26.82 GiB is gone).
+3. **Restart determinism.** Read on the **A770 host-fed arm** (`GPU.1`, PCI
+   `8086:56A0`), the bit-readable card, because the B60 caveat forbids the
+   claim there: two cold boots byte-identical,
+   `9a7e2e77cfa1a25a0ebdb653a54abb343987f977558e3bfd98a9752353e5969f` (L6
+   holds for that scope). **The arcwell arm's restart determinism is OWED** —
+   `~/src/arcwell` excludes the A770, so arcwell is B60-only and no
+   bit-readable card can run it; that arm is governed by design rule D3's load
+   barrier, not by cross-boot byte-identity.
+
+**Disposition.** The campaign gate is **MET on the measured rows**: the
+load-time pinned fill pays on cold TTFT at depth 4, RSS reaches the 32 GiB
+host class, and decode does not regress. The miss-tier verdict already on the
+record is unchanged — **as a miss tier, LISBON keeps the host hop** — and this
+window does not disturb it. One sub-row (arcwell-arm restart determinism) is
+**OWED**, with its scope stated rather than asserted.
+
+**Evidence classes.** All numbers above: `measured-here` (B60 / A770). The
+prefetch depth and the pinned-payload arithmetic: `code` (patch `0049`;
+`flash_next_offload.h`). No arcwell-owned rate is quoted as ours.
