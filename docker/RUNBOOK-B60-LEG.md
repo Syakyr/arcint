@@ -223,7 +223,7 @@ podman run -d --name arcint-b60 \
   --served-model-name qwen3.8-27b \
   --device GPU.0 \
   --host 0.0.0.0 --port 8080 \
-  --n-ctx 262144 \
+  --n-ctx 120000 \
   --prefix-cache-mib 8192 \
   --cache-dir /var/cache/arcint \
   --queue-timeout 30 \
@@ -234,12 +234,26 @@ podman logs -f arcint-b60
 
 **GATES in the load log, in order:**
 1. OpenVINO plugin version string contains **`marfrit-p15`**.
+   If the load log doesn't print it, check the lib directly:
+   `podman run --rm --entrypoint bash ghcr.io/syakyr/arcint:investigation \
+    -c 'strings /usr/lib/libopenvino* /usr/lib/*/libopenvino* 2>/dev/null | grep -m1 marfrit'`.
    Anything else → STOP, wrong base was pulled; record the string.
 2. Device named: record the FULL_DEVICE_NAME / mem size lines —
    confirms `GPU.0` is the e211 and not a phantom.
 3. Model load completes with no allowlist refusal.
-4. Record: load time (cold cache), VRAM reported/used at
-   `--n-ctx 262144`.
+4. Record: load time (cold cache), VRAM used.
+
+**Measured-here (B60 leg 2026-09-24), context ceiling:** with MTP
+resident the reservation math gives **max ctx 126672 per lane** on
+22.71 GiB usable (weights+graph 13.06 + drafters 3.16 + MTP state
+0.97 + activations 0.60 + margin 0.25 + GDN rows 303 MiB + KV
+36.2 KiB/token). `--n-ctx 262144` does NOT fit this config; 120000
+is the working value. Lever for more: lower `--prefix-cache-mib`.
+
+**Speculation engages ONLY under greedy** (`src/api/handlers.cpp:46`).
+A sampled request (temp > 0) shows `draft accept 0.0% (0/0)` BY
+DESIGN and gets serial speed. To exercise MTP, send
+`"temperature": 0`. All card acceptance numbers are greedy.
 
 **Serve test:**
 ```bash
@@ -264,11 +278,17 @@ podman stop arcint-b60 && podman rm arcint-b60
 ```
 
 **GATES:**
+- **Test with `"temperature": 0`** — drafting is gated to greedy
+  (handlers.cpp:46); sampled requests draft zero and look inert.
+- With BOTH our `openvino_mtp_layer` and Intel's `openvino_mtp_model`
+  in the dir, the engine defaults to **ours** (measured-here:
+  `mtp: layer (reconstructed)`). The Intel pairing needs
+  `--mtp-layer exported`.
 - Decode lines print `draft accept NN% (…)`.
   - **45–75%+ → head is correct** (this is the oracle: a wrong head
     cannot change outputs, only make speculation useless).
-  - **~0% → STOP.** Head/IR pairing or flag wiring is wrong. Record
-    the acceptance line and the file shas; escalate.
+  - **~0% under greedy → STOP.** Head/IR pairing or flag wiring is
+    wrong. Record the acceptance line and the file shas; escalate.
 - Reference points (card): our layer + our lm_head = 36.3 t/s @ 90.8%
   (acceptance task); Intel's `openvino_mtp_model` + our lm_head via
   `--mtp-layer exported` = 37.7–38.1 t/s @ 93.9% code / 76.4% prose.
@@ -309,7 +329,7 @@ pattern as the sycl entries:
       --model-id qwen3.8-27b-intel-int4
       --served-model-name qwen3.8-27b
       --device GPU.0 --host 0.0.0.0 --port ${PORT}
-      --n-ctx 128000 --prefix-cache-mib 8192
+      --n-ctx 120000 --prefix-cache-mib 8192
       --cache-dir /var/cache/arcint --queue-timeout 30
       --mtp off
     cmdStop: podman stop ${MODEL_ID}
@@ -319,8 +339,15 @@ pattern as the sycl entries:
 (+ a `-mtp` twin with `--mtp on` once Leg 2 is green.)
 
 **Comparison discipline vs the sycl baselines:**
-- Match `--n-ctx` to the baseline being compared (128000 vs the
-  llama 128k entry), not the engine max — KV pressure moves numbers.
+- Match `--n-ctx` to the baseline being compared (120000 here; the
+  arcint ceiling with MTP resident is 126672), not the engine max —
+  KV pressure moves numbers.
+- Align `--served-model-name` with the model name llama-swap actually
+  sends, or the engine logs a mismatch every request (single-model
+  aliasing papers over it; don't rely on it).
+- Prompts over 2048 tokens prefill in chunks and chunk boundaries are
+  NOT bit-exact on this backend (DESIGN 3.2, logged at load). Note it
+  in any output-equality comparison vs llama.cpp.
 - The quants differ (int4 NNCF IR vs IQ3_S / Q4_K_XL GGUF). This is
   engine-vs-engine at each engine's served artifact, not a
   matched-weights A/B. Say so in any report.
@@ -362,7 +389,7 @@ Fill and keep with the leg:
 [ ] Image digest pulled: ____________ (expect e5d09a34…98b8e34)
 [ ] marfrit-p15 seen in load log: yes / NO(→stop)
 [ ] GPU.0 = e211 confirmed via: ____________
-[ ] Leg 1 cold load time: ____ s   VRAM used @262k: ____ GiB
+[ ] Leg 1 cold load time: ____ s   VRAM used @120k ctx: ____ GiB (ceiling 126672 w/ MTP resident)
 [ ] Leg 1 decode t/s: ____  (ref 25.0 card)
 [ ] Leg 2 layer served: ours / intel-exported
 [ ] Leg 2 accept %: ____  decode t/s: ____  (refs 36.3@90.8 / 37.7-38.1@93.9)
