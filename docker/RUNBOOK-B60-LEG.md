@@ -31,6 +31,7 @@ this leg establishes it.
 | Image digest | `sha256:e5d09a34…98b8e34` | measured-here |
 | Runtime stamp to see in load log | `marfrit-p15` in OV version string | measured-here |
 | Model | `OpenVINO/Qwen3.8-27B-int4-ov` → dir `qwen38-intel-int4-ov` | card |
+| `--model-id` (entry id, NOT the dir alias) | `qwen3.8-27b-intel-int4` | code: model_registry.cpp:172 |
 | Base IR lm_xml sha (16) | `ab94a08ce150de6a` | card |
 | chat_template sha (16) | `c3cf9e34abf4f9e3` | card |
 | tokenizer sha (16) | `87a7830d63fcf43b` | card |
@@ -38,6 +39,7 @@ this leg establishes it.
 | No-MTP decode | 25.0 t/s | card |
 | MTP decode (Intel layer + our lm_head) | 37.7–38.1 t/s, 93.9% code / 76.4% prose | card |
 | MTP decode (our layer + our lm_head) | 36.3 t/s, 90.8% acceptance task | card |
+| MTP head is a LOAD requirement | allowlist pins presence; `--mtp off` does not waive it (measured-here: first Leg 1 refused without the files) | measured-here |
 | B60 PCI id | `8086:e211` (DRM numbering ≠ OpenVINO numbering) | measured-here |
 
 **Do-NOTs (from HANDOFF §6 — these are incidents waiting to happen):**
@@ -126,21 +128,42 @@ sha256sum tokenizer.json              | cut -c1-16   # MUST be 87a7830d63fcf43b
 **GATE:** all three match. Any mismatch → stop; the engine's allowlist
 will refuse it anyway, find out now, not at boot.
 
-### 3b. MTP head (transfer from the build box)
+### 3b. MTP head (transfer from the build box) — REQUIRED FOR BOTH LEGS
 
 Built 2026-09-24 on the build box at `~/mtp-build/out/`
 (layer.bin 849,399,048 B / lm_head.bin 1,272,143,360 B; sizes match
-`docs/mtp-head-card.md`). **For Leg 1, do NOT copy these yet** —
-Leg 1 runs headless of the MTP files.
+`docs/mtp-head-card.md`).
+
+**Corrected 2026-09-24 after the first Leg 1 attempt failed:**
+`--mtp off` does NOT waive the head files. The allowlist entry pins
+`mtp_head_exported: true` and `validate_artifact`
+(`src/core/model_registry.cpp:489`) refuses the artifact at load when
+the artifact reports the head absent — before any serving flag is
+consulted. Detection rule (`src/core/artifact.cpp:459`):
+
+    has_mtp_head = (openvino_mtp_layer.xml OR openvino_mtp_model.xml)
+                   AND openvino_mtp_lm_head.xml present
+
+Intel's IR already ships the layer half (`openvino_mtp_model.xml`).
+The only missing files are our `openvino_mtp_lm_head.{xml,bin}`.
+Copy the head files BEFORE Leg 1; `--mtp on/off` then selects use,
+not loadability.
 
 ```bash
 # from the build box:
 rsync -avP --checksum ~/mtp-build/out/ <user>@<b60>:~/mtp-build-mtphead/
 # on the B60, verify BEFORE installing:
 cd ~/mtp-build-mtphead && sha256sum -c SHASUMS256.txt
-# Leg 2 only — move the four files beside the base IR:
+# install beside the base IR (both legs):
 mv ~/mtp-build-mtphead/openvino_mtp_*.{xml,bin} ~/Models/ov/qwen38-intel-int4-ov/
 ```
+
+With all four files present the dir carries TWO layers (our
+`openvino_mtp_layer` + Intel's `openvino_mtp_model`). Which one
+`--mtp on` uses by default is UNVERIFIED — settle it from `--help`
+(§4d) and the load log, and record it. The card's two pairings:
+ours = 36.3 t/s @ 90.8%; Intel-layer via `--mtp-layer exported` =
+37.7–38.1 t/s @ 93.9% code.
 
 ## 4. Pull + container sanity (failure-class separation)
 
@@ -195,8 +218,8 @@ podman run -d --name arcint-b60 \
   -e ZES_ENABLE_SYSMAN=1 \
   -e ZE_AFFINITY_MASK=0 \
   ghcr.io/syakyr/arcint:investigation \
-  --model /models/ov/qwen38-intel-int4-ov \
-  --model-id qwen38-intel-int4-ov \
+  --model /models/qwen38-intel-int4-ov \
+  --model-id qwen3.8-27b-intel-int4 \
   --served-model-name qwen3.8-27b \
   --device GPU.0 \
   --host 0.0.0.0 --port 8080 \
@@ -282,8 +305,8 @@ pattern as the sycl entries:
       -v arcint-cache:/var/cache/arcint
       -e ZES_ENABLE_SYSMAN=1 -e ZE_AFFINITY_MASK=0
       ghcr.io/syakyr/arcint:investigation
-      --model /models/ov/qwen38-intel-int4-ov
-      --model-id qwen38-intel-int4-ov
+      --model /models/qwen38-intel-int4-ov
+      --model-id qwen3.8-27b-intel-int4
       --served-model-name qwen3.8-27b
       --device GPU.0 --host 0.0.0.0 --port ${PORT}
       --n-ctx 128000 --prefix-cache-mib 8192
@@ -314,7 +337,8 @@ pattern as the sycl entries:
 | 4b stub silent | image | re-pull by digest; compare `podman inspect` |
 | libopenvino/libtbb load error | image loader | should be impossible (ldconfig gate); if seen: wrong base, record digest |
 | Level Zero / /dev/dri errors at model load | host driver / device recipe | §1a/1b; try `--privileged` once to isolate group-vs-driver |
-| allowlist refusal | mount or flag pair | dir name = alias? lm_xml sha = `ab94a08ce150de6a`? `--model-id` matches dir? |
+| allowlist refusal | mount or flag pair | dir basename = alias `qwen38-intel-int4-ov`; `--model-id` = ENTRY ID `qwen3.8-27b-intel-int4` (they differ — dir is the alias, id is dotted) |
+| `MTP head mismatch: allowlist present, artifact absent` (with `--mtp off` too) | allowlist presence pin | head files are a LOAD requirement, not a use option (§3b); install at least `openvino_mtp_lm_head.{xml,bin}` beside the base IR |
 | `--mtp` unknown flag | flag spelling | §4d ground truth; card says `--mtp on`, `--mtp-layer exported` |
 | accept ~0% | head pairing | shas vs SHASUMS256.txt; which layer served; stop, escalate |
 | serves, wrong output | engine | capture /props + load log + request; do NOT re-run blindly |
