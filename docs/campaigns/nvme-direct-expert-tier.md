@@ -1181,3 +1181,281 @@ collect, refusal, guard): `paper` (design note §3/§4) + `code` (patch 0048,
 probe's `device_slot_buffers=0`) + `code` (`aw_uapi.h`; `moe_otd_runtime.cpp`).
 The patch/apply/compile evidence and the cell ladder: `measured-here`. The BO
 destination, transport and card validation: **OWED**.
+
+---
+
+## D2/D3 byte destination — SETTLED AND PROVEN: a caller-created xe VRAM BO, exported as a dma-buf (2026-09-24)
+
+[`code` for the mechanism; `measured-here` for the proof. One card leg on the
+B60 alone; NO `arcint` leg, NO module load/unload, NO expert-store write. The
+arcwell module was found loaded and carved (inherited) and left as found.]
+This leg settles the one item the D2/D3 integration recorded as OWED: **how the
+plugin obtains a VRAM BO whose dma-buf meets arcwell's mapping contract** — and
+proves it end-to-end at the smallest scale, without arcint.
+
+### 1. The mechanism, decided from arcwell's own source
+
+**arcwell provides NO allocator/helper. The caller creates the xe BO and
+exports the dma-buf itself.** Three independent sources say so, and they agree:
+
+- `stub/src/arcwell.c`'s own header: *"userspace creates a host-visible VRAM
+  BO on xe and exports it as a dma-buf, then hands us the fd"* (`code`:
+  `~/src/arcwell/stub/src/arcwell.c:7-8`).
+- `M4_API.md`: *"The contract lives in the uAPI, not in a client library …
+  Any thin client that wraps these ioctls exists only to issue them; it is not
+  a data path and holds no bytes"* (`code`; the same record states the earlier
+  client-library revision *"has been removed"*).
+- `KERNEL_FACTS.md`, "The working recipe, no xe patch required", step 1:
+  *"Userspace creates the BO (WC + `NEEDS_VISIBLE_VRAM` + 64K-aligned) and
+  exports it with `DRM_IOCTL_PRIME_HANDLE_TO_FD`"* (`code`).
+
+The uAPI confirms it by omission: there is no BO-create ioctl. `AW_BUF_XE_GEM`
+is declared but `0.0.1` implements **only** `AW_BUF_DMABUF` — `aw_map_buffer`
+returns `-EOPNOTSUPP` for any other `in_source` (`code`: `aw_uapi.h`;
+`arcwell.c:486-489`). The client's once-at-open lifecycle is
+`USING_ARCWELL.md` §3, verbatim: create the BO and export it;
+`AW_IOC_MAP_BUFFER` with `in_length = BO size`; then *"assert `out_flags &
+AW_MAP_F_REQUIRE_P2P` … this check is not optional"*.
+
+**Chosen path: direct xe DRM ioctls from the consumer**, vendoring the DRM
+constants, exactly as arcwell's own `stub/test/aw_expert_test.c` and
+`aw_async_test.c` do (`code`): `DRM_IOCTL_XE_GEM_CREATE` with
+`placement = 1 << DRM_XE_MEM_REGION_CLASS_VRAM`,
+`flags = DRM_XE_GEM_CREATE_FLAG_NEEDS_VISIBLE_VRAM`,
+`cpu_caching = DRM_XE_GEM_CPU_CACHING_WC`, size rounded to a 64 KiB multiple;
+then `DRM_IOCTL_PRIME_HANDLE_TO_FD`. The vended header is `xe_drm.h`
+(arcwell's tree) or the system `<drm/xe_drm.h>`; the ioctls are identical.
+
+**Alternatives rejected, with the source line that rejects them:**
+
+| alternative | why rejected | class |
+|---|---|---|
+| arcwell's own helper/library | there is none in the current contract. The tree carries an **untracked, stale** `libarcwell.a`/`arcwell.o` whose symbols (`aw_backend_stages_via_system_ram`, `aw_unbuilt_reason`) identify it as the pre-`0.0.1` userspace-staging client that `M4_API.md` says was removed; it does not create an xe BO, and `KERNEL_FACTS.md` is explicit that *"There is no userspace data path and none is to be designed"* | `code` |
+| `AW_BUF_XE_GEM` (an xe GEM handle directly) | declared in `aw_uapi.h` but unimplemented at `0.0.1`; `aw_map_buffer` returns `-EOPNOTSUPP` for anything but `AW_BUF_DMABUF` | `code` |
+| L0 / OpenCL export | OpenCL cannot *create* a `NEEDS_VISIBLE_VRAM`+WC BO; it can only *import* a dma-buf (`cl_khr_external_memory_dma_buf`, handle type `0x2067`), which is the **consumption** half, not the creation half (arcwell's own `aw_cl_import_test` E2E proves the import; `KERNEL_FACTS.md` "END TO END") | `code` |
+
+**Lifetime and ownership.** The BO's GEM handle is owned by the opening
+process's render-node fd; the exported `pr.fd` is a separate dma-buf reference.
+`AW_IOC_MAP_BUFFER` takes the module's **own** reference (`dma_buf_get`,
+`arcwell.c:495`), so the caller may close `pr.fd` immediately after a
+successful map — arcwell's own tests do exactly that. The registration is
+released by `AW_IOC_UNMAP_BUFFER` or by closing the `/dev/arcwell` fd
+(`aw_free_buffer` detaches, unpins and drops the reference; `USING_ARCWELL.md`
+§3: *"Buffers are owned by the file descriptor"*). In-flight batches hold buffer
+references until collected (`aw_uapi.h`: *"Buffer references are held until the
+batch is collected"*), so a buffer must not be unmapped under a live batch;
+closing the fd drains.
+
+**Can the plugin hold it inside the provider without breaking OpenVINO's
+allocator?** Yes: it is a raw DRM BO with its own fd, **not** an OpenVINO
+engine allocation, so it does not pass through `allocate_memory`. To let an
+OpenCL kernel read it, the provider imports the dma-buf
+(`cl_khr_external_memory_dma_buf`, `0x2067`) into a `cl_mem` — the path
+arcwell's own E2E cell proved (`code`: `aw_cl_import_test.c`;
+`KERNEL_FACTS.md`). The slot descriptor must then point at that imported
+`cl_mem` rather than an engine buffer. That integration (plugin-side) is not
+proven in this leg — this leg proves the byte path only.
+
+### 2. The proof (smallest scale, non-arcint)
+
+`measured-here` on the B60. New standalone client
+`tools/arcwell_bo_dma_proof.c` (tracked; sha256
+`8ee9ee5187cf4913f7d26dc981fe9aaccdaabac028d13aa35f60699c4da1a211`), built on
+the card host against `<drm/xe_drm.h>` and `~/src/arcwell/stub/include/aw_uapi.h`.
+It creates the BO, exports it, registers it, transfers **one real 2,457,600 B
+payload from the real store** (byte-transparent artifact, the artifact-format
+step's store), verifies the BO by host readback through its own xe mapping, and
+reads `AW_IOC_STATS` as a delta. Re-read of the arcwell tree at this date: HEAD
+`2e9257a`, **tree `e7d326e`** — the same tree the 2026-09-23 recon pinned, so
+the cited sources are unchanged.
+
+Command (`<render-node>` is the B60 node identified by PCI id `8086:E211`; the
+operator-local path is in the handoff packet):
+
+```
+$ ./arcwell_bo_dma_proof --drm <render-node> --file <store>/expert_0000.bin \
+      --part-start <sectors> --readback-out <packet>/readback-normal.bin
+==== arcwell BO -> dma-buf -> arcwell -> host readback [normal - must PASS] ====
+BO: size=2490368 B (38.00 x 64 KiB) handle=1 placement=0x2 flags=0x4
+PRIME: dma-buf fd=4
+MAP_BUFFER: handle=16 out_flags=0x1 (AW_MAP_F_REQUIRE_P2P honoured)
+FIEMAP: <store>/expert_0000.bin extents=1 phys=195689447424 -> absolute LBA=482871296 len=2457600
+SUBMIT: batch_id=1 submitted=1 err=0
+poll: saw_eagain=1 polls=49 collected=1
+COLLECT: bytes=2457600 completed=1 segments=3 err=0
+STATS delta: via_host_bounce 0->0 max_inflight 261->261 batches 23->24 batch_reads 800->801 segments 2400->2403 bytes 1966080000->1968537600
+READBACK: wrote 2457600 B to <packet>/readback-normal.bin
+READBACK: 2457600 B byte-identical to the store file
+RESULT=PASS -- xe VRAM BO dma-buf registered peer-to-peer, one real expert landed by controller DMA, host readback byte-identical, via_host_bounce delta 0, max_inflight 261
+```
+
+Host-readback byte identity (sha256 of the store file and of the BO's readback):
+
+```
+4a4bb0f91361e4b184d8c151fc9bdddee29626d667fda8b89928106592983f9a  <store>/expert_0000.bin
+4a4bb0f91361e4b184d8c151fc9bdddee29626d667fda8b89928106592983f9a  <packet>/readback-normal.bin
+```
+
+**Reading.** One real expert landed in a caller-created VRAM BO by controller
+DMA: BO 2,490,368 B (the 64 KiB round-up of the 2,457,600 B payload),
+peer-to-peer registration honoured, 3 segments (the bio floor for 600 pages),
+`via_host_bounce` delta **0**, `max_inflight` 261 (absolute, the module-global
+high-water mark, `> 1` as the design note requires), and the BO's own
+host readback **byte-identical** to the store file. This is a **DMA payload
+read back to the host**, so the byte comparison is legitimate and the B60
+compute determinism caveat does not apply.
+
+### 3. Red-first cells (mutation-testable)
+
+`measured-here`. The tool carries five mutation legs; every one MUST report
+`RESULT=FAIL`, and the tool's terminal guard refuses to let a mutation leg pass
+(`"the mutation did NOT change the outcome"`). Four go red as required; the
+fifth is a measured counterexample to a contract claim (see §4).
+
+**`--mutate-no-part-offset`** — drop the ext4 partition start; the DMA reads the
+wrong bytes and the readback must mismatch:
+
+```
+MUTATED: partition start dropped  -> absolute LBA=382205952
+RESULT=FAIL -- readback mismatch at byte 0 (expected for this mutation)
+```
+
+**`--mutate-offset-unaligned`** — `in_dest_offset=512` (not page-aligned); the
+module must refuse it:
+
+```
+SUBMIT: batch_id=1 submitted=0 err=-22
+SUBMIT_BATCH refused the unaligned in_dest_offset=512: submitted=0 err=-22 (out_err is the submission-time error; the ioctl return is not enough)
+RESULT=FAIL -- [MUTATED] unaligned transfer geometry refused
+```
+
+**`--mutate-system-bo`** — a system-memory BO (the host-bounce configuration);
+`MAP_BUFFER` must refuse it:
+
+```
+MAP_BUFFER refused a system-memory BO: Numerical result out of range
+STATS after refusal: via_host_bounce 0->0 (delta 0)
+RESULT=FAIL -- [MUTATED] host-bounce configuration refused
+```
+
+**`--mutate-readback`** — corrupt the expected bytes; the readback must fail:
+
+```
+RESULT=FAIL -- readback mismatch at byte 1228800 (expected for this mutation)
+```
+
+**`--mutate-bo-size`** — the BO size is **not** rounded to 64 KiB. **This leg
+does not go red on the B60**, and that is the finding, not a shortcut.
+
+### 4. Findings that correct the record
+
+Three dated corrections follow from the raw output; none is smoothed.
+
+**(a) The 64 KiB BO gate is NOT enforced on the B60.** `~/src/arcwell/
+KERNEL_FACTS.md` states the four `DRM_IOCTL_XE_GEM_CREATE` requirements are
+enforced — *"size a multiple of 64 KiB (DG2 flat-CCS sets the VRAM manager
+`min_page_size = 64K`)"* — and that omission *"returns `-EINVAL`"*. That was
+measured on the **A770 (DG2)**. On the B60, a 2,457,600-byte BO (37.5 × 64 KiB)
+was **accepted end-to-end**:
+
+```
+NOTE: [MUTATED] GEM_CREATE ACCEPTED a non-64KiB size (2457600 B); continuing ...
+BO: size=2457600 B (37.50 x 64 KiB) handle=1 placement=0x2 flags=0x4
+MAP_BUFFER: handle=19 out_flags=0x1 (AW_MAP_F_REQUIRE_P2P honoured)
+COLLECT: bytes=2457600 completed=1 segments=3 err=0
+RESULT=FAIL -- [MUTATED] the mutation did NOT change the outcome; this leg proves nothing
+```
+
+The readback for that run is byte-identical (`readback-bo-size.bin` sha256
+`4a4bb0f9…`). So the 64 KiB rule is a **client contract**, not a kernel-enforced
+gate on the B60 (kernel 7.0.14); the B60 does not enforce a 64 KiB gate for this
+BO on this kernel (the granule itself was not measured, only that the
+acceptance shows no 64 KiB gate). The safe path is unchanged — round the BO up
+per `USING_ARCWELL.md` §6 and `KERNEL_FACTS.md`, because the contract is written
+for both cards and the A770/DG2 gate is card-specific. A red cell for this rule
+cannot be made on the B60.
+
+**(b) A submission-time geometry error is reported in `out_err`/`out_submitted`,
+not by the ioctl return.** `AW_IOC_SUBMIT_BATCH` returned **0** yet
+`out_submitted=0`, `out_err=-22` (`-EINVAL`) for the unaligned offset. The
+`Transport::submit` implementation patch 0048 owes must therefore check
+`out_submitted == in_count` and `out_err == 0`, not the ioctl return alone
+(`code`: `aw_uapi.h`, *"`out_err`: submission-time error only"*; observed
+`measured-here`).
+
+**(c) A system-memory dma-buf is refused with `-ERANGE` before the
+`via_host_bounce` increment sites.** The refusal is real (no path bounces), but
+the counter stayed 0 because the failure is the carve range check
+(`aw_try_carve`: `-ERANGE`, `arcwell.c:302`) — the requested range lies outside
+usable VRAM — which runs before the two documented increment sites
+(`arcwell.c:509` peer2peer clear; `arcwell.c:557` non-P2PDMA page). The
+`via_host_bounce` delta of 0 is therefore expected for **this** refusal and does
+not weaken the guard: dmesg carries `could not carve for phys … at any granule
+… : -34` (`-ERANGE`), and the map failed.
+
+### 5. Implication for the fill's destination (explicit)
+
+The proof changes the destination from an open question to a concrete object:
+**the fill's destination must be a caller-created xe VRAM BO**, created and
+owned by the plugin/provider (raw DRM ioctls), exported as a dma-buf,
+registered with `AW_IOC_MAP_BUFFER` peer-to-peer, and imported into OpenCL by the
+same dma-buf fd for the consuming kernel. The static partition's current slot
+buffers are host-mapped (`usm_host`, `device_slot_buffers=0`), so they cannot be
+the destination; the provider's `Transport::begin` becomes "create the per-slot
+BO, export, map", `submit` drives `AW_IOC_SUBMIT_BATCH` (checking
+`out_submitted`/`out_err`), and `collect` drives `AW_IOC_BATCH_WAIT` — the
+schedule already tracked in `src/exec/pinned_nvme_fill.h` / patch 0048.
+The per-expert BO is the smallest scale proved here; the artifact-format step's
+concatenated per-layer BO (one request per expert at a page-aligned
+`in_dest_offset`) is the same contract, and either is admissible. Registering
+many BOs is not a BAR2 hazard in the current tree: carves are section-sized
+(128 MiB) and reused (`carve_covers`, `arcwell.c:265`; `aw_pages_present`,
+`arcwell.c:348`),
+and this leg registered several BOs without adding a carve.
+
+**What this does NOT discharge:** the plugin-side transport wiring, the OpenCL
+import into OpenVINO's slot descriptors, and the LISBON gate's "serving step
+with the fill overlapping" number. No arcint leg was run.
+
+### 6. Card, lock, module state
+
+- **Before:** `pgrep -x arcint` empty; no competing service (`ollama`/`vllm`/
+  `llama-server` empty); B60 (`8086:E211`) `power/control=on`, runtime
+  **active**; A770 (`8086:56A0`) **suspended**, untouched; `arcwell` loaded and
+  carved (inherited), `/dev/arcwell` present; physical-host `MemAvailable`
+  32.9 GiB (minimum 34,471,692 kB, the re-run sampler's first row).
+- **One card leg at a time:** the B60 alone; the A770 was never opened.
+- **Wake lock (coordinator host):** found none set (`keine Sperre gesetzt`);
+  taken for 4 h with a reason naming only the campaign and the B60 (no host
+  name), and **released** when the card work was done. No foreign lock
+  overwritten.
+- **Sampler (SOP §1):** the physical-host sampler ran for the leg with the
+  4 GiB watchdog on `MemAvailable`. Minimum observed **34,471,692 kB = 32.9 GiB**;
+  **0 watchdog trips**.
+- **Store:** read-only; no file written or moved.
+- **After:** no `arcint`; `arcwell` **left loaded and carved** as found (unloading
+  a carved GPU is the `~/src/arcwell/KERNEL_FACTS.md` half-state hazard); no new
+  carve line from this leg; B60 runtime **active**, `power/control=on`; A770
+  untouched.
+
+### 7. Records changed, and what remains
+
+`docs/window-053.md` dependency 3 is updated **in place** with this date: its
+**destination** clause — "there is no destination a byte-transparent fill can
+land in" — is **CLEARED** (the BO-backed destination is settled and proved),
+while its **consumer-integration** clause stays standing (no plugin transport,
+no overlapping-step number). The three gate rows stay OPEN. Design-note §9
+records the same disposition.
+
+**Evidence classes, this leg.** The mechanism and rejected alternatives: `code`
+(`arcwell.c`, `aw_uapi.h`, `USING_ARCWELL.md`, `M4_API.md`, `KERNEL_FACTS.md`).
+The end-to-end proof, the sha256 byte identity, the five mutation legs and the
+three corrections: `measured-here` (B60). arcwell's own E2E OpenCL-import cell:
+`code` (arcwell's tree) + arcwell's `measured-here`. The plugin integration and
+the gate: **OWED**.
+
+**Raw output** (verbatim, unredacted, with the operator-local paths only in the
+git-ignored packet): `normal.txt`, `mutate-no-part-offset.txt`,
+`mutate-offset-unaligned.txt`, `mutate-bo-size.txt`, `mutate-system-bo.txt`,
+`mutate-readback.txt`, `sha256sums.txt`, `sampler2.log`, and the tool source on
+the persistent evidence path; hashes in the packet.

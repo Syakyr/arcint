@@ -507,3 +507,30 @@ confirmation.
   are OWED, and an enabled fill refuses the load. §7 item 4 (the gate) and the
   three gate rows stay OWED/OPEN. No card leg, no module load; the arcwell
   module was found loaded/carved and left as found.
+- 2026-09-24 — **byte-destination proof leg: the destination is SETTLED AND
+  PROVEN on the B60; D2's device destination is no longer an open question.**
+  A non-arcint client (`tools/arcwell_bo_dma_proof.c`) created a caller-owned xe
+  VRAM BO (raw `DRM_IOCTL_XE_GEM_CREATE`: VRAM placement +
+  `NEEDS_VISIBLE_VRAM` + `CPU_CACHING_WC`, size rounded to 64 KiB), exported it
+  via `DRM_IOCTL_PRIME_HANDLE_TO_FD`, registered it peer-to-peer with
+  `AW_IOC_MAP_BUFFER` (`AW_MAP_F_REQUIRE_P2P` asserted), transferred **one real
+  2,457,600 B expert** from the real store by controller DMA, and verified the
+  BO through its own xe mapping: **byte-identical** (sha256 `4a4bb0f9…`),
+  `AW_IOC_STATS` delta `via_host_bounce = 0`, `max_inflight > 1`. The mechanism
+  is decided with `code` citations: arcwell provides **no** allocator/helper
+  (`stub/src/arcwell.c:7-8`; `M4_API.md` "the contract lives in the uAPI, not in
+  a client library"; `KERNEL_FACTS.md` "the working recipe", step 1), so the
+  plugin creates the BO itself; OpenCL can only **import** the dma-buf
+  (`cl_khr_external_memory_dma_buf`, arcwell's own E2E cell), not create one;
+  `AW_BUF_XE_GEM` is unimplemented at `0.0.1`. Three dated corrections: on the
+  B60 the 64 KiB BO gate is **not** kernel-enforced (a 37.5 × 64 KiB BO was
+  accepted end-to-end, contrary to `~/src/arcwell/KERNEL_FACTS.md`'s A770/DG2
+  measurement); a submission-time geometry error is reported in
+  `out_submitted`/`out_err`, not the ioctl return, so `Transport::submit` must
+  check the counts; and a system-memory dma-buf is refused with `-ERANGE` at the
+  carve range check, before the `via_host_bounce` sites. What this does NOT
+  discharge: the plugin-side `Transport`, the OpenCL import into the slot
+  descriptors, and the LISBON gate's overlapping-step number. `docs/window-053.md`
+  dependency 3's destination clause is CLEARED in place; its
+  consumer-integration clause stays standing. No `arcint` leg; the arcwell
+  module was found loaded and carved and left as found.

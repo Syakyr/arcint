@@ -299,6 +299,24 @@ things block it today. Every one is recorded, not worked around.
    dma-buf BO-backed slot destination are OWED, and with them the "serving
    step with the fill overlapping" number. See the campaign's "D2/D3 consumer
    integration" section.]
+   [DESTINATION CLEARED 2026-09-24, byte-destination proof leg — dependency 3
+   STANDS on its consumer-integration half. The "there is no destination a
+   byte-transparent fill can land in" clause is **CLEARED**: the destination is
+   settled and proved end-to-end at the smallest scale on the B60 by a
+   non-arcint client (`tools/arcwell_bo_dma_proof.c`). arcwell provides **no**
+   allocator/helper — `stub/src/arcwell.c` says "userspace creates a
+   host-visible VRAM BO on xe and exports it as a dma-buf, then hands us the
+   fd" — so the plugin creates the BO itself with the raw xe DRM ioctls
+   (`DRM_IOCTL_XE_GEM_CREATE` VRAM + `NEEDS_VISIBLE_VRAM` + `CPU_CACHING_WC`,
+   64 KiB-rounded; `DRM_IOCTL_PRIME_HANDLE_TO_FD`), registers it peer-to-peer,
+   and imports the same dma-buf into OpenCL (`cl_khr_external_memory_dma_buf`,
+   the path arcwell's own E2E cell proved). Proof: one real 2,457,600 B expert
+   from the real store landed in the BO, host readback **byte-identical**
+   (sha256 `4a4bb0f9…`), `AW_IOC_STATS` delta `via_host_bounce = 0`,
+   `max_inflight > 1`. What still STANDS: the plugin-side transport wiring, the
+   OpenCL import into OpenVINO's slot descriptors, and the "serving step with
+   the fill overlapping" number — none exists yet, so the three rows stay OPEN.
+   See the campaign's "D2/D3 byte destination" section.]
 
 **Consequence:** the three rows stay **OPEN**. [UPDATED 2026-09-23,
 artifact-format step: dependencies 1 and 2 are CLEARED, so the gate is no
@@ -308,6 +326,13 @@ dependency 3, the D2/D3 consumer integration, with its three rows still OPEN.]
 is built, wired and compile-verified (patch `0048`), but there is no dma-buf
 VRAM destination for the fill, so nothing lands and the overlapping-step number
 still does not exist. The three rows stay OPEN.]
+[UPDATED 2026-09-24, byte-destination proof leg: dependency 3's **destination**
+clause is CLEARED — the fill's destination is settled and proved on the B60
+(a caller-created xe VRAM BO whose dma-buf meets arcwell's mapping contract),
+so the gate is no longer blocked on "there is no destination". Dependency 3
+STANDS only on its consumer-integration half: the plugin-side `Transport`, the
+OpenCL import into the slot descriptors, and the "serving step with the fill
+overlapping" number. The three rows stay OPEN.]
 The gate's own bytes cannot be laid down. This document is the criteria, not a
 measurement.
 
@@ -412,3 +437,28 @@ paths, lock, raw output) live only in the git-ignored packet
   destination, not on a missing schedule. No card leg, no module load, no wake
   lock, no store/host mutation; the arcwell module was found loaded/carved and
   left as found.
+- 2026-09-24 — **byte-destination proof leg: the destination is SETTLED AND
+  PROVEN; dependency 3's destination clause is CLEARED and its
+  consumer-integration clause stays standing.** One card leg on the B60 alone
+  (`8086:E211`), non-arcint; the A770 was untouched. New tracked client
+  `tools/arcwell_bo_dma_proof.c` creates a caller-owned xe VRAM BO
+  (`DRM_IOCTL_XE_GEM_CREATE` with VRAM + `NEEDS_VISIBLE_VRAM` + `CPU_CACHING_WC`,
+  size rounded to 64 KiB), exports it via `DRM_IOCTL_PRIME_HANDLE_TO_FD`,
+  registers it peer-to-peer (`AW_MAP_F_REQUIRE_P2P` asserted), transfers one
+  real 2,457,600 B expert from the real store, and verifies the BO by host
+  readback: **byte-identical**, sha256 `4a4bb0f9…` both sides; `AW_IOC_STATS`
+  delta `via_host_bounce = 0`, `max_inflight 261 (> 1)`, `batches`/`batch_reads`/
+  `segments` moved by the leg's own work, `bytes +2,457,600`. Five mutation
+  legs; four go red as required (partition offset dropped → mismatch; unaligned
+  `in_dest_offset` refused/`out_err=-22`; system-memory BO refused `-ERANGE`;
+  readback corrupted → mismatch). Three dated corrections: on the B60 the 64 KiB
+  BO gate is **not** enforced (a 37.5 × 64 KiB BO was accepted end-to-end,
+  unlike the A770/DG2 measurement in `~/src/arcwell/KERNEL_FACTS.md`); a
+  submission-time geometry error is reported in `out_submitted`/`out_err`, not
+  the ioctl return; and the system-memory refusal is `-ERANGE` at the carve
+  range check, before the `via_host_bounce` sites. What stays OWED: the
+  plugin-side transport, the OpenCL import into the slot descriptors, and the
+  overlapping-step number. Three gate rows stay **OPEN**. No `arcint` leg, no
+  module load/unload, no store write; the arcwell module was found loaded and
+  carved and left as found; wake lock taken and released; sampler minimum
+  32.9 GiB, 0 watchdog trips.
