@@ -175,7 +175,11 @@ only a byte comparison catches it); **reject non-plain extents** (`UNWRITTEN`,
 `DELALLOC`, `INLINE`, `ENCODED`, `UNKNOWN`; pass `FIEMAP_FLAG_SYNC`); **handle
 spanning**. The recommended layout — one file per expert, `fallocate`d — gives
 **exactly 1 extent per expert**, so an expert is **one request** at one
-`in_dest_offset`. It is **not** one DMA segment: a bio holds at most
+`in_dest_offset`. [DATED IN PLACE 2026-09-24, patch 0049 leg: with the REAL
+store this holds only if one destination maps the whole record. The store's
+`gate|up|down` record meets three per-tensor device regions, so one expert is
+THREE page-aligned requests; see the "D2/D3 plugin transport" section.] It is
+**not** one DMA segment: a bio holds at most
 `BIO_MAX_VECS` (256) pages = 1 MiB, so a 2.4 MB expert is ~3 bios whatever the
 layout (arcwell item 24, `results/EXPERT_OPTION_B_2026-09-16.txt`).
 
@@ -1459,3 +1463,181 @@ git-ignored packet): `normal.txt`, `mutate-no-part-offset.txt`,
 `mutate-offset-unaligned.txt`, `mutate-bo-size.txt`, `mutate-system-bo.txt`,
 `mutate-readback.txt`, `sha256sums.txt`, `sampler2.log`, and the tool source on
 the persistent evidence path; hashes in the packet.
+
+---
+
+## D2/D3 plugin transport + OpenCL slot import — built and mechanism-proven; the served gate stays OWED (2026-09-24)
+
+[`code` + `measured-here`. Plugin patch `0049` build-verified device-free; one
+B60 leg for the mechanism. NO served run; the three gate rows stay OPEN. The
+arcwell module was loaded fresh (it had been unloaded by the host's sleep) and
+left loaded; see the packet.] This leg supplies the last two items the
+byte-destination proof recorded as OWED: the plugin-side `Transport`, and the
+OpenCL import that makes the BO-backed slot the destination the resident expert
+is read from.
+
+### 1. The transport (patch `0049`, `moe/pinned_nvme_transport.hpp`)
+
+`code`. `lgc::nvme_fill::ArcwellTransport` implements the `Transport` interface
+patch `0048` injected empty. Per the destination proof's decided mechanism, it
+never asks arcwell for an allocator (there is none): it creates each
+64 KiB-rounded xe VRAM BO itself with the raw DRM ioctls
+(`DRM_IOCTL_XE_GEM_CREATE` with VRAM placement + `NEEDS_VISIBLE_VRAM` +
+`CPU_CACHING_WC`, then `DRM_IOCTL_PRIME_HANDLE_TO_FD`), registers it
+peer-to-peer (`AW_IOC_MAP_BUFFER`, asserting `AW_MAP_F_REQUIRE_P2P`), and
+drives `AW_IOC_SUBMIT_BATCH` / `AW_IOC_BATCH_WAIT` with the schedule's one
+batch per layer, four in flight. `submit()` checks `out_submitted`/`out_err`,
+not the ioctl return alone (the dated correction: an unaligned geometry returns
+0 with `submitted=0`, `err=-22`). Lifetime: the BO's GEM handle is owned by the
+render-node fd; the exported dma-buf is a separate reference; arcwell takes its
+own `dma_buf_get` at `MAP_BUFFER`, so the caller may close the exported fd after
+a successful map; registrations release by `AW_IOC_UNMAP_BUFFER` or fd close;
+in-flight batches hold the buffer until collected.
+
+### 2. The OpenCL import into the slot descriptors
+
+`code`. `bind_pinned_nvme_pool()` imports each registered dma-buf with
+`engine.import_buffer()` (`code`: `src/plugins/intel_gpu/src/runtime/ocl/
+ocl_engine.cpp:111-165` — `clCreateBufferWithProperties` with
+`CL_EXTERNAL_MEMORY_HANDLE_DMA_BUF_KHR` `0x2067` + the fd, then
+`cl::ExternalMemoryHelper::acquire`; `ocl_ext.hpp:347` defines the handle
+constant; read on the build host) and **replaces this layer's host-mapped
+`gate_w`/`up_w`/`down_w`** with a `reinterpret_buffer()` of the imported pool.
+The fused GEMV kernel indexes `gate_weight_addr + expert_id * expert_wei_size`
+(`code`: `moe_3gemm_swiglu_mlp.cl:516`, a build-host read), so the per-tensor
+pool layout keeps the stride and the full-layout wrapper keeps
+`expert_tensor_span()`'s `total_bytes/num_expert` arithmetic; `bind_pinned_nvme_
+pool()` now asserts that equality rather than assuming it. What stays on the host path: the six
+scale/zp tensors, which the artifact-format verdict excludes from the DMA slice
+(weights + scales + zp = 2,553,600 B = 623.4375 pages, not page-aligned, and
+the device wants `[group][oc]` vs the file's `[oc][group]`). They are
+host-uploaded here, at load, on the engine's service stream
+(`fill_weights_memory(..., include_weights=false)`), completing each pinned
+slot before the first routed call. A non-resident expert never enters this
+path: it still takes the host tier at the existing static-partition branch.
+
+**Geometry correction, dated.** The store record is `gate|up|down`
+concatenated; the plugin's device layout is three per-tensor slot regions, so
+ONE expert is THREE page-aligned requests (each 819,200 B = 200 pages), not
+one. The design note's "one expert = one request" held only for the synthetic
+store whose whole file mapped to one destination. The store ordinal is
+layer-major — `dense_layer * capacity + slot`, file `expert_%04u.bin` — and was
+verified against the manifest (0 mismatches over all 3,408).
+
+### 3. The B60 mechanism proof (`tools/arcwell_cl_slot_proof.c`)
+
+`measured-here` on the B60 alone (`8086:E211`; the A770 untouched). A tracked
+non-arcint client, run in the container (which now has `/dev/arcwell` and the
+store mounted), creates three per-tensor VRAM BOs, DMA's two real store experts
+(six requests), imports every dma-buf into OpenCL, and reads the BOs back
+through the OpenCL queue. Verbatim apart from the operator-local path tokens
+(`<render-node>`, `<store>`, `<packet>`):
+
+```
+drm=<render-node> store=<store> n=2 capacity=4 tensor=819200 region=3276800 bo=3276800
+BO[0]: gem=1 prime_fd=5 aw_handle=22 size=3276800 out_flags=0x1
+BO[1]: gem=2 prime_fd=6 aw_handle=23 size=3276800 out_flags=0x1
+BO[2]: gem=3 prime_fd=7 aw_handle=24 size=3276800 out_flags=0x1
+SUBMIT: batch_id=1 submitted=6 err=0
+COLLECT: bytes=4915200 completed=6 segments=6 err=0 (of 6 requests)
+OpenCL device: Intel(R) Arc(TM) Pro B60 Graphics (acquire/release present)
+BO[0] imported into OpenCL
+BO[1] imported into OpenCL
+BO[2] imported into OpenCL
+READBACK: wrote 4915200 B to <packet>/readback-cl.bin
+STATS delta: via_host_bounce 0->0 max_inflight 6->6 batches 7->8 batch_reads 24->30 segments 24->30 bytes 19660800->24576000
+READBACK: 4915200 B through OpenCL byte-identical to the store record
+RESULT=PASS -- 2 real expert(s) DMA'd by controller into per-tensor VRAM BOs, imported into OpenCL on Intel(R) Arc(TM) Pro B60 Graphics, read back byte-identical, via_host_bounce delta 0, max_inflight 6, 6 requests
+rc=0
+```
+
+**The STATS baseline is nonzero, and that is the measurement.** `AW_IOC_STATS`
+is a module-global counter, so the absolutes carry the earlier mutation legs'
+registrations (`aw_handle` 22/23/24, `batches 7->8`); this leg's own delta is
+`batches +1`, `batch_reads +6`, `segments +6`, `bytes +4,915,200`, and
+`via_host_bounce` **0→0**. A run against a freshly loaded module reads these
+absolutes from zero (the counter is module-global, `aw_uapi.h`: read it as a
+delta, never absolute); only the absolutes differ, not the per-leg delta.
+
+Byte identity (a DMA payload read back through the OpenCL queue — legitimate
+byte comparison; the B60 compute caveat does not apply). `expected-cl.bin` is
+produced by concatenating, for each tensor t, the file's `[t*T, (t+1)*T)` slice
+for slots 0..n-1 (`normal-cl.txt`'s own expected side; command in the packet):
+
+```
+d463d1d5fda90c6fd6364e2bf5f5c894a8ecb8810a309147146b69e0cb91587c  readback-cl.bin
+d463d1d5fda90c6fd6364e2bf5f5c894a8ecb8810a309147146b69e0cb91587c  expected (store gate|up|down slices)
+```
+
+### 4. Red-first legs (all five measured RED)
+
+`measured-here`. All five `--mutate-*` legs exit `rc=1` with their named
+failure; each has its own raw transcript in the packet (`mut-*.txt`, hashes in
+`sha256sums.txt`):
+
+| leg | raw result | rc |
+|---|---|---|
+| `--mutate-offset-unaligned` | `RESULT=FAIL -- [MUTATED] unaligned transfer geometry refused` + `SUBMIT refused unaligned in_dest_offset: submitted=0 err=-22` | 1 |
+| `--mutate-no-part-offset` | `RESULT=FAIL -- readback mismatch at byte 0 (expected for this mutation)` | 1 |
+| `--mutate-system-bo` | `RESULT=FAIL -- [MUTATED] host-bounce configuration refused` + `MAP_BUFFER refused system-memory BO: Numerical result out of range (via_host_bounce 0->0)` | 1 |
+| `--mutate-readback` | `RESULT=FAIL -- readback mismatch at byte 409600 (expected for this mutation)` | 1 |
+| `--mutate-cl` | `RESULT=FAIL -- readback mismatch at byte 0 (expected for this mutation)` (corruption written through OpenCL) | 1 |
+
+The campaign's named synchronous-read refusal stays covered by
+`pinned_nvme_fill_refuses_a_synchronous_read_on_the_decode_path` in
+`tests/test_pinned_nvme_fill.cpp` (patch `0048`), mutation-tested earlier: the
+`Transport` interface has no synchronous read, and `require_no_sync_read()`
+refuses a would-be `AW_IOC_READ_BLOCKS` once serving has begun.
+
+### 5. Build evidence
+
+`measured-here`. Patch
+`0049-moe-otd-pinned-nvme-transport.patch`, sha256
+`d6d3498d20fddf22b2972ba128c7b719dd8b759e4378a4b16f838296b54a630f`, mirrored
+byte-for-byte (`cmp` of the two tracked copies is clean). It reverse-applies
+and re-applies cleanly on the 0048 tree; raw transcript
+(`apply-check-0049.txt` in the packet):
+
+```
+## reverse --check
+rc=0
+## reverse
+rc=0
+## forward --check
+rc=0
+## forward
+rc=0
+```
+
+and compiles clean with the production target (raw transcript
+`build-0049.log`, rc captured):
+
+```
+[0/2] Re-checking globbed directories...
+[1/7] ... test_kernels_db_gen.py ... OK
+[2/7] Building CXX object .../moe/moe_otd_runtime.cpp.o
+[3/7] Building CXX object .../moe/expert_weight_providers.cpp.o
+[4/7] Building CXX object .../moe/moe_3gemm_swiglu_opt.cpp.o
+[5/7] Linking CXX static library .../libopenvino_intel_gpu_graph.a
+[6/7] Linking CXX shared module .../libopenvino_intel_gpu_plugin.so
+ninja_rc=0
+```
+
+### 6. What this leg does NOT discharge
+
+`docs/window-053.md` dependency 3's **consumer-integration** clause stays
+standing. The transport and import now exist and are proven at the mechanism
+level, but the integrated **served** number — the fill running inside the
+serving loop, the depth-4 gate rows, cold TTFT both arms, byte-identity across
+two cold boots, decode non-regression — is **OWED**. No gate row was
+half-measured. The cost named for leaving it owed: a served run needs the
+depth-4 artifact's own layer keys matched to the store (the store holds the
+depth-48 ratio-86 splitmix64 set, layer-major); the transport's ordinal
+arithmetic is the store's, and an artifact whose layer keys differ needs the
+store re-pointed.
+
+**Evidence classes, this leg.** The mechanism, geometry, lifetime and slot
+descriptor change: `code` (patch `0049`; `moe_3gemm_swiglu_mlp.cl:516`;
+`arcwell.c`; `USING_ARCWELL.md`). The B60 proof, the sha256 identity and the
+five red legs: `measured-here` (B60). The compile and apply checks:
+`measured-here`. The served gate: **OWED**.

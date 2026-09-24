@@ -1223,6 +1223,64 @@ with that reason — exactly the note's "arcwell cannot be set up at all is a
 load failure" rule. With the env unset, patch 0018/0046/0047 behaviour is
 unchanged.
 
+## 0049 — the arcwell transport and the OpenCL slot import
+
+`0049-moe-otd-pinned-nvme-transport.patch` supplies the production `Transport`
+0048 injected empty, and the OpenCL import that makes the BO-backed slot the
+destination the resident expert is read from. Two new files:
+
+- `moe/pinned_nvme_transport.hpp` — `lgc::nvme_fill::ArcwellTransport`, the
+  `Transport` implementation. It owns the `/dev/arcwell` fd and the Arc render
+  node fd, creates one 64 KiB-rounded xe VRAM BO per (layer, tensor)
+  (`DRM_IOCTL_XE_GEM_CREATE` with VRAM placement + `NEEDS_VISIBLE_VRAM` +
+  `CPU_CACHING_WC`), exports the dma-buf (`DRM_IOCTL_PRIME_HANDLE_TO_FD`),
+  registers it peer-to-peer (`AW_IOC_MAP_BUFFER`, asserting
+  `AW_MAP_F_REQUIRE_P2P`), and drives `AW_IOC_SUBMIT_BATCH` /
+  `AW_IOC_BATCH_WAIT`, checking `out_submitted`/`out_err` (the ioctl return
+  alone is not enough; an unaligned geometry returns 0 with submitted=0,
+  err=-22). It expands one expert into THREE page-aligned requests — the store
+  record is `gate|up|down` concatenated and the plugin's device layout is
+  three per-tensor regions — with the store ordinal `dense_layer * capacity +
+  slot` and `expert_%04u.bin` (the ordering was verified layer-major, 0
+  mismatches against the manifest).
+- `moe/aw_uapi.h` — arcwell's uAPI header (BSD-2-Clause), vendored because the
+  plugin build cannot see `~/src/arcwell`.
+
+`expert_weight_providers.*` gains `create_pinned_nvme_pool()` (register the
+three BOs before the barrier), `pinned_nvme_geometry()`, and
+`bind_pinned_nvme_pool()` — which **imports the dma-bufs with
+`engine.import_buffer()`** and **replaces the host-mapped `gate_w`/`up_w`/
+`down_w`** with `reinterpret_buffer()`s of the imported pool, so the fused GEMV
+kernel reads the controller-DMA'd bytes directly. `moe_otd_runtime.*`'
+`fill_weights_memory()` gains `include_weights=false`, used to host-upload only
+the six scale/zp tensors (which the DMA slice excludes: adding them is 623.4375
+pages, not page-aligned, and they need the `[oc][group]`→`[group][oc]`
+transpose), completing each pinned slot at load on the engine's service stream.
+Customisation is opt-in and operator-set: `MOE_OTD_PINNED_NVME_FILL`,
+`MOE_OTD_PINNED_NVME_DRM`, `MOE_OTD_PINNED_NVME_STORE`,
+`MOE_OTD_PINNED_NVME_PART_START`.
+
+MEASURED (2026-09-24, device-free + one B60 leg): the patch, sha256
+`d6d3498d20fddf22b2972ba128c7b719dd8b759e4378a4b16f838296b54a630f`, reverse-
+applies and re-applies cleanly on the 0048 tree and compiles clean
+(`ninja openvino_intel_gpu_plugin`, `ninja_rc=0`); the apply transcript
+(`apply-check-0049.txt`) and the complete build log (`build-0049.log`) are in
+the packet. The mechanism was proven on the B60 end-to-end by the tracked
+non-arcint client `tools/arcwell_cl_slot_proof.c`: three per-tensor VRAM BOs,
+two real store experts DMA'd as six requests, imported into OpenCL, read back
+through the OpenCL queue **byte-identical** (sha256 `d463d1d5…`),
+`via_host_bounce` delta 0, `max_inflight` 6. All five red legs fail as required
+(`rc=1`, named failure, one transcript each in `mut-*.txt`): unaligned
+geometry, dropped partition offset, system-memory BO, corrupted readback,
+OpenCL corruption.
+
+**OWED, stated not faked.** The integrated served number — the fill running
+inside the serving loop and the depth-4 gate rows — is NOT measured here; the
+plugin was built and the mechanism proven, but the acceptance gate's three
+rows (`docs/window-053.md`) stay OPEN. The store ordering used by the
+transport is the store's own layer-major ordinal; a run against an artifact
+whose layer keys differ from the store's would need the store re-pointed.
+
 ## Not carried either: the measurement instrument
 
 The arcint session's working tree also carries per-stage timing accumulators

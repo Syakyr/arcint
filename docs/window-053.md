@@ -317,6 +317,24 @@ things block it today. Every one is recorded, not worked around.
    OpenCL import into OpenVINO's slot descriptors, and the "serving step with
    the fill overlapping" number — none exists yet, so the three rows stay OPEN.
    See the campaign's "D2/D3 byte destination" section.]
+   [TRANSPORT + OPENCL IMPORT BUILT 2026-09-24, plugin transport leg —
+   dependency 3 STANDS. The plugin now ships the production `Transport`
+   (`moe/pinned_nvme_transport.hpp`: raw xe VRAM BO creation, dma-buf export,
+   `AW_IOC_MAP_BUFFER` peer-to-peer, `AW_IOC_SUBMIT_BATCH`/`AW_IOC_BATCH_WAIT`)
+   and the OpenCL import (`bind_pinned_nvme_pool()`: `engine.import_buffer()`
+   replaces the layer's host-mapped `gate_w`/`up_w`/`down_w`, so the resident
+   expert is read from the BO; the six scale/zp tensors stay on the host path).
+   Patch `0049` reverse-applies/re-applies on the 0048 tree and compiles clean
+   (rc 0; `apply-check-0049.txt` and `build-0049.log` in the packet); the
+   mechanism is proven on the B60 by
+   `tools/arcwell_cl_slot_proof.c` — two real store experts DMA'd into
+   per-tensor VRAM BOs, imported into OpenCL, read back **byte-identical**
+   (sha256 `d463d1d5…`), `via_host_bounce` delta 0, `max_inflight` 6 — with
+   five red legs. What still STANDS: the **integrated served number** (the fill
+   running inside the serving loop, cold TTFT both arms, byte-identity across
+   two cold boots, decode non-regression) and the depth-4-artifact↔store key
+   match; none is measured here. The three rows stay OPEN. See the campaign's
+   "D2/D3 plugin transport + OpenCL slot import" section.]
 
 **Consequence:** the three rows stay **OPEN**. [UPDATED 2026-09-23,
 artifact-format step: dependencies 1 and 2 are CLEARED, so the gate is no
@@ -462,3 +480,24 @@ paths, lock, raw output) live only in the git-ignored packet
   module load/unload, no store write; the arcwell module was found loaded and
   carved and left as found; wake lock taken and released; sampler minimum
   32.9 GiB, 0 watchdog trips.
+- 2026-09-24, later — **plugin transport + OpenCL import leg: built and
+  mechanism-proven; dependency 3 STANDS; the three rows stay OPEN.** Patch
+  `0049` adds `moe/pinned_nvme_transport.hpp` (production `Transport`: raw xe
+  VRAM BO + dma-buf export + `AW_IOC_MAP_BUFFER` peer-to-peer +
+  `AW_IOC_SUBMIT_BATCH`/`AW_IOC_BATCH_WAIT`, store ordinal `dense_layer *
+  capacity + slot`) and `moe/aw_uapi.h`, wires it into the coordinator, and
+  replaces each layer's host-mapped `gate_w`/`up_w`/`down_w` with BO-backed
+  memories imported through `engine.import_buffer()`; the six scale/zp tensors
+  stay on the transposing host path and are uploaded at load. The patch
+  reverse-applies/re-applies on the 0048 tree and compiles clean (rc 0). The
+  mechanism was proven on the B60 end-to-end by `tools/arcwell_cl_slot_proof.c`
+  (three per-tensor VRAM BOs, two real store experts as six requests, OpenCL
+  import, byte-identical readback sha256 `d463d1d5…`, `via_host_bounce` delta
+  0, `max_inflight` 6) with five red legs. What stays OWED: the integrated
+  served number (cold TTFT both arms, byte-identity across two cold boots,
+  decode non-regression) and the depth-4-artifact↔store key match. One card
+  leg on the B60 alone (`8086:E211`), A770 untouched; the arcwell module was
+  found unloaded (host sleep) and loaded for the leg, left loaded; `/dev/arcwell`
+  and the store were passed into the container to run the proof; sampler
+  minimum `MemAvailable` 30.66 GiB (32,153,844 kB), 0 watchdog trips. The wake
+  lock was found held by the coordinator and left untouched.

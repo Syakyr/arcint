@@ -211,7 +211,14 @@ collected all (`results/ASYNC_2026-09-15.txt`).
   ratios is one batch per layer: **71 requests at ratio 86**, **128 at ratio
   75** (`code`: plugin integer division `512*(100−r)/100`; the fit ledger's
   `ceil` is the over-reserving host figure, per the campaign's dated
-  correction). Keep **4 batches in flight** — arcwell measured four batches
+  correction). [DATED IN PLACE 2026-09-24, patch 0049 leg: with the REAL store
+  this count is not the request count. The store record is `gate|up|down`
+  concatenated while the plugin's device layout is three per-tensor regions, so
+  one expert is **three** page-aligned requests: 213 at ratio 86, 384 at ratio
+  75. `AW_BATCH_MAX = 256` therefore does not fit ratio 75 in one batch; the
+  production transport chunks by experts (`kPerBatch = 85`, 255 requests) and
+  composites the arcwell batch ids. The ratio-86 gate scope (213 requests) is
+  one batch.] Keep **4 batches in flight** — arcwell measured four batches
   overlapping and all collecting (`results/ASYNC_2026-09-15.txt`) — and collect
   the oldest with `AW_IOC_BATCH_WAIT` (one collector per id; a second concurrent
   wait returns `-EBUSY`, `code`: `aw_uapi.h`).
@@ -534,3 +541,25 @@ confirmation.
   dependency 3's destination clause is CLEARED in place; its
   consumer-integration clause stays standing. No `arcint` leg; the arcwell
   module was found loaded and carved and left as found.
+
+- 2026-09-24, later — **plugin transport + OpenCL slot import leg: the
+  destination is wired and the mechanism is proven; the served gate stays
+  OWED.** Patch `0049` supplies `lgc::nvme_fill::ArcwellTransport` (raw xe VRAM
+  BO creation + dma-buf export + `AW_IOC_MAP_BUFFER` peer-to-peer +
+  `AW_IOC_SUBMIT_BATCH`/`AW_IOC_BATCH_WAIT`, with the store ordinal `dense_layer
+  * capacity + slot`) and `bind_pinned_nvme_pool()`, which imports the dma-bufs
+  with `engine.import_buffer()` and **replaces the layer's host-mapped
+  `gate_w`/`up_w`/`down_w`** with BO-backed memories, so the fused GEMV kernel
+  reads the controller-DMA'd bytes directly; the six scale/zp tensors stay on
+  the transposing host path and are uploaded at load
+  (`fill_weights_memory(..., include_weights=false)`). Dated correction to §3:
+  the store record is `gate|up|down` concatenated but the device layout is
+  three per-tensor regions, so one expert is **three** page-aligned requests,
+  not one; "one expert = one request" held only for the synthetic store.
+  Build: patch reverse-applies/re-applies on the 0048 tree and compiles clean
+  (rc 0). Mechanism on the B60: `tools/arcwell_cl_slot_proof.c` DMA'd two real
+  store experts into per-tensor VRAM BOs, imported them into OpenCL and read
+  them back **byte-identical** (sha256 `d463d1d5…`), `via_host_bounce` delta 0,
+  `max_inflight` 6; five red legs fail as required. §7 item 4 (the gate), the
+  served overlapping-step number, and the depth-4-artifact↔store key match stay
+  **OWED**; the three `docs/window-053.md` rows stay OPEN.
