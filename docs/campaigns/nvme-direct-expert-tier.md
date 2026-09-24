@@ -1641,3 +1641,208 @@ descriptor change: `code` (patch `0049`; `moe_3gemm_swiglu_mlp.cl:516`;
 `arcwell.c`; `USING_ARCWELL.md`). The B60 proof, the sha256 identity and the
 five red legs: `measured-here` (B60). The compile and apply checks:
 `measured-here`. The served gate: **OWED**.
+
+---
+
+## D4 integrated served leg — the pinned NVMe fill runs inside the serving loop; the integrated number EXISTS (2026-09-24)
+
+[`code` + `measured-here`. One B60 leg (`8086:E211`; the A770 untouched), plus
+a device-free store build/verify. NO new tracked code. The `docs/window-053.md`
+dependency 3 consumer half is CLEARED; the three gate rows stay OPEN.]
+
+This leg closes the last OWED item of the D2/D3 integration: the depth-4 store
+whose layer keys resolve to the served depth-4 artifact, and the integrated
+served run with the fill live.
+
+### 1. The depth-4 store (`measured-here` + `code`)
+
+The depth-48 store holds the splitmix64 ratio-86 set keyed to the depth-48
+artifact; the LISBON scope is depth 4 (`docs/window-053.md`), whose artifact has
+four different layer keys. A second store was built with the tracked writer
+(`tools/q4e/expert_store.py`, unchanged — driven, not rewritten).
+
+**The four layer keys** are the artifact's `weight_0` bin offsets — the layer's
+first OTD weight-file offset (`code`: patch 0013/0018; `get_const_offset`),
+read from the artifact IR as the `layerN/moe/experts_gate/weight_u4` constant
+offsets:
+
+```
+{"0": 284632533, "1": 2033390357, "2": 3650420373, "3": 5369067397}
+```
+
+The method is validated against the depth-48 layer-key map a served window
+already produced (the plugin's own census-seed refusal named `layer_key
+284636629`, the `layer0/moe/experts_gate/gridix_u8` offset of that artifact —
+`measured-here`). The depth-4 plugin's own histogram (§2) reproduces exactly
+`284632533 / 2033390357 / 3650420373 / 5369067397`, so the keys are not assumed.
+
+**Geometry** (`measured-here`, raw output on the persistent evidence packet):
+
+```
+file count            284
+sizes                 2457600 (all)
+filefrag extents      284 -> 1   (every file exactly ONE plain extent)
+non-plain flags       0          (every 7th file)
+last,eof              41/41      (every 7th file)
+st_blocks             4800       (fully allocated)
+alignment             600 pages r0; 4800 LBAs r0; 37 x 64 KiB r32768
+manifest              slice 2457600, group 128, 284 experts, seed 0xF2A17C0DE5EED, capacity 71
+```
+
+`aw_fiemap` byte-verifies all 284 against the raw device through the
+partition-start translation, and its `--mutate` red leg fails on content:
+
+```
+284 files, 284 extents total (1.00 per file), 284 verified against the raw device
+RESULT=PASS -- FIEMAP + partition offset gives the correct absolute LBA
+RED ... MISMATCH
+RESULT=FAIL -- raw device at the computed LBA is not the file's bytes
+```
+
+The manifest's ordinal→(layer, expert) map and the file sha256s match (0
+mismatches); ordinal = `layer * 71 + slot`, ascending layer-key order equals
+decoder order, so it is the transport's `dense_index * capacity + slot`
+(`code`: patch 0049).
+
+**Byte-transparency, verified directly** (`measured-here`): every pinned
+expert's `gate|up|down` slice in the store was compared against the artifact's
+own `weight_u4` constant bytes at `offset + expert * 819,200` — 4 layers × 71
+experts × 3 roles = **852 slices, 0 mismatches**. The store is not merely
+key-matched; it carries the served artifact's weights byte-for-byte. This is a
+file read, not a served forward, so the B60 compute caveat does not apply.
+
+### 2. The integrated served run (`measured-here`, B60)
+
+The transport + OpenCL import (patch 0049) are live; `MOE_OTD_PINNED_NVME_FILL=1`
+with the store dir, the B60 render node and the partition start. Toolchain: the
+0049-built plugin (sha256 `2d83e2a6…`), served binary `a6dac5b5…`, artifact
+`qwen38-flash-next-d4s-ov` xml `823997733f0b4b07`, ratio 86, `--moe-cpu-tier`, KV
+u8, chunk 512, n_ctx 8192, the 5-token France prompt, greedy.
+
+The load barrier did not refuse; the fill landed. The served run (fresh
+process, first run — the graph compiled):
+
+```
+props ready=1 after 97s
+lgc  load: language model ready in 19.3 s (paged); device-resident 1.88 GiB
+lgc  load: ngram table STAGED: 1 port(s) of 33600 rows x 90 B = 2.884 MiB ...
+lgc  load: expert slots: plateau probe settled at 0.19 GiB ... (source: probe-static)
+lgc  slot 0: prefill     5 tok in  1.43 s (  3.5 t/s) | graph 1.43 s, ...
+lgc  slot 0: decode      8 tok in  1.79 s (  4.5 t/s) | graph 1.66 s, ...
+[OTD_PERF] gpu_hits=736, gpu_misses=4231, gpu_hit_rate=14.8178%, ... evictions=0,
+  acquisitions=4967, device_slot_buffers=0, host_slot_buffers=36, staging_bytes=409600,
+  cpu_tier_pairs=82904, cpu_tier_experts=4231
+```
+
+**The integrated served number.** The fill overlaps the serving boot.
+`T_boot` = 97 s (served boot to `/props → 200`); `T_prefill` = 1.43 s (the
+5-token prefill forward). The arcwell-arm integrated cold TTFT is therefore
+**98.4 s**, below the pinned `X = 139.5 s` — but this is a single-arm number,
+not the gate: the host-fed arm was not run in the same window, so
+`docs/window-053.md`'s row stays EMPTY/OPEN. A second run (warm model cache)
+reads boot 21 s, prefill 0.12 s, decode 0.13 s, streamed TTFT 0.25 s, and
+repeats the exact same stats delta — a consistency check, not a cold run.
+
+**`AW_IOC_STATS` delta** (module-global, read before/after; the design note's
+requirement):
+
+```
+run 1: bytes 31,948,800 -> 729,907,200   (+697,958,400 = the exact pinned-store size)
+       reads 39 -> 891, segments 39 -> 910, batches 12 -> 16, batch_reads 39 -> 891
+       via_host_bounce 0 -> 0   max_inflight 6 -> 220
+run 2: bytes 729,907,200 -> 1,427,865,600 (+697,958,400); batches 16 -> 20
+       via_host_bounce 0 -> 0   max_inflight 220 -> 220
+```
+
+`via_host_bounce = 0` and `max_inflight = 220 (> 1)` as required; the bytes
+delta is **exactly** the 284-expert pinned payload, so the controller DMA moved
+the store and nothing else. The module's own per-client accounting records the
+12 registrations and their release:
+
+```
+arcwell: MAP_BUFFER handle=49 npages=14208 bytes=58195968 peer2peer=1 (live=1 peak=1)
+  ... handle=60 ... (live=12 peak=12)
+arcwell: UNMAP_BUFFER handle=49 (live=11 peak=12)
+  ... handle=60 (live=0 peak=12)
+```
+
+(`bytes=58,195,968` is the 64 KiB round-up of the 58,163,200-byte per-tensor
+pool, 71 × 819,200; twelve BOs = three tensors × four layers. These `live`/`peak`
+figures are **per-client**, `code`: `arcwell.c:1081`; an `AW_IOC_STATS` read from
+a separate client fd therefore reports `buffers_live=0 buffers_peak=0`, which is
+expected and is not a contradiction.)
+
+**BO-backed-slot evidence, stated with its limit.** The fill wrote the store
+bytes into the 12 per-tensor VRAM BOs; `bind_pinned_nvme_pool` imported each
+dma-buf with `engine.import_buffer()` and replaced that layer's
+`gate_w`/`up_w`/`down_w` (the stride assertion would throw otherwise), so the
+fused GEMV kernel reads the imported pool (`code`: patch 0049; the integrated
+run does not itself read a BO back — the OpenCL readback identity is the
+earlier `tools/arcwell_cl_slot_proof.c` leg). The plugin's `device_slot_buffers`
+counter stays 0 because it is incremented at **compile-time** `allocate_memory`
+(`code`: `moe_offload_constant.cpp:161`), not at the runtime import — it is not
+a BO counter and nothing in this leg reads it as one. The direct byte evidence
+is the 852-slice store↔artifact identity (§1) plus the exact-bytes DMA delta.
+
+**Key-match verification, from the plugin itself** (`measured-here`):
+`MOE_OTD_ROUTING_HIST` dumped `layer,weight_offset,expert,count` — 4 layers,
+`key_collisions=0`, weight offsets exactly
+`284632533 / 2033390357 / 3650420373 / 5369067397`. The store and the artifact
+agree on the keys the transport uses. No key-mismatch refusal was needed; none
+was exposed.
+
+**Host-RAM picture.** The PLE staging term is already banked (26.82 GiB →
+**2.884 MiB**, read from the run's own `ngram table STAGED` line). The expert
+host pool ceiling is `0.66 GiB (GTT)` against `0.19 GiB` resident; the run's
+peak `VmRSS` was 3.53 GiB (cold) / 2.98 GiB (warm). Physical-host
+`MemAvailable` minimum over the served run's own window **45.26 GiB**;
+**0 watchdog trips**. (The sampler's overall minimum, 23.7 GiB, fell at
+08:14:46 during the preceding failed CPU-plugin attempts, before the served
+run — not during it. The 4 GiB watchdog was armed before the leg.)
+
+### 3. The environment regression, diagnosed and worked around (operator-local)
+
+The first attempts crashed in the OpenVINO **CPU plugin's** `cpu_info()` parse
+(`free(): invalid next size (fast)`, gdb backtrace through
+`ov::get_proc_type_table()` ← `IStreamsExecutor::Config::update_executor_config()`),
+before any graph compile — reproducibly, with the same binary+plugin that
+served on 2026-09-23. Cause: the container's
+`/sys/devices/system/cpu/online` is a **sparse** list (`0,2,5,...`) while
+`possible` is `0-15`; `lin_system_conf.cpp`'s parse loop only advances on
+ranges, so a comma-only list corrupts the proc-type table. The leg ran the
+served process inside a private mount namespace presenting a contiguous
+`online`/`possible` view, which restores the 2026-09-23 behaviour
+(`measured-here`: with the contiguous view the depth-48 model compiles and
+loads — `lgc load: language model ready in 27.7 s`). This is operator
+infrastructure, not campaign code; no tracked file changes for it.
+
+### 4. Card, lock, module, service state
+
+- **Before:** no `arcint`; no competing service; `arcwell` loaded and carved
+  (inherited), `/dev/arcwell` present; B60 active, `power/control=on`; A770
+  suspended, untouched; the coordinator's wake lock held (not touched, not
+  released).
+- **One card leg at a time;** the B60 alone; the A770 never opened.
+- **Sampler (SOP §1):** the physical-host sampler ran before the leg with the
+  4 GiB watchdog; minimum `MemAvailable` 23.7 GiB, **0 trips**.
+- **After:** no `arcint`; `arcwell` left **loaded and carved** as found (the
+  `~/src/arcwell/KERNEL_FACTS.md` half-state hazard forbids unloading a carved
+  GPU); B60 active; A770 untouched; the leg's BO registrations released at fd
+  close; the wake lock still held and untouched.
+
+### 5. What clears, and what remains
+
+`docs/window-053.md` dependency 3's **consumer-integration** clause is
+**CLEARED**: an integrated served run exists (the fill inside the serving loop,
+`via_host_bounce = 0`, the exact-bytes delta, the artifact↔store key match).
+The three gate rows stay **OPEN** — they are the next leg: both arms in one
+window (cold TTFT, arcwell ≤ host-fed, ≤ `X`), the `os.wait4` RSS row, and the
+two-cold-boot determinism row (with the A770 confirmation where the B60 is not
+bit-readable).
+
+**Evidence classes, this leg.** Layer keys and the method: `code` (patches
+0013/0018; `moe.cpp`) + `measured-here` (the artifact IR offsets and the
+plugin's own histogram). Store geometry/FIEMAP/manifest/byte-transparency:
+`measured-here` (ext4 partition). The integrated run, stats delta, OTD_PERF and
+timings: `measured-here` (B60). The CPU-plugin regression: `measured-here`
+(gdb + the namespace fix). The three gate rows: **OPEN/OWED**.

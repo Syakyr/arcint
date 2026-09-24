@@ -335,6 +335,24 @@ things block it today. Every one is recorded, not worked around.
    two cold boots, decode non-regression) and the depth-4-artifact↔store key
    match; none is measured here. The three rows stay OPEN. See the campaign's
    "D2/D3 plugin transport + OpenCL slot import" section.]
+   [CLEARED 2026-09-24, D4 integrated served leg — dependency 3's
+   consumer-integration clause is CLEARED. A depth-4 store was built with the
+   tracked writer (`tools/q4e/expert_store.py`, unchanged; 4 layers × 71 experts
+   = 284 experts / 697,958,400 B, one plain extent each, `aw_fiemap` verifies
+   all 284 against the raw device, manifest exact) and its four layer keys are
+   the served artifact's `weight_0` bin offsets
+   (`284632533 / 2033390357 / 3650420373 / 5369067397`) — the plugin's own
+   `MOE_OTD_ROUTING_HIST` dump reproduces exactly those keys, and 852/852
+   pinned expert-role slices are byte-identical to the artifact's `weight_u4`
+   constants. The integrated B60 run with `MOE_OTD_PINNED_NVME_FILL=1` did not
+   refuse: boot to `/props` 97 s, `T_prefill` 1.43 s (arcwell-arm cold TTFT
+   **98.4 s** = `T_boot` 97 s + `T_prefill` 1.43 s, `code` arithmetic over
+   `measured-here` terms), `AW_IOC_STATS` delta `bytes +697,958,400` exactly,
+   `via_host_bounce 0→0`, `max_inflight 220`, 12 BOs live and released. The three
+   gate rows stay **OPEN** — they are the next leg: both arms in one window
+   (cold TTFT, arcwell ≤ host-fed, ≤ `X`), the `os.wait4`/`ru_maxrss` row, and
+   the two-cold-boot determinism row with its A770 confirmation. See the
+   campaign's "D4 integrated served leg" section.]
 
 **Consequence:** the three rows stay **OPEN**. [UPDATED 2026-09-23,
 artifact-format step: dependencies 1 and 2 are CLEARED, so the gate is no
@@ -351,14 +369,35 @@ so the gate is no longer blocked on "there is no destination". Dependency 3
 STANDS only on its consumer-integration half: the plugin-side `Transport`, the
 OpenCL import into the slot descriptors, and the "serving step with the fill
 overlapping" number. The three rows stay OPEN.]
-The gate's own bytes cannot be laid down. This document is the criteria, not a
-measurement.
+[UPDATED 2026-09-24, D4 integrated served leg — **dependency 3 is CLEARED**: its
+last clause, the consumer integration with an integrated served number, now
+exists. The plugin transport + OpenCL slot import run inside the serving loop on
+the depth-4 artifact whose store holds the same layer keys; the arcwell arm's
+integrated cold TTFT is `T_boot` 97 s (served boot to `/props → 200`) +
+`T_prefill` 1.43 s = **98.4 s** (`code` arithmetic over `measured-here` terms;
+the run-1 streamed-TTFT client call failed, so 98.4 s is the composed figure,
+not an instrument reading), the `AW_IOC_STATS` delta is `bytes +697,958,400` (the
+exact pinned payload) with `via_host_bounce 0→0` and `max_inflight 220`. The gate
+is no longer blocked on a missing consumer. The three gate rows stay **OPEN** —
+the NEXT leg is the two-arm window, the `os.wait4` RSS row and the two-cold-boot
+determinism row.]
+[CORRECTED 2026-09-24, D4 integrated served leg: the retained sentence this
+note replaces ("The gate's own bytes cannot be laid down.") is no longer true —
+a byte-transparent store exists and the fill **landed** on the B60
+(`AW_IOC_STATS bytes +697,958,400`, `via_host_bounce 0`). The three acceptance
+rows are still EMPTY; this document remains the criteria, not a measurement of
+the gate.]
 
 ## Harness and tools the measurement will use (named now)
 
 - **served binary** `arcint` + plugin `ov-0047` (`f021de51b5812ee2`, patches
   0003–0047), KV u8, `--moe-cpu-tier`, `--offload-ratio 86`, the pinned
   `--prefill-chunk` and `--n-ctx`; artifact sha pasted at measurement.
+  [UPDATED 2026-09-24, D4 integrated served leg: the LISBON gate window needs the
+  plugin that carries the pinned NVMe fill — patches through `0049`
+  (sha256 `2d83e2a6…`), not `ov-0047`; `ov-0047` cannot run the arcwell arm.
+  The D4 integrated leg used the 0049 plugin and the served binary
+  `a6dac5b5…`. The two-arm gate must use that plugin.]
 - **device-free probe** `tools/boot_serving_shape.py` (`--stage compile` /
   `--stage forward`, `--cut layerN/out`, `--repeat`) for the determinism
   localisation.
@@ -501,3 +540,20 @@ paths, lock, raw output) live only in the git-ignored packet
   and the store were passed into the container to run the proof; sampler
   minimum `MemAvailable` 30.66 GiB (32,153,844 kB), 0 watchdog trips. The wake
   lock was found held by the coordinator and left untouched.
+- 2026-09-24, later — **D4 integrated served leg: the pinned NVMe fill runs
+  inside the serving loop; dependency 3 is CLEARED and the integrated number
+  exists.** A depth-4 store was built with the tracked writer (unchanged): 284
+  files of 2,457,600 B, every file one plain extent, `aw_fiemap` byte-verifies
+  all 284 against the raw device with its `--mutate` leg failing on content,
+  manifest mapping and sha256s exact; its four layer keys are the served
+  artifact's `weight_0` bin offsets, and the plugin's own `MOE_OTD_ROUTING_HIST`
+  dump reproduces exactly them (`key_collisions=0`), with 852/852 pinned
+  expert-role slices byte-identical to the artifact's `weight_u4` constants. The
+  integrated B60 run with `MOE_OTD_PINNED_NVME_FILL=1` did not refuse: boot to
+  `/props` 97 s, `T_prefill` 1.43 s (arcwell-arm cold TTFT **98.4 s** = boot +
+  prefill, `code` arithmetic), and the
+  `AW_IOC_STATS` delta is `bytes +697,958,400` exactly, `via_host_bounce 0→0`,
+  `max_inflight 220`, 12 BOs live and released. `docs/window-053.md` dependency
+  3 is cleared in place; the three gate rows stay **OPEN** (the next leg). No
+  new tracked code; the A770 was untouched; the arcwell module was left loaded
+  and carved; the coordinator's wake lock was left held and untouched.

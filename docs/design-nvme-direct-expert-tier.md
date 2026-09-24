@@ -563,3 +563,26 @@ confirmation.
   `max_inflight` 6; five red legs fail as required. §7 item 4 (the gate), the
   served overlapping-step number, and the depth-4-artifact↔store key match stay
   **OWED**; the three `docs/window-053.md` rows stay OPEN.
+
+- 2026-09-24, later — **D4 integrated served leg: the fill runs inside the
+  serving loop and the integrated number EXISTS; dependency 3's
+  consumer-integration clause is CLEARED, the three gate rows stay OPEN.** A
+  depth-4 store was built with the tracked writer (`tools/q4e/expert_store.py`,
+  unchanged): 4 layers × 71 experts = 284 experts / 697,958,400 B, every file
+  one plain extent, `aw_fiemap` byte-verifying all 284 against the raw device
+  with its `--mutate` leg failing on content, and the manifest mapping and
+  sha256s exact. Its four layer keys are the artifact's `weight_0` bin offsets
+  (`{284632533, 2033390357, 3650420373, 5369067397}`), and the plugin's own
+  `MOE_OTD_ROUTING_HIST` dump reproduces exactly those keys
+  (`key_collisions=0`); a direct file check finds **852/852** pinned
+  expert-role slices byte-identical to the artifact's `weight_u4` constants.
+  The integrated B60 run with `MOE_OTD_PINNED_NVME_FILL=1` did not refuse: boot
+  to `/props` 97 s, `T_prefill` 1.43 s (arcwell-arm cold TTFT **98.4 s**), and
+  the `AW_IOC_STATS` delta is `bytes +697,958,400` (the exact pinned payload),
+  `via_host_bounce 0→0`, `max_inflight 220`; 12 BOs were live and released. §7
+  item 4's remaining half (both arms in one window, the `wait4` RSS row, the
+  two-cold-boot determinism row) is the next leg. A container CPU-topology
+  regression (a sparse `online` list tripping the OpenVINO CPU plugin's
+  `cpu_info()` parse) was diagnosed and worked around operator-locally; no
+  tracked change. No new tracked code; the A770 was untouched and the wake lock
+  was left held.
