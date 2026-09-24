@@ -381,6 +381,42 @@ pgrep -af arcint                  # must be empty (host AND podman ps -a)
 ```
 Write the release line: timestamp, leftover count, card left as found.
 
+## 12. Results — B60 leg, 2026-09-24 (measured-there)
+
+All numbers from the container on the B60 box, artifact
+`qwen38-intel-int4-ov`, `--n-ctx 120000`, one lane. Runtime confirmed
+at the library: `2026.4.0-22849-71640275d29-marfrit-p15`.
+
+| Config | Prefill @64 tok | Decode | Draft accept |
+|---|---|---|---|
+| serial (temp 0.7) | 107 t/s | 23.6 t/s | — (gated off) |
+| MTP reconstructed, greedy, Hanoi | 108.7–110.3 t/s | **31.8 t/s** | 81.8% (466/570) |
+| MTP exported layer, greedy, Hanoi | 54.9 t/s (first-request artifact) | **32.4 t/s** | 83.0% (468/564) |
+| llama.cpp sycl draft-mtp2, Hanoi (`qwen3.8-27b-mtp2-sycl`) | 18.2 t/s | **22.3 t/s** | n/a |
+
+**Headline: arcint+MTP is +43% decode vs the llama.cpp sycl baseline
+on the same prompt.** Caveats: quantization differs (int4 NNCF IR vs
+UD-Q4_K_XL GGUF), MTP depth differs (1-layer vs n-max 2), prefill
+sample is 64 tokens (thin). Decode is the robust number.
+
+Other findings:
+- Reconstructed head: CORRECT (81.8% greedy; 1.35x over serial).
+- Exported layer marginally ahead of reconstructed (+2% t/s, +1.2pp
+  accept) on the same prompt.
+- Greedy determinism holds across restarts (identical counters both
+  boots).
+- Prefill variance from earlier runs was a first-request artifact;
+  repeats settle at ~109 t/s.
+- ctx ceiling with MTP resident: 126672/lane; 120000 served. Load
+  21.8–22.4 s, device-resident 13.06 GiB + 3.16 drafters.
+- **OPEN: cold-vs-warm cache showed no difference** (21.9/22.4 s cold
+  vs 21.8 s warm). Verify the `arcint-cache` volume is actually
+  populated after a boot; if empty, the volume-worth claim in the
+  handoff is wrong for this build.
+- Handoff doc inaccuracy: the load log does NOT print the OV version
+  string; the marfrit check must target
+  `/usr/lib/marfrit-openvino/openvino/libs/libopenvino.so.2640`.
+
 ## 11. Recording sheet (this leg's deliverable)
 
 Fill and keep with the leg:
