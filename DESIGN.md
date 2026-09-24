@@ -9827,6 +9827,124 @@ the design note states.
 requirement: a 32/44 GiB host can carry this model's n-gram table from disk,
 the way the reference default does, and the freed term returns to the expert
 host pool. LISBON-001's RSS-bounded-through-boot cell is where that is read.
+[DATED IN PLACE 2026-09-24, LISBON-001 gate window: the cell was read at
+`ru_maxrss` **3.697 GiB** on both arms (≤ the 32 GiB bound) and the staged
+n-gram term at **2.884 MiB**; see §7.0.2ch and `docs/window-053.md` row 2.]
+
+#### 7.0.2ch The NVMe expert tier inside the served loop is the load-time pinned fill, not a miss tier: arcwell beats host-fed on cold TTFT at prefetch depth 4 (2026-09-24)
+
+Campaign: `docs/campaigns/nvme-direct-expert-tier.md`; acceptance
+`docs/window-053.md` (LISBON-001: `X = 139.5 s` pinned 2026-09-23, the three
+rows filled 2026-09-24); design note `docs/design-nvme-direct-expert-tier.md`
+(§2 the warning horizon, §3 the schedule, §4 the fallback, §6 the FreeToken
+split); git-ignored handoff packet
+`docs/handoff-nvme-direct-expert-tier.local.md`. Plugin `ov-0049` (sha256
+`2d83e2a6…`, patches 0003–0049); served binary `a6dac5b5…`; artifact
+`qwen38-flash-next-d4s-ov`. The PLE half of the same "ships arrive from disk"
+story is §7.0.2cg.
+
+**The finding.** [measured-here] A load-time fill that moves the pinned expert
+set straight from the NVMe expert store into the card's VRAM through arcwell's
+batch surface (`AW_IOC_SUBMIT_BATCH` / `AW_IOC_BATCH_WAIT`) **pays on cold
+TTFT**: in ONE B60 window the arcwell arm read **92.492 s** against the
+host-fed arm's **99.679 s**, a **7.19 s margin**, both at or below the
+pre-pinned `X = 139.5 s` (`code`: arithmetic over the `measured-here` `T_boot` /
+`T_prefill` inputs, `docs/window-053.md`), and decode did not regress
+(**4.1 t/s** vs **3.4 t/s**).
+
+**Why it is the pinned fill and not a miss tier.** [code] The design note's §2
+answers the campaign's condition from the plugin patches: a layer's top-k ids
+are produced by that layer's own router and become host-visible only inside
+that layer's MoE hook (`patches/0012`, `0017`, `0037`, `0044`), so the routing
+warning horizon is **zero layers ahead** and a router-driven fetch cannot hide
+arcwell's 1.125 ms (arcwell's number, not ours). The one fetch the serving loop
+reaches is the **load-time pinned fill**, because the static partition's
+membership is a pure function of configuration fixed at `bind()` (`code`:
+patch 0018; patch 0046) — an unbounded warning. **as a miss tier, LISBON keeps
+the host hop**; the fill is scheduled only at load.
+
+**The mechanism.** [code] Patch 0049 supplies the production transport
+(`moe/pinned_nvme_transport.hpp`: raw xe VRAM BO, dma-buf export,
+`AW_IOC_MAP_BUFFER` peer-to-peer, `AW_IOC_SUBMIT_BATCH` / `AW_IOC_BATCH_WAIT`)
+and `bind_pinned_nvme_pool()`, which imports the dma-bufs with
+`engine.import_buffer()` and replaces the layer's host-mapped `gate_w` / `up_w`
+/ `down_w` with BO-backed memories; the six scale/zp tensors stay on the
+transposing host path. `lgc::nvme_fill::Scheduler(transport, /*depth=*/4)`
+issues one batch per layer, four in flight, collects and marks the slot filled
+before the first routed call. Design rule D3 holds: a pinned expert not landed
+by the load barrier is a **load failure**, never a silent demotion to the host
+tier — a boot's residency set cannot depend on I/O timing (§3.4).
+
+**The served gate.** [measured-here] Card B60, artifact
+`qwen38-flash-next-d4s-ov`, ratio 86 (`512*(100−86)/100 =` **71 slots/layer**,
+`code`), plugin `ov-0049`, served binary `a6dac5b5…`, one fresh process per arm,
+page cache dropped before each arm, the 5-token France prompt, greedy,
+`max_tokens 32`, both arms in ONE window:
+
+| quantity | arcwell arm (pinned fill) | host-fed arm (fill disabled) |
+|---|---|---|
+| cold TTFT (depth 4) | **92.492 s** | **99.679 s** |
+| boot to `/props → 200` | 90.25 s | 97.19 s |
+| request → first token | 2.247 s | 2.491 s |
+| decode | **4.1 t/s** (32 tok / 7.76 s) | 3.4 t/s (32 tok / 9.28 s) |
+
+The mechanism is visible in the same run's own counters: the host-fed arm read
+the expert bytes with `total_disk_io_ms 12,497` (`avg_disk_io_us 7,386`,
+`tensor_loads 1,692`) against the arcwell arm's **1,928** (`1,131`). The
+`AW_IOC_STATS` arcwell delta is `bytes +697,958,400` — the exact pinned payload
+(`71 × 4 × 2,457,600`, `code`: `src/exec/flash_next_offload.h:45`) — with
+`reads +852`, `segments +871`, `batches +4`, `batch_reads +852`,
+`via_host_bounce 0→0`, `max_inflight 220`; the host-fed delta is `bytes +0`.
+The prefetch depth reached is **4 batches in flight**, one per depth-4 layer;
+`max_inflight 220` is a module-global high-water inherited from the warm-up
+leg, not this arm's own queue depth.
+
+**RSS and the freed PLE term.** [measured-here] The boot child's `os.wait4`
+`ru_maxrss` is **3.697 GiB** on both arms, far below the 32 GiB host-class
+bound; the mid-run `VmHWM` prefix is 3.697 ≤ `wait4` (CF-KEYSTONERSS holds). The
+physical-host sampler's `MemAvailable` minimum is **45.86 GiB** with 0 watchdog
+trips, and the PLE term reads `ngram table STAGED` at **2.884 MiB** — the
+26.82 GiB pin of §7.0.2cg is gone.
+
+**Restart determinism, and the OWED arm.** [measured-here] The B60 cannot carry
+a byte-identity claim (its recorded per-card GDN floor, §7.0.2cb), so the row is
+read on the **A770 host-fed arm**, the only arm that can run there: two cold
+boots byte-identical,
+`9a7e2e77cfa1a25a0ebdb653a54abb343987f977558e3bfd98a9752353e5969f`. The
+**arcwell arm's restart determinism is OWED**, stated as a limit and not
+smoothed: `~/src/arcwell` excludes the A770, so arcwell is **B60-only** and no
+bit-readable card can run it. That arm is governed by design rule D3's load
+barrier, not by cross-boot byte-identity.
+
+**Caveats.** [measured-here + code] Scope is **depth 4 of 48** — the byte path
+is depth-independent (one expert slice is 2,457,600 B at every layer, `code`;
+the partition membership is fixed at `bind()`), so depth 4 keeps both arms in
+one window, but a full-depth (48-layer) variant is an OPERATOR DECISION and is
+not assumed. The arcwell arm requires the B60. The `X` threshold is `code`
+arithmetic over `measured-here` inputs and is never `measured-here` itself.
+
+**arcwell's numbers stay arcwell's.** [`measured-here` (arcwell's own
+hardware)] The 2.91 GB/s and 1.125 ms-expert figures are arcwell's own
+measurements on arcwell's hardware (`docs/campaigns/nvme-direct-expert-tier.md`, Known
+section); they appear here only as the labelled projection inside `X`, never as
+arcint measurements.
+
+**The FreeToken fidelity split.** [code] FreeToken's disk reads happen at
+**bank fill**, not as a decode-path miss handler (`~/src/FreeToken-ref`,
+`moe/host_banks.py`, `moe/expert_banks.py`); its runtime miss tier is the CPU
+executor and the host bank (`moe/cpu_executor.py`). The per-forward NVMe DMA
+tier is **arcint-original**. **LISBON is not the FreeToken way** — the FreeToken
+way is exactly the host hop, which this milestone keeps as the runtime
+fallback. The FTW container is FreeToken's way and shares the ext4
+one-file-per-expert store idea.
+
+**What it means.** [measured-here] The served path can bring the pinned expert
+set onto the card **from disk at load** and beat the host-fed path on cold
+TTFT, at a prefetch depth the serving loop actually reaches (4 in flight).
+That closes the campaign gate's cold-TTFT, RSS and (host-fed) determinism rows;
+the miss-tier verdict is unchanged — LISBON keeps the host hop for runtime
+moves. The one OWED sub-row is the arcwell arm's restart determinism, and its
+reason is structural (B60-only), not a missing measurement.
 
 #### 7.0.3 KV precision on the paged path — u8 is the lever, u4 is a tax
 

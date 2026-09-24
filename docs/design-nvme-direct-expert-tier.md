@@ -375,6 +375,13 @@ Read from `~/src/FreeToken-ref` (`code`). The note must not blur the two.
 
 ## §7 — the B60 probe spec (the next leg, unambiguous; RUN 2026-09-23 — items 1–3 measured, item 4 owed)
 
+[DATED IN PLACE 2026-09-24, LISBON-001 gate window: **item 4 is measured.**
+The gate ran on the B60 at depth 4 — cold TTFT arcwell **92.492 s** vs host-fed
+**99.679 s**, both ≤ `X = 139.5 s`, prefetch depth **4 batches in flight**,
+`via_host_bounce 0→0`; the `wait4` RSS row and the A770 host-fed
+restart-determinism row are filled, and the arcwell arm's byte-identity is
+OWED (arcwell is B60-only). See §9 and `docs/window-053.md` rows 1–3.]
+
 Operator decision 2026-09-23: the B60 is free for this campaign's gate, B60 legs
 are allowed **with the determinism caveat recorded** (byte-identity claims only
 where the B60 is known readable, otherwise paired with an A770 confirmation),
@@ -434,7 +441,7 @@ confirmation.
 | PLE disk backend and FTW container are FreeToken-faithful | `code` | `~/src/FreeToken-ref/.../ple_disk.py`; `.../checkpoint/ftw.py` |
 | the runtime miss tier is the CPU executor + host bank (FreeToken's way = the host hop) | `code` | `~/src/FreeToken-ref/.../moe/host_banks.py`, `expert_banks.py`, `cpu_executor.py` |
 | a router-driven fetch can be hidden | **REFUTED** | §2; horizon 0 |
-| the pinned fill pays cold TTFT | **HYPOTHESIS** (projection only) | §3; §7 decides |
+| the pinned fill pays cold TTFT | **MEASURED** (`measured-here`) [DATED IN PLACE 2026-09-24: the arcwell arm is at or below host-fed on cold TTFT at depth 4 — 92.492 s vs 99.679 s in one B60 window; §9, `docs/window-053.md` rows 1–3. The pre-gate projection is kept as written below.] | §3; §7; the LISBON-001 gate window |
 
 ---
 
@@ -457,6 +464,12 @@ confirmation.
 - **D4. The verdict on the campaign's condition stands:** as a *miss tier*,
   LISBON keeps the host hop. The bulk-residency fill is a separate, gate-decided
   question (cold TTFT), and the RED-C-02 hardware clauses are still owed.
+  [DATED IN PLACE 2026-09-24: the gate is decided — the load-time pinned fill
+  **pays on cold TTFT at depth 4** (arcwell 92.492 s vs host-fed 99.679 s, one
+  B60 window), and the RED-C-02 hardware clauses were measured on the B60
+  2026-09-23. The miss-tier verdict stands unchanged: LISBON keeps the host hop.
+  One sub-row is OWED: the arcwell arm's restart determinism, because arcwell
+  is B60-only. See §9 and `docs/window-053.md` rows 1–3.]
 
 **Status.**
 

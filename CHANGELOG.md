@@ -315,6 +315,49 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
 - **No plugin patch**: the change is arcint-side, and the runtime dependency is
   unchanged.
 
+### The NVMe expert tier inside the served loop (campaign: nvme-direct-expert-tier)
+
+- **Ships arrive from disk.** The static partition's pinned expert set is now
+  brought onto the card straight from the NVMe expert store at load, through
+  arcwell's batch surface (`AW_IOC_SUBMIT_BATCH` / `AW_IOC_BATCH_WAIT`), one
+  batch per MoE layer, four batches in flight, collected and marked filled
+  before the first routed call. A pinned expert not landed by the load barrier
+  is a **load failure**, never a silent demotion to the host tier. Plugin patch
+  `0049` supplies the transport (`moe/pinned_nvme_transport.hpp`: raw xe VRAM
+  BO, dma-buf export, peer-to-peer mapping) and the OpenCL import that replaces
+  each layer's host-mapped expert memories with the BO; the six scale/zp
+  tensors stay on the transposing host path. There is **no fetch on the decode
+  path**.
+- **Why pinned at load, not a miss tier**: the routing warning horizon is zero
+  layers — a layer's top-k ids become host-visible only inside that layer's own
+  MoE hook — so a router-driven fetch cannot hide arcwell's 1.125 ms (arcwell's
+  number, not ours). The runtime miss tier stays the host hop.
+- **Measured served gate (B60, ONE window, one artifact, ratio 86, depth 4 of
+  48)**: cold TTFT arcwell **92.492 s** vs host-fed **99.679 s** — the arcwell
+  arm is at or below host-fed and both are ≤ the pre-pinned `X = 139.5 s`;
+  prefetch depth **4 batches in flight** (one per layer); `AW_IOC_STATS` arcwell
+  delta `bytes +697,958,400` exactly, `reads +852`, `segments +871`,
+  `batches +4`, `via_host_bounce 0→0`, `max_inflight 220`; host-fed delta
+  `bytes +0`. Decode 4.1 t/s vs 3.4 t/s — no regression. `os.wait4` child
+  `ru_maxrss` **3.697 GiB** both arms (≤ 32 GiB); physical sampler minimum
+  45.86 GiB, 0 watchdog trips.
+- **Restart determinism**: A770 host-fed arm (the bit-readable card), two cold
+  boots byte-identical (`9a7e2e77…9f`). **The arcwell arm's restart
+  determinism is OWED** — `~/src/arcwell` excludes the A770, so arcwell is
+  **B60-only** and no bit-readable card can run it; that arm is governed by the
+  load barrier, not by cross-boot byte-identity.
+- **PLE-disk attachment**: the n-gram table staged from disk (subsection
+  above) is the other half of the 0.5.3 "ships arrive from disk" milestone;
+  both take host memory off the ledger (the LISBON gate reads the PLE term at
+  2.884 MiB staged).
+- **Caveat**: depth 4 of 48 — the byte path is depth-independent, and a
+  full-depth (48-layer) variant remains an operator decision, not assumed.
+- Requires `marfrit-openvino 2026.4.0~dev20260821+p19` (patches 0003–0049);
+  note `p19` is ALSO the 0003–0043 stamp (deliberately not renumbered — the
+  0049 build is identified by its `MOE_OTD_PINNED_NVME_FILL` / `pinned NVMe
+  fill` and `ArcwellTransport` symbols, as
+  `contrib/packaging/marfrit-openvino/patches/README.md` discloses).
+
 ## 0.5.0 — 2026-09-13
 
 Requires `marfrit-openvino 2026.4.0~dev20260821+p15` (patches 0003–0033) —
