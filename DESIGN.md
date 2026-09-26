@@ -10718,12 +10718,41 @@ of it.
       (bytes to memory) would settle it. No metrics library was found under
       the system library path (other prefixes were not searched). GPU
       observation is restricted to privileged users (`observation_paranoid`
-      1). A privileged run was not tried; enabling one is a host setting. By
-    the model's config (`code`, 32 value heads, key and value dims of 128)
-    the GDN recurrent state is 524,288 elements: 2 MiB in f32, 1 MiB in
-    f16 (its served precision was not checked). In this arm's geometry an
-    effect appeared only at 16 MiB and above, though 8 MiB already moved the
-    next FC (35.3 against 29.5).
+      1). A privileged run was not tried; enabling one is a host setting.
+      [Tried the same evening; see the counter bullet below.]
+    - By the model's config (`code`: 32 value heads, key and value dims of
+      128) the GDN recurrent state is 524,288 elements: 2 MiB in f32, 1 MiB
+      in f16 (its served precision was not checked). In this arm's geometry
+      an effect appeared only at 16 MiB and above, though 8 MiB already
+      moved the next FC (35.3 against 29.5).
+- [measured-here, dev host, root in the (privileged) dev container,
+  2026-09-26] **Hardware counters, attempted.**
+  - Setup: Intel metrics-discovery `5eef2d4` and metrics-library `1c5a8aa`,
+    built and installed. The intercept layer, built with its MDAPI support,
+    drives them with the ComputeBasic metric set.
+  - As the normal user, activating the metric set failed. As root, the
+    per-command (event-based) path could not create its counter command
+    queue (`CL_OUT_OF_RESOURCES`, -5); the cause was not traced.
+  - Time-based sampling ran as root with no host sysctl change. Which MDAPI
+    adapter is which card is inferred from the metric names and adapter 0's
+    mostly idle pattern while the A770 ran, not verified by PCI id:
+    - Adapter 1 is taken to be the A770. Its records were all zero while an
+      FC chain ran on the A770. About 40 million arrived in 240 s, some 30x
+      what the configured period allows (a period of 200 units, about
+      171 µs going by 500 units reading 426.7 µs). The process did not exit
+      before its timeout. The stream itself was anomalous.
+    - Adapter 0 is taken to be the B60. It returned non-zero clock, L3,
+      memory and TLB fields, but was never tested under a B60 load; 18
+      samples read GPU_BUSY above 50 % during an A770 run.
+  - So no A770 counters were obtained. Tried: ComputeBasic only, default
+    buffer, periods of about 171 µs, 427 µs and the default, both adapters.
+    Not tried: other metric sets, other buffer sizes, the Level Zero path.
+- [measured-here, B60 `GPU.0`, the same stock-runtime chain, one run each]
+  The multiply+atomic arm at 16 MiB moves the FC after it from 25.2 to
+  28.8 µs, and the next one from 26.0 to 31.7 ([arithmetic] 1.14x and
+  1.22x), against 4.3x on the A770. The effect was not reproduced on the
+  B60 at 16 MiB. The 32 MiB arm was not run there; the B60's cache size
+  was not checked against it.
 - Open: what separates a slow served launch from the same oneDNN
   implementation and launch geometry in isolation. Up to 3.7x
   ([arithmetic], the 2048x4096 output projection); 1.9x for 4096x2048.
