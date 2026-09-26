@@ -10571,7 +10571,8 @@ of it.
     explained.
   - No isolated number exists for the 2048x4096 or 4096x2048 shapes, so
     whether those served launches run below their isolated rate is not
-    known.
+    known. [Superseded later the same day: both were measured in isolation,
+    below.]
 - [measured-here, A770, 0067, 6 s of a 400-token served decode at 29.3 t/s]
   A 13 µs sampler of `act_freq` (the GT clock) and the throttle reasons:
   - 2.0 GHz on 78 % of samples and 2.35–2.4 GHz on the rest;
@@ -10591,32 +10592,85 @@ of it.
   depth-1 digests differ between the routes (`6d6c6660f021` against
   `5f4625c0bf7c`, §7.0.2co's changed summation order); the 4096 digest is
   shared.
-- [measured-here, A770, later the same day] Further discriminators:
-  - The other two served shapes in isolation, device-timed in an alternating
-    chain: 4096x2048 31.4 µs (served 59.2) and 2048x4096 28.8 µs (served
-    105–111). With the residual fused as oneDNN's `binary_add` post-op (as
-    served) the latter reads 29.8 µs, with the same geometry.
-  - **The deterministic attribute in the served graph.** A measurement-only
-    build drops it under an environment switch (not a patch; the source was
-    restored). With it set, 0 of 1,320 served 8192-wide matmuls carry the
-    attribute, and decode reads 26.4 / 30.2 t/s against 30.2 / 30.0 with the
-    attribute, the digests unchanged. The attribute does not cost this
-    decode.
-  - Card fill: 720 chained FCs, 12.65 GiB on the card, 63.5 µs per FC
-    (host-timed), no slower than 30.
-  - The clock: the isolated chain also runs at 2.0 GHz (97 % of 13 µs
-    samples, PL4 on 3 %, 124 W), and is fast there.
-  - Placement: of the decode GEMMs' pointer arguments in the served call
-    log, 22,795 are device USM addresses and 15 are host.
-- Open: what separates a slow served launch (up to 3.7x its isolated time)
-  from the same primitive, geometry, clock and fill in isolation; and what
-  the matrix-unit kernel leaves behind for the next layer. The one fast
-  served launch seen (layer 0, 45 µs) follows the step's input copies and
-  the embedding gather, not another layer's kernels. The GPU caches, TLB
-  and page placement are candidates and are not measured.
-  - Tested and not the cause: dynamic quantisation, the scale group, the
-    deterministic attribute (served, above), card fill to 12.65 GiB, the GT
-    clock, the residual post-op, host-resident arguments.
+- [measured-here, A770, later the same day] Further discriminators.
+  - **The other two served shapes in isolation.** The alternating chain is
+    20 pairs of FC(2048->4096) and FC(4096->2048) at M = 1, with the served
+    decompression pattern, on the stock runtime, device-timed by the
+    intercept.
+    - 4096x2048: 31.4 µs, 33.1 with the residual add (served: 59.2, 1.9x).
+    - 2048x4096: 28.8 µs. With the residual fused as oneDNN's `binary_add`
+      post-op (as served; verbose shows it on this FC) it reads 29.8 µs, with
+      the same geometry (2048x1x16 over 16x1x16).
+    - [arithmetic] The served 0067 output projection (110.9) is 3.7x the
+      29.8 µs comparand.
+    - The patched runtime was not measured isolated on these two shapes, so
+      the runtime and patch set remain a variable for them. Only 8192x2048
+      has a patched isolated figure (57.2 µs, above).
+  - **The deterministic attribute in the served graph.**
+    - The arm: a measurement-only build drops the attribute under an
+      environment switch, `ARCINT_FC_NONDET` (not a patch; the source was
+      restored and the tree rebuilds to `730ef029`). Both arms ran that same
+      build, the switch set or unset.
+    - Configuration: A770, the full-depth 35B packed u8, all-resident +
+      dispatch, u8 KV, chunk 1024, 32 tokens. Legs in the order without,
+      with, without, with:
+
+      | | decode depth 1 | decode after 4096 | prefill 4096 |
+      |---|---|---|---|
+      | without the attribute | 26.4 / 30.2 t/s | 27.4 / 28.1 t/s | 956.0 / 960.9 t/s |
+      | with it | 30.2 / 30.0 t/s | 28.1 / 28.1 t/s | 962.0 / 961.4 t/s |
+
+    - Removing the attribute gives no gain (two runs per arm). The first
+      leg's 26.4 is unexplained.
+    - The digests are identical with and without it at both depths, so the
+      same kernels may have been chosen either way.
+    - Verbose confirms the removal for the 8192-wide shape only: 0 of 1,320
+      served lines carry it. For the other shapes it rests on `code`
+      (0031's condition covers every f16-activation compressed FC).
+    - Per-launch times were not traced in this arm.
+  - **Card fill**, isolated, the 8192x2048 chain, host-timed: 720 FCs, 12.65
+    GiB on the card, 63.5 µs per FC, no slower than 30. The served state
+    holds about 13.1 GiB of constants plus KV, above what was tried.
+  - **The GT clock.** The 30-FC 8192x2048 chain (54.9 µs device, 70.1
+    host-timed) also runs at 2.0 GHz: 97 % of 13 µs samples, PL4 on 3 %,
+    124 W. The served clock was at least as high. The memory clock was
+    sampled in neither.
+  - **Placement** [measured-here, by address range; inference]. Of the
+    decode GEMMs' pointer arguments in the last 400,000 lines of one depth-1
+    served call log, 22,795 fall in the device USM range and 15 in the host
+    range. The pointers were not mapped to their allocations, and the range
+    cannot tell host from shared USM. [arithmetic] 15 of 22,810 pointers
+    cannot move a per-launch median.
+- Open: what separates a slow served launch from the same oneDNN
+  implementation and launch geometry in isolation. Up to 3.7x
+  ([arithmetic], the 2048x4096 output projection); 1.9x for 4096x2048.
+  Also open: what the matrix-unit kernel leaves behind for the next layer.
+  - [measured-here, n = 1] One launch of layer 0's 8192x2048 input
+    projection read 45 µs in one step. Its predecessors are the step's input
+    copies, reorders, gathers and norm, not another layer's kernels.
+  - Candidates, none measured: the GPU caches, TLB and page placement; the
+    memory clock; overlap of launches on the plugin's queue; the kernel
+    binary behind the shared geometry (program hashes were not compared);
+    and, for 2048x4096 and 4096x2048, the patched runtime.
+  - Tested and not the cause, each at its own scope:
+    - dynamic quantisation: off in the served decode (verbose), and flat in
+      isolation (8192x2048);
+    - the scale group: a flat rate in isolation (4096x4096);
+    - the deterministic attribute: no served end-to-end gain without it,
+      two runs per arm;
+    - the residual post-op: in isolation, 2048x4096;
+    - card fill to 12.65 GiB: in isolation, 8192x2048, below the served
+      fill;
+    - the GT clock: in isolation, 8192x2048;
+    - host-resident arguments: by address range.
+- [Correction 2026-09-26, `code`] Patch 0031's comment says the
+  deterministic attribute "pins the k-parallel-local work-group count to
+  one". In oneDNN's selector (`kernel_evaluator.cpp`) the attribute scores
+  the global k-parallel entries out, and pins `wgCountK` only on those
+  entries' path. A k-parallel-local entry keeps its local work-group count.
+  The served launch geometry (a local extent of 16 in z) is consistent with
+  that. The comment's clause is wrong; the patch's effect on the global
+  strategies stands.
 
 #### 7.0.3 KV precision on the paged path — u8 is the lever, u4 is a tax
 
