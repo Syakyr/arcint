@@ -10493,6 +10493,113 @@ Campaign: `docs/campaigns/sub4bit-vram-kernel.md`; plugin patch 0067.
   next call. Untraced, the step is 35.6 ms against 29.2 ms of traced device
   work: decode is now mostly device time, and the dense GEMMs are half of it.
 
+#### 7.0.2ct The 35B's dense decode GEMMs, measured below the card's bandwidth (2026-09-26, open)
+
+Campaign: `docs/campaigns/sub4bit-vram-kernel.md`; no code change. After
+§7.0.2cs the decode step is mostly device time, and the dense GEMMs are half
+of it.
+
+- [measured-here, a device-free read of the served IR, constants of 64 KiB
+  and more] The dense constants hold 1.646 GiB of u8 and 0.59 GiB of f16.
+  - The f16 part includes the compressed FCs' group-16 scales, about
+    0.21 GiB by arithmetic.
+  - The 111 compressed FCs are u8 with group-16 f16 scales and a scalar
+    zero point: 40 of 8192x2048, 30 of 4096x2048, 40 of 2048x4096, and one
+    the profile did not match. That one is presumed the LM head: 1.646 -
+    1.172 GiB (the other 110) = 0.474 GiB, about 248k x 2048.
+  - The 280 plain f16 FCs are the routers, the shared experts, the small
+    GDN projections, and (by count, inferred) the attention layers' k/v.
+  - That a decode step reads each dense matrix once follows from the graph
+    (`code`); it is not a measured access count.
+- [measured-here, `ARCINT_PROFILE_NODES`, oneDNN verbose] Every decode FC
+  runs oneDNN `jit:gemm:any` with f16 activations (so no dynamic
+  quantisation in the served decode). The compressed ones carry
+  `attr-deterministic:1` (patch 0031).
+  - An 8192x2048 FC launches as 8192x1x16 over 16x1x16. That reads as a
+    work-group-local split-K of 16; the chosen strategy itself was not
+    observed.
+  - [code, oneDNN `GEMMStrategy::nondeterministic`, `kernel_evaluator.cpp`]
+    Only the global k-parallel strategies are excluded under the
+    deterministic attribute; the local split-K is allowed.
+- [measured-here, A770] The same 8192x2048 FC in isolation: a chain of FCs
+  at M = 1 with the served decompression pattern, on the stock runtime
+  unless named.
+  - 54.9 µs device time (intercept), 18.87 MB at about 344 GB/s. The card's
+    nominal bandwidth is 560 GB/s (`paper`).
+  - 57.2 µs device time on the patched runtime. That run carries the
+    deterministic attribute by `code` (patch 0031); its verbose check
+    aborted in the runner's CPU-reference compile. Patched and stock differ
+    in more than that attribute, so the 4 % is not a single-variable A/B.
+  - The same launch geometry in three contexts (the intercept's call log):
+    served with the attribute, isolated patched, isolated stock. Geometry is
+    not kernel identity; program hashes were not compared.
+  - Host-timed medians: 70.0–70.2 µs at dynamic quantisation unset, 0, 32
+    and 128. At 4096x4096, scale groups 16/32/128 give 66.6/62.4/58.8 µs:
+    the time tracks the scale bytes, and the rate is flat within 2.5 %. At
+    30/300/600 chained FCs (600 = 10.54 GiB on the card) 70.1/63.8/63.6 µs,
+    not slower with more.
+  - `OV_GPU_USE_ONEDNN=0`, at 2048x2048 with a per-group u8 zero point:
+    120.7 µs against 25.5 µs with oneDNN, host-timed, about 4.7x slower. The
+    kernel it took was not named. For the served model it took the load's
+    host anonymous memory past a 30 GiB cap, so that arm has no served
+    number.
+- [measured-here, A770, the full-depth 35B packed u8, all-resident +
+  dispatch, u8 KV, depth 1, 32 tokens, traced steps 5–29, one run per arm;
+  median µs per launch] The GEMMs are classified by the kernels before them
+  (a GDN layer's projections: after its input norm; after its GDN core; the
+  one straight after another large GEMM). The shapes follow from the model's
+  structure, not from a trace join.
+
+  | arm | GDN input projection 8192x2048 | GDN output projection 2048x4096 | GDN second projection 4096x2048 |
+  |---|---|---|---|
+  | 0066 scalar gate/up | 72.5 | 105.6 | 59.2 |
+  | 0066 matrix-unit gate/up | 131.9 | 100.7 | 59.2 |
+  | 0067 (matrix-unit) | 142.6 | 110.9 | 59.2 |
+
+  - The same classification for the attention layers' q projection came out
+    unstable (100.6 / 160.0 / 64.8 µs) and is not used.
+  - One launch of layer 0's input projection (no MoE block before it) read
+    45 µs in one 0067 step. That is faster than the isolated chain's 54.9,
+    so the isolated chain is not this kernel's ceiling either.
+  - [arithmetic] The matrix-unit arm makes the next layer's input projection
+    1.8x slower: 59.4 µs x 29 launches = 1.7 ms per step. The output
+    projection moved the other way (-0.15 ms). Of §7.0.2cr's 2.1 ms gap
+    (15.6 against 13.5 ms of GEMM) this locates about 75–85 %. The
+    projection sits in the next layer, after the MoE block's remaining
+    kernels. How the matrix-unit kernel slows it is not measured.
+  - The rise of about 10 µs in both GDN columns from 0066 to 0067 is not
+    explained.
+  - No isolated number exists for the 2048x4096 or 4096x2048 shapes, so
+    whether those served launches run below their isolated rate is not
+    known.
+- [measured-here, A770, 0067, 6 s of a 400-token served decode at 29.3 t/s]
+  A 13 µs sampler of `act_freq` (the GT clock) and the throttle reasons:
+  - 2.0 GHz on 78 % of samples and 2.35–2.4 GHz on the rest;
+  - PL4 (peak current) on 12 %; 92.8 W average.
+  A GT clock at most 17 % lower does not account for a 2x kernel. The memory
+  clock was not sampled, and only this arm was.
+- [measured-here, A770, 0067 plugin `730ef029`, two interleaved pairs] The
+  whole-model gate/up route, which DESIGN §3.4 makes all-or-nothing:
+
+  | gate/up | decode depth 1 | decode after 4096 | prefill 4096 |
+  |---|---|---|---|
+  | matrix unit | 30.1 / 30.1 t/s | 28.2 / 28.1 t/s | 960.2 / 961.5 t/s |
+  | scalar | 27.8 / 29.0 t/s | 27.1 / 27.1 t/s | 632.8 / 632.5 t/s |
+
+  With the routing waits gone, the matrix unit leads at decode as well:
+  its faster gate/up outweighs the next-layer penalty. The route stays. The
+  depth-1 digests differ between the routes (`6d6c6660f021` against
+  `5f4625c0bf7c`, §7.0.2co's changed summation order); the 4096 digest is
+  shared.
+- Open: what the matrix-unit kernel leaves behind; what separates a slow
+  served launch from the fast layer-0 one; the kernel binary behind the
+  shared geometry.
+  - Tested and not the cause: dynamic quantisation (off in the served
+    decode, and flat in isolation), and the scale group (flat rate).
+  - Not excluded: the card's fill at the served state (about 13.1 GiB of
+    constants plus KV; tested only to 10.54 GiB) and the deterministic
+    attribute in the served graph (no served run without it).
+
 #### 7.0.3 KV precision on the paged path — u8 is the lever, u4 is a tax
 
 The plugin accepts f16/u8/i8/u4/i4 for `KV_CACHE_PRECISION` on the paged path,
