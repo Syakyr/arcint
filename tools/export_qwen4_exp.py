@@ -571,7 +571,7 @@ def verify_serving_shape(n_layers=None):
               f"port(s) under {rep['ngram_chunk_cap_bytes']:,} B each "
               f"(not a constant; bound from host memory per request)")
         sp = ss.slot_pool_from_ir(model, cfg.num_experts, 0)
-        print(f"  slot_pool_from_ir (backend_ov.cpp:578) -> {sp}")
+        print(f"  slot_pool_from_ir (backend_ov.cpp:580) -> {sp}")
         if sp is None:
             print("    nullopt: no op type contains 'moe'. The MoE fusion is a "
                   "GPU-plugin COMPILE-time pass and this walk runs on "

@@ -17,7 +17,7 @@ TWO KINDS OF CELL, and the distinction is the point:
 WHAT THIS FILE FOUND, on its first run (2026-09-12), and it is a finding about
 the C++ and not about the export:
 
-`slot_pool_from_ir` (backend_ov.cpp:578-624) identifies a MoE layer by
+`slot_pool_from_ir` (backend_ov.cpp:580-626) identifies a MoE layer by
     std::string tname = node->get_type_name();  ... tolower ...
     if (tname.find("moe") == std::string::npos) continue;      // :585
 NO ARCINT-EXPORTED IR CARRIES AN OP WHOSE TYPE NAME CONTAINS "moe". Measured
@@ -434,7 +434,7 @@ def test_the_input_ports_are_the_names_and_shapes_the_serving_path_feeds(built):
     `HashParams::num_ngram_heads() = (ngram_size - 1) * heads_per_ngram`
     (src/exec/ngram_row_ids.h:59), which the same file's header states at :21
     as "16 on Qwen3.8: 8 x 2-gram + 8 x 3-gram", and each head gathers one
-    160-wide row (:22). `position_ids` is the name backend_ov.cpp:99 declares
+    160-wide row (:22). `position_ids` is the name backend_ov.cpp:101 declares
     (`kPositionIds`). `conv_mask` is the port q4e.backbone already declares
     (backbone.py:105-106).
     """
@@ -629,7 +629,7 @@ def slot_pool_from_tiled_ir(model, num_expert, ratio_pct):
     exports instead of a type name: the Constants with leading dim
     `num_expert` that feed a dequant chain, grouped per MoE layer.
 
-    Same per-expert arithmetic as backend_ov.cpp:601-605 (product of dims[1:]
+    Same per-expert arithmetic as backend_ov.cpp:603-607 (product of dims[1:]
     times the CEILED element size) and the same slot ceiling as fit.h:96.
     """
     per_layer = {}
@@ -665,7 +665,7 @@ def slot_pool_from_tiled_ir(model, num_expert, ratio_pct):
 def test_the_cpp_type_name_matcher_finds_nothing_and_the_line_is_named(built):
     """THE HANDSHAKE FAILURE, named exactly.
 
-    `slot_pool_from_ir`'s gate is backend_ov.cpp:586
+    `slot_pool_from_ir`'s gate is backend_ov.cpp:588
 
         if (tname.find("moe") == std::string::npos) continue;
 
@@ -715,7 +715,7 @@ def test_the_cpp_type_name_matcher_finds_nothing_and_the_line_is_named(built):
     typed = sorted({n.get_type_name() for n in model.get_ordered_ops()
                     if "moe" in n.get_type_name().lower()})
     print(f"\n[contract-otd] moe-typed ops in the serving-shape IR: {typed}")
-    print(f"[contract-otd] slot_pool_from_ir(backend_ov.cpp:578) -> {got}")
+    print(f"[contract-otd] slot_pool_from_ir(backend_ov.cpp:580) -> {got}")
     print(f"[contract-otd] dev-host model store, 2026-09-12: "
           f"{FLEET_IRS_WITH_MOE_TYPED_OP} of {FLEET_IRS_ALL} IRs carry one "
           f"({FLEET_IRS_SIZE_FILTERED} of them over 100k)")
@@ -739,7 +739,7 @@ def test_the_pattern_matcher_prices_the_expert_pool_and_lands_on_the_cpp_constan
     gate+up+down at real geometry = 2*(640*2560) + 2560*640 = 4,915,200 int4
     values = 2,457,600 bytes. The IR walk cannot reproduce that figure, and the
     reason is structural rather than a bug in either side:
-    backend_ov.cpp:605 uses `element_type().size()`, which CEILS a 4-bit width
+    backend_ov.cpp:607 uses `element_type().size()`, which CEILS a 4-bit width
     to one whole byte -- so it reads 4,915,200 B per expert, EXACTLY 2x. The
     C++ comment at :610-615 anticipates over-reservation ("this over-reserves
     rather than under-reserves, pending an on-card audit"); this cell measures

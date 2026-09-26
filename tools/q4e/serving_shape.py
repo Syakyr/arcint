@@ -31,14 +31,14 @@ So "shape and element type, no data" is not a degraded artifact from the
 serving runtime's point of view -- for the slot-pool decision it is the WHOLE
 artifact. This module emits exactly that, and the contract test
 (`tests/python/test_serving_shape.py`) checks it against a Python transcription
-of `slot_pool_from_ir` (`backend_ov.cpp:578-624`) rather than against a
+of `slot_pool_from_ir` (`backend_ov.cpp:580-626`) rather than against a
 description of it.
 
 --------------------------------------------------------------------------
 2. THE EXPERT-SLOT (OTD) CONTRACT, BOTH SIDES, CITED
 --------------------------------------------------------------------------
 
-C++ side, `src/exec/backend_ov.cpp:578-624` `slot_pool_from_ir`:
+C++ side, `src/exec/backend_ov.cpp:580-626` `slot_pool_from_ir`:
 
   * a MoE op is any node whose OpenVINO TYPE NAME contains "moe",
     case-insensitively                                    (backend_ov.cpp:582-586)
@@ -46,9 +46,9 @@ C++ side, `src/exec/backend_ov.cpp:578-624` `slot_pool_from_ir`:
     exactly ONE Convert, whose LEADING DIMENSION equals `num_expert`
                                                           (backend_ov.cpp:589-605)
   * per-expert bytes = product of dims[1:] x element_type().size()
-                                                          (backend_ov.cpp:601-605)
+                                                          (backend_ov.cpp:603-607)
   * an unmatched graph returns nullopt and the caller falls back to the
-    plateau probe -- "this function never guesses"        (backend_ov.cpp:567-570)
+    plateau probe -- "this function never guesses"        (backend_ov.cpp:569-572)
 
 Export side, the shape that was MEASURED to fuse on the card is the TILED
 lowering, described in `tools/verify_moe_lowering.py:26-45` and emitted by
@@ -2730,7 +2730,7 @@ def build_qwen35moe_serving_shape_ir(config=None, arena=None, n_layers=None,
 # --------------------------------------------------------------------------
 
 def slot_pool_from_ir(model, num_expert, ratio_pct):
-    """Python transcription of `slot_pool_from_ir`, src/exec/backend_ov.cpp:578-624.
+    """Python transcription of `slot_pool_from_ir`, src/exec/backend_ov.cpp:580-626.
 
     Line-for-line, with the C++ line numbers on each step. Returns None where
     the C++ returns nullopt.
