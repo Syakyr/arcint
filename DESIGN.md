@@ -10591,14 +10591,32 @@ of it.
   depth-1 digests differ between the routes (`6d6c6660f021` against
   `5f4625c0bf7c`, §7.0.2co's changed summation order); the 4096 digest is
   shared.
-- Open: what the matrix-unit kernel leaves behind; what separates a slow
-  served launch from the fast layer-0 one; the kernel binary behind the
-  shared geometry.
-  - Tested and not the cause: dynamic quantisation (off in the served
-    decode, and flat in isolation), and the scale group (flat rate).
-  - Not excluded: the card's fill at the served state (about 13.1 GiB of
-    constants plus KV; tested only to 10.54 GiB) and the deterministic
-    attribute in the served graph (no served run without it).
+- [measured-here, A770, later the same day] Further discriminators:
+  - The other two served shapes in isolation, device-timed in an alternating
+    chain: 4096x2048 31.4 µs (served 59.2) and 2048x4096 28.8 µs (served
+    105–111). With the residual fused as oneDNN's `binary_add` post-op (as
+    served) the latter reads 29.8 µs, with the same geometry.
+  - **The deterministic attribute in the served graph.** A measurement-only
+    build drops it under an environment switch (not a patch; the source was
+    restored). With it set, 0 of 1,320 served 8192-wide matmuls carry the
+    attribute, and decode reads 26.4 / 30.2 t/s against 30.2 / 30.0 with the
+    attribute, the digests unchanged. The attribute does not cost this
+    decode.
+  - Card fill: 720 chained FCs, 12.65 GiB on the card, 63.5 µs per FC
+    (host-timed), no slower than 30.
+  - The clock: the isolated chain also runs at 2.0 GHz (97 % of 13 µs
+    samples, PL4 on 3 %, 124 W), and is fast there.
+  - Placement: of the decode GEMMs' pointer arguments in the served call
+    log, 22,795 are device USM addresses and 15 are host.
+- Open: what separates a slow served launch (up to 3.7x its isolated time)
+  from the same primitive, geometry, clock and fill in isolation; and what
+  the matrix-unit kernel leaves behind for the next layer. The one fast
+  served launch seen (layer 0, 45 µs) follows the step's input copies and
+  the embedding gather, not another layer's kernels. The GPU caches, TLB
+  and page placement are candidates and are not measured.
+  - Tested and not the cause: dynamic quantisation, the scale group, the
+    deterministic attribute (served, above), card fill to 12.65 GiB, the GT
+    clock, the residual post-op, host-resident arguments.
 
 #### 7.0.3 KV precision on the paged path — u8 is the lever, u4 is a tax
 
