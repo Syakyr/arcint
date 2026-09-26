@@ -503,6 +503,11 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
   KV, chunk 512) 1.04 -> 3.13 t/s at 512 tokens, the same digests. A
   mislaid IQ2_S unit cell (failing as written) is fixed. Stamp unchanged at
   `+p19`.
+- **CPU tier: native dots one job per AVX2 lane** (plugin patch 0066, DESIGN
+  §7.0.2cq): the scalar dot's multiply-then-add per lane (no FMA, verified in
+  the built plugin), so the bytes are unchanged. Flash-Next (`d48n`) prefill
+  on the A770 (ratio 75 + tier + dispatch, u8 KV, chunk 512) 3.13 -> 6.4 t/s
+  at 512 tokens. Stamp unchanged at `+p19`.
 - **Instruments**: `tools/bigalloc.c` (large host allocations by call
   stack, peak-attributed), `tools/native_moe_match_probe.cpp` (the native
   matcher pass alone, device-free), `tools/native_moe_block_ab.cpp` (one

@@ -10299,6 +10299,32 @@ the wrong group (`code`; no earlier run is on record); fixed.
   vectorised across jobs, one job per lane, without changing any job's
   order.
 
+#### 7.0.2cq The CPU tier's native dots run one job per AVX2 lane: Flash-Next prefill 3.13 -> 6.4 t/s (2026-09-26)
+
+Campaign: `docs/window-054.md`; plugin patch 0066.
+
+- [measured-here] After 0065 the tier's per-job dot was a scalar mulss/addss
+  chain (objdump of the built plugin).
+- [code] 0066 runs it one job per AVX2 lane, four decoded rows per pass. The
+  multiply and the add stay separate: the routine is compiled
+  `fp-contract=off`. That is the scalar path's own rounding, so a job's bytes
+  do not change.
+- [measured-here] objdump shows 0 `vfmadd` and 4 `vmulps` in the built
+  plugin's copy of the routine.
+- [measured-here] A new bitwise cell against the per-job
+  `compute_stage_f32` is red on a mutant that lets the lanes contract to
+  FMA; the older f16-output cell was blind to it.
+- [measured-here, A770, Flash-Next `d48n`, ratio 75 + tier + dispatch, u8
+  KV, chunk 512] Prefill 512 tokens 163.64 -> **79.94 s (6.4 t/s)**, 6.2x
+  0064's 491.76 s. Decode unchanged; digests unchanged against 0064.
+- The 128- and 512-token requests (61.74 and 79.94 s) imply a fixed term of
+  about 56 s per request and a marginal rate of about 21 t/s. That fixed term
+  is not attributed (unmeasured: the first request's kernel compile, or the
+  tier's first touch of the experts, are candidates).
+- The 32k lower bound at 6.4 t/s is 1.4 h. At chunk 2048 a 4,096-token prompt
+  reads 14.8 t/s (`docs/window-054.md`), which brings LYON row 1 inside the
+  operator's 2 h budget.
+
 #### 7.0.3 KV precision on the paged path — u8 is the lever, u4 is a tax
 
 The plugin accepts f16/u8/i8/u4/i4 for `KV_CACHE_PRECISION` on the paged path,

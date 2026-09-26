@@ -1783,6 +1783,40 @@ MEASURED (A770, Flash-Next `d48n`, ratio 75 + tier + dispatch, u8 KV, chunk
 - Series 0003–0065 (63 patches) applies byte-identical to the built tree;
   the plugin compiles clean.
 
+## 0066 — CPU tier, native formats: one job per AVX2 lane (2026-09-26)
+
+After 0065 each native row is decoded once per call, but every job's dot still
+ran as a scalar `mulss`/`addss` chain (`measured-here`: the built plugin's
+`compute_stage_f32_jobs`, objdump). 0066 runs the dots over several jobs one
+job per AVX2 lane (`native_dot_jobs_avx2`, in the AVX2 translation unit). It
+takes four decoded rows per pass, so four independent chains hide the add
+latency; the activations are transposed once per stage to [ic][jobs]. Each
+lane is the scalar dot's own sequence along k, a multiply then an add. The
+routine is compiled `fp-contract=off`, and the built plugin's copy carries
+4 `vmulps` and 0 `vfmadd` (`measured-here`, objdump). So a job's bytes do not
+change. A single job keeps the scalar loop.
+
+The unit cells:
+- The standalone build now uses the plugin's per-file flags: `-O3 -mavx2
+  -mfma -mf16c` for the AVX2 source only. Built with `-mfma` everywhere, the
+  scalar reference itself could contract to FMA.
+- **New:** a bitwise cell compares `compute_stage_f32_jobs` over 11 jobs, at
+  Flash-Next's K = 2560, with the per-job `compute_stage_f32` (the
+  pre-image), at f32. A mutant letting the lanes contract to FMA (4
+  `vfmadd`) is red there. It passed the whole-expert cell, whose f16 outputs
+  at small dimensions could not see a last-bit change.
+- 11 of 11 pass.
+
+MEASURED (A770, Flash-Next `d48n`, ratio 75 + tier + dispatch, u8 KV, chunk
+512, 2026-09-26):
+- Prefill of 128 tokens: 77.44 -> 61.74 s.
+- Prefill of 512 tokens: 163.64 -> **79.94 s (6.4 t/s)**; 491.76 s on 0064.
+- Decode unchanged at 0.5 t/s.
+- Digests unchanged against 0064/0065 (`eec6f2f2acb5d988`,
+  `e4b40e198c8f22a6`); tier pairs 709,175.
+- Series 0003–0066 (64 patches) applies byte-identical to the built tree;
+  the plugin compiles clean.
+
 ## Hazard: the measurement tree's patch set is applied but UNCOMMITTED
 
 The dev tree the measurement plugin is built from (its path is operator-local)

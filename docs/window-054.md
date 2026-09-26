@@ -359,4 +359,15 @@ at the end, not many. **No measurement before the feature exists.**
     §7.0.2cp): 3.13 t/s, same digests; the forecast is at least ~2.9 h, still
     over.
   The rows stay EMPTY until a lever brings the 32k forecast under 2 h.
+- 2026-09-26, **the forecast is under the budget** (`measured-here`, A770,
+  Flash-Next `d48n`, ratio 75 + tier + dispatch, u8 KV):
+  - Patch 0066 (the tier's native dots one job per AVX2 lane, DESIGN
+    §7.0.2cq) reads 6.4 t/s at 512 tokens, chunk 512.
+  - At row 1's chunk 2048 (the fit admits it, 1.40 GiB of activations), a
+    4,096-token prompt reads 276.57 s = 14.8 t/s; digest `965f4e83cd66768b`.
+  - A 32k prompt forecasts about 37 min plus the attention growth, inside
+    the 2 h budget.
+  - Row 1 is run next under a hard 2 h cap, with 3a's compile-once reading
+    from the same process (a 2,048- and a 32,768-token prompt). Its result
+    is recorded in its own entry.
 
