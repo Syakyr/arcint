@@ -2,7 +2,7 @@
 # operator namespace on GHCR so the Pro B60 box can pull and test.
 #
 # Images produced:
-#   ghcr.io/syakyr/arcint-ov:2026.4.0-marfrit-p16   (tier 1, patched OpenVINO)
+#   ghcr.io/syakyr/arcint-ov:2026.4.0-marfrit-p15   (tier 1, patched OpenVINO)
 #   ghcr.io/syakyr/arcint:investigation-<ts>         (tier 2, immutable)
 #   ghcr.io/syakyr/arcint:investigation              (tier 2, moving channel)
 #
@@ -44,22 +44,41 @@ env:
   REGISTRY: ghcr.io
 
 jobs:
-  # Resolve the lowercase namespace once: GHCR requires it and
-  # github.repository_owner preserves the account's capitalisation.
+  # Resolve the lowercase namespace AND the tier selection once, in shell,
+  # where the evaluation is visible in the log. A previous run skipped
+  # tier2 despite tiers=arcint with the equivalent inline expression
+  # (run 35829326673; the dispatch inputs are not exposed via the API,
+  # so the inline evaluation could not be audited after the fact) —
+  # computing the booleans here makes the decision auditable instead of
+  # expression-magic.
   ns:
     runs-on: ubuntu-latest
     outputs:
       owner: ${{ steps.ns.outputs.owner }}
       build_ts: ${{ steps.ns.outputs.build_ts }}
+      build_ov: ${{ steps.tiers.outputs.build_ov }}
+      build_arcint: ${{ steps.tiers.outputs.build_arcint }}
     steps:
       - id: ns
         run: |
           echo "owner=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
           echo "build_ts=$(date +%Y%m%dT%H%M%S)" >> "$GITHUB_OUTPUT"
+      - id: tiers
+        run: |
+          T='${{ github.event.inputs.tiers }}'
+          bo=false; ba=false
+          case "${T,,}" in
+            all) bo=true; ba=true ;;
+            *) case "$T" in *ov*) bo=true ;; esac
+               case "$T" in *arcint*) ba=true ;; esac ;;
+          esac
+          echo "raw tiers input: '$T' -> ov=$bo arcint=$ba" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "build_ov=$bo" >> "$GITHUB_OUTPUT"
+          echo "build_arcint=$ba" >> "$GITHUB_OUTPUT"
 
   tier1-openvino:
     needs: ns
-    if: ${{ github.event.inputs.tiers == 'all' || contains(github.event.inputs.tiers, 'ov') }}
+    if: needs.ns.outputs.build_ov == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
@@ -84,18 +103,23 @@ jobs:
       - name: Build patched OpenVINO base
         run: |
           docker build \
-            -t ${{ env.REGISTRY }}/${{ needs.ns.outputs.owner }}/arcint-ov:2026.4.0-marfrit-p16 \
+            -t ${{ env.REGISTRY }}/${{ needs.ns.outputs.owner }}/arcint-ov:2026.4.0-marfrit-p15 \
             -f docker/Dockerfile.openvino-patched .
 
       - name: Push tier 1 (tag carries pin + patch level; immutable by content)
         run: |
-          docker push ${{ env.REGISTRY }}/${{ needs.ns.outputs.owner }}/arcint-ov:2026.4.0-marfrit-p16
+          docker push ${{ env.REGISTRY }}/${{ needs.ns.outputs.owner }}/arcint-ov:2026.4.0-marfrit-p15
 
   tier2-engine:
     needs: [ns, tier1-openvino]
+    # always() so a skipped tier1 does not auto-skip this; then gate on
+    # the ns-computed booleans and tier1's actual result.
     if: >-
-      ${{ (github.event.inputs.tiers == 'all' || contains(github.event.inputs.tiers, 'arcint'))
-          && (needs.tier1-openvino.result == 'success' || needs.tier1-openvino.result == 'skipped') }}
+      ${{ always()
+          && needs.ns.result == 'success'
+          && needs.ns.outputs.build_arcint == 'true'
+          && needs.tier1-openvino.result != 'failure'
+          && needs.tier1-openvino.result != 'cancelled' }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -110,21 +134,21 @@ jobs:
       - name: Build engine image
         run: |
           docker build \
-            --build-arg OV_BASE=${{ env.REGISTRY }}/${{ needs.ns.outputs.owner }}/arcint-ov:2026.4.0-marfrit-p16 \
+            --build-arg OV_BASE=${{ env.REGISTRY }}/${{ needs.ns.outputs.owner }}/arcint-ov:2026.4.0-marfrit-p15 \
             --build-arg ARCINT_GIT_SHA=${GITHUB_SHA::12} \
             -t ${{ env.REGISTRY }}/${{ needs.ns.outputs.owner }}/arcint:build-${{ needs.ns.outputs.build_ts }} \
             -f docker/Dockerfile.arcint .
 
       # The device-free smoke test already ran inside the build (stub +
       # /props). Re-run here against the final image before publishing the
-      # channel tag (kyuz0's immutable→channel discipline).
+      # channel tag (kyuz0's immutable→channel discipline). Must run INSIDE
+      # the container: the stub binds 127.0.0.1 in the container's netns,
+      # so a host-side curl has nothing to connect to (measured: run
+      # 35830030865, curl (7) after the stub logged 'listening').
       - name: Smoke test
         run: |
-          docker run --rm ${{ env.REGISTRY }}/${{ needs.ns.outputs.owner }}/arcint:build-${{ needs.ns.outputs.build_ts }} \
-            --stub --port 8090 &
-          sleep 3
-          curl -fsS http://127.0.0.1:8090/props > /dev/null
-          kill %1
+          docker run --rm --entrypoint bash ${{ env.REGISTRY }}/${{ needs.ns.outputs.owner }}/arcint:build-${{ needs.ns.outputs.build_ts }} \
+            -c '/usr/bin/arcint --stub --port 8090 & S=$!; sleep 2; curl -fsS http://127.0.0.1:8090/props > /dev/null; R=$?; kill $S 2>/dev/null; wait $S 2>/dev/null; exit $R'
 
       - name: Push immutable + channel tags
         run: |
