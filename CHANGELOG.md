@@ -19,6 +19,29 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
 
 ## Unreleased
 
+## 0.5.0.1 — 2026-09-27
+
+Requires `marfrit-openvino 2026.4.0~dev20260821+p20` (patches 0003–0067).
+The floor rises from 0.5.0's `+p15`: the native per-expert route needs
+patches 0044–0067.
+
+### Scope: a served-performance release on the 0.5.0 line
+
+No 0.5.x dot's acceptance gate is closed by this release. BERLIN-001's
+rows, VENICE, LISBON's open sub-row and LYON rows 2, 3a and 3b stay as the
+roadmap records them, and the dots keep their numbers. What ships is the
+speed of the native MoE route and the fixes that made it measurable:
+
+- the full-depth Qwen3.6-35B-A3B native packed u8 artifact serves
+  all-resident on the 16 GiB card: prefill 12.5 -> about 960 t/s at 4096
+  tokens, decode about 20 -> 28 t/s (patches 0059–0067);
+- Flash-Next (the 48-layer native artifact, ratio 75 + CPU tier + dispatch)
+  prefills 1.04 -> about 15 t/s (patches 0065–0066); a 32k prompt
+  prefills in 36 minutes (LYON row 1);
+- the served coder (fused int4) and agent (dense) routes are unchanged.
+
+### Changes
+
 - **The exact reference at full depth** (`tools/ref_forward_stream.py`,
   run on a GB10): the pin's own model with every weight from the GGUF,
   the experts streamed per layer and the n-gram table gathered lazily;

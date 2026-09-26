@@ -11,7 +11,7 @@
 # It carries the CMake package, the headers and the runtime that arcint links.
 set -euo pipefail
 
-PKGVER=0.5.0
+PKGVER=0.5.0.1
 UPSTREAM_TAG=v${PKGVER}
 PKGREL=1
 # The public repository, not the fleet one. The fleet repo (still named
@@ -26,8 +26,10 @@ OV_PREFIX=/usr/lib/marfrit-openvino
 # The ABI is the nightly, not the patch level: floor the patch level, cap at
 # the next nightly. An exact pin (Depends: = +p1-1) made apt REMOVE arcint when
 # the runtime was upgraded to +p3 on 2026-09-04; never render "=" here again.
-OV_DEP_VERSION="2026.4.0~dev20260821+p18-1"
-# The +p18 floor is the unreleased tip's (patch 0042: patch 0037's hybrid prefill
+OV_DEP_VERSION="2026.4.0~dev20260821+p20-1"
+# The +p20 floor is 0.5.0.1's (patches 0044-0067: the native expert formats' OpenCL
+# decode, the all-resident native pool and its dispatch; an older runtime has no
+# native per-expert route at all). +p18 was the floor after patch 0042 (patch 0037's hybrid prefill patch 0037's hybrid prefill
 # launched its gather over every token-expert pair while the tables held only the
 # resident ones — a page fault on Xe2; +p16 and +p17 carry 0037 without the fix).
 # The +p15 floor is 0.4.4's (patch 0033: with four-bit values the verify pass read the
@@ -37,6 +39,7 @@ OV_DEP_VERSION="2026.4.0~dev20260821+p18-1"
 # 0.4.2's (patches 0022-0029), +p7 0.4.0's (patch 0021). Building an older tag with it
 # would re-issue a released version string under different Depends. Refused.
 case "$PKGVER" in 0.3.*|0.4.0|0.4.1|0.4.2|0.4.3) echo "the +p15 floor is 0.4.4's; bump PKGVER and the tarball sha at the tag" >&2; exit 1 ;; esac
+case "$PKGVER" in 0.4.*|0.5.0) echo "the +p20 floor is 0.5.0.1's; bump PKGVER and the tarball sha at the tag" >&2; exit 1 ;; esac
 OV_DEP_NEXT_NIGHTLY="2026.4.0~dev20260822"
 HERE=$(dirname "$(readlink -f "$0")")
 
