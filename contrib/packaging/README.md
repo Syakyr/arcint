@@ -28,10 +28,15 @@ instruction, which is the one thing this directory exists to prevent.
     marfrit-openvino/
       build-openvino.sh     clones upstream OpenVINO at the pinned commit,
                             resets hard, applies patches/, builds Release
+      build-openvino-debugcaps.sh
+                            the same with the GPU plugin's debug
+                            capabilities on, into an explicitly named
+                            prefix (a measurement build, never a package)
       build-deb.sh          repacks the upstream wheels for their layout and
                             CMake package, then overwrites the libraries with
                             the patched build
-      patches/              the patch series, with its measurements
+      patches/              the patch series 0003–0067, and README.md: what
+                            each patch does and its standing measured effect
       debian/               control, copyright, changelog
 
 ## The pin
@@ -40,14 +45,19 @@ instruction, which is the one thing this directory exists to prevent.
 the README and FURTHER-READING.md was taken on that code. A patch that does not apply
 cleanly to that commit is a bug in `patches/`, not a reason to move the pin.
 
-The patched build reports itself as `…-71640275d29-marfrit-pN` (`+p18`,
-patches 0003–0042, is the floor the unreleased tip depends on — patch 0042
-fixes patch 0037's page fault on Xe2, so `+p16` and `+p17`, which carry
-0037 without it, fault at the first CPU-tier prefill on an Arc Pro B60;
-`+p15`, patches 0003–0033, is what arcint 0.4.4 through 0.5.0 depend on; `+p7` was the first level carrying patch 0021 for the GGUF
-path), so a version string in a log says whether it is the patched runtime
-and at which level. arcint reads the level off the plugin's version string
-at load and sizes its scratch terms by it; `--gguf` needs `+p7` or later.
+The patched build reports itself as `…-71640275d29-marfrit-pN`, so a version
+string in a log says whether it is the patched runtime and at which level.
+`+p20` (patches 0003–0067) is the floor arcint 0.5.0.1 depends on. Earlier
+levels worth knowing when reading an old log: `+p6` is the first with the
+`u8:i4` prefill on micro-SDPA (patch 0020), `+p7` the first carrying the
+K-quant kernel `--gguf` needs (patch 0021), `+p15` (0003–0033) what arcint
+0.4.4 through 0.5.0 depend on, and `+p16`/`+p17` carry patch 0037 without
+its fix (0042, in `+p18`) and fault at the first CPU-tier prefill on an
+Arc Pro B60. Several measurement builds between `+p19` and `+p20` kept the
+`+p19` stamp and are identified by their symbols, not the version string
+(the per-patch record says which). arcint reads the level off the plugin's
+version string at load and sizes its scratch terms by it.
+
 The build-number field stays numeric because `ov_parse_ci_build_number` rejects
 anything else; the patch level rides in the free-form tail.
 

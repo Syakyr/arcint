@@ -1,1884 +1,314 @@
 # Patches carried against the pinned OpenVINO
 
-Per `DESIGN.md` §1 in the arcint repository, rung 2 of "smallest sufficient
+Per `DESIGN.md` §1.1 in the arcint repository, rung 2 of "smallest sufficient
 divergence": a numbered patch set **applied at build time here**, not a
 divergent checkout. Each patch stays PR-shaped so it can be re-offered
-upstream, and this file names what each one is for.
+upstream, and this file says what each one does and what it measurably
+changes. Every patch's own header carries its full derivation; the dated
+measurement record behind each number is on the arcint development branch
+(`qfndev`), under the DESIGN section named.
 
 The pin is `2026.4.0-22849-71640275d29` — upstream commit `71640275`. A patch
 that does not apply cleanly to that commit is a bug in this directory, not a
-reason to move the pin.
-
-## Applied
-
-### 0003-moe-batched-gemv-expert-mask-subbuffer-churn.patch
-
-`prepare_internal_buffers` in the GPU plugin's MoE implementation rebuilds its
-per-expert mask subbuffers on **every** inference when `token_num > 1`:
-`create_subbuffer` twice per expert, 512 calls per layer, **20,480 per
-two-token forward**. Those masks are read only by the per-expert prefill
-fallback; the batched-GEMV path that a small-token forward actually takes never
-looks at them. At `token_num == 1` the whole block is skipped, which is why
-plain decoding never showed the cost.
-
-The patch skips the mask creation below the batched-GEMV threshold and caches
-it against `(token_num, buffer)` for the prefill path proper.
-
-Measured on an Arc Pro B60, u8 KV, 300 tokens, temperature 0, output
-**byte-identical** to the unpatched plugin in both arms:
-
-| | unpatched | patched |
-|---|---|---|
-| verify forward wall | 27.3 ms | 18.1 ms |
-| MoE host execute per verify | 8.91 ms | 0.74 ms |
-| `--mtp on`, prose | 44–46 t/s | 60.5–61.2 t/s |
-| `--mtp off` | 62.3 t/s | 61.7–62.3 t/s |
-
-Full derivation: `docs/moe-m2-path.md` in the arcint repository.
-
-Upstream: not yet filed. This is the patch that motivated giving this recipe a
-patch path at all; it should be offered upstream, and this line should then
-name the PR.
-
-### 0004-moe-otd-perf-counters.patch
-
-Extends the runtime's `[OTD_PERF]` counters (evictions, acquisitions, slot
-tiers, staging bytes) so the offload-dial work in 0005-0007 and the host-tier
-work in 0011-0012 can be measured rather than guessed at. No served-path
-behaviour changes and no throughput number belongs to this patch on its own;
-it is the instrument the numbers on 0005-0007 and 0011-0012 below were taken
-with.
-
-Upstream: not yet filed.
-
-### 0005-moe-otd-device-resident-slot-pool.patch
-
-Charges each MoE expert slot buffer against a new per-compile device-memory
-budget in program order, so slots that fit land in VRAM instead of the
-previous host-only upload path. New plugin property:
-`MOE_OTD_DEVICE_POOL_BYTES`.
-
-### 0006-moe-otd-async-batched-slot-upload.patch
-
-Batches one `try_acquire_simultaneous` call's misses into one upload and
-replaces the per-tensor blocking copy with a non-blocking one out of a
-staging ring, waiting on the whole batch once instead of once per tensor.
-
-### 0007-moe-otd-drop-redundant-stream-finish.patch
-
-Drops the unconditional per-MoE-layer `stream.finish()` ahead of the
-batched-GEMV top-k read on an in-order queue, where the read's own blocking
-copy already waits for everything enqueued before it.
-
-Measured together (0005-0007, on top of 0004's counters): the 35B on the
-16 GiB card goes from 0.4 t/s (ratio 25, unpatched) to 9.1 at ratio 50 / 8 GiB device pool (16-token probe) and 10.4 (64-token probe; same patches, longer probe) —
-0005 supplying the device-resident pool, 0006 and 0007 the async upload path
-and the redundant-finish removal.
-
-Upstream: not yet filed for any of 0005-0007.
-
-### 0008-paged-kv-value-cache-precision.patch
-
-Adds an independent `VALUE_CACHE_PRECISION` config knob alongside the
-existing `KV_CACHE_PRECISION`, so the key and value cache can be asked to
-compress to different precisions at the config level. Paged-attention
-Parameter ports stay 8-bit-typed regardless; the real, possibly sub-8-bit
-packing lives entirely at the config level that this patch extends.
-
-### 0009-paged-kv-asymmetric-kernel-plan.patch
-
-The kernel-side asymmetric-KV plan: PARTIAL. The decode fast path's kernel
-hard-codes one KV quant type across both operands, so a genuine
-sub-8-bit-vs-not mismatch is now refused earlier, at the config level 0008
-adds, rather than reaching the kernel and miscompiling.
-
-### 0010-paged-kv-asymmetric-decode-kernel.patch
-
-The per-side decode-read kernel for u8 keys / i4 values, plus the matching
-write-kernel split, on the decode fast path. Prefill still declines to the
-OCL fallback per 0009's guard.
-
-Measured together (0008-0010): u8:i4 KV costs 8.8 KiB/token against u8:u8's
-11.3, auto-fitting 171,312 tokens against 133,456 on the coder on the
-16 GiB card and 199,424 against 155,376 on the agent on the 24 GB card — a
-+28% context gain. The acceptance task scores 10/10 at u8:i4. Owed: the
-prefill price, and prefix byte-exactness.
-
-Upstream: not yet filed for any of 0008-0010.
-
-### 0011-moe-cpu-expert-kernel.patch
-
-The host CPU compute-tier kernel: AVX2 and scalar implementations for the
-plugin's grouped-int4 layout, a thread pool, an mmap weight accessor, the
-M14 perf counters, and the `MOE_CPU_TIER` property. Compute-only — nothing
-in it changes served behaviour until 0012 wires the decode path to it.
-Per-source `-O3` is deliberate: the graph library this file lives in builds
-at `-Os`, and the kernel needs the higher setting.
-
-### 0012-moe-cpu-tier-decode-split.patch
-
-The wiring: which `(token, expert)` pairs get redirected to the host tier on
-a device-slot capacity miss (LRU probe), the OpenCL kernel sentinel skip for
-those pairs, and how the host excursion overlaps the GPU work and joins
-before `mlp_reduce`.
-
-Measured together (0011-0012): the 35B on the 16 GiB card at ratio 50 /
-8 GiB reaches 15.0/15.5 t/s against 10.4/10.6 without the host tier; at
-ratio 75 / 5 GiB, 14.1/14.8 against 7.4/7.5. Text output byte-identical
-either way, acceptance task 10/10.
-
-Upstream: not yet filed for either of 0011-0012.
-
-### 0013-moe-otd-routing-histogram.patch
-
-Adds a per-expert routing histogram to `OffloadExpertWeightProvider`,
-counted before any hit/miss or capacity-dedup logic runs, behind
-`MOE_OTD_ROUTING_HIST`. Companion instrument to 0004's counters and to the
-0011/0012 host-tier counters, none of which can be used to reconstruct plain
-routing after the fact. No throughput number belongs to this patch; it is a
-diagnostic.
-
-Upstream: not yet filed.
-
-### 0014-gpu-assign-adopts-output-layout.patch
-
-`assign_impl::execute_impl` asserted when a non-`kv_cache` stateful
-primitive's variable layout diverged from the assign's output layout — hit
-by the DFlash2 draft head's own K/V state chain (`ReadValue` → `Concat` →
-`Slice` → `Assign`) at prompts whose first draft concatenates exactly the
-window's row count. When the data type and rank still agree, the patch
-adopts the output layout (`variable.set_layout`) instead of asserting — the
-update a skipped runtime path would otherwise have made — and copies; a
-genuine type or rank mismatch still asserts with the same message. A
-variable updated normally takes the same path as before.
-
-Measured on the served int4 draft head: the unpatched plugin disables the
-drafter at 2,155 / 2,230 prompt tokens; patched, it drafts at those depths
-and further out (1,966 / 2,155 / 2,266 / 2,481 / 3,251), byte-identical to
-the unpatched plugin everywhere the unpatched plugin does not disable.
-
-Upstream: not yet filed.
-
-### 0015-paged-attention-bounded-partials.patch
-
-Three changes to the GPU plugin's paged-attention implementation:
-
-- **Host-side sizing fix**: `get_internal_buffer_descs` sized `tmp_out` at
-  4 bytes/element unconditionally; the kernel already declares it
-  `OUTPUT_TYPE` (f16 on every model this repository serves), so the mixed
-  stage was allocating exactly twice the bytes its kernels address. Sized
-  from the real output dtype instead — no kernel change, same addresses
-  read and written, half the term.
-- **A bound on the online-merge partition count**: a new read-write plugin
-  property, `PAGED_ATTENTION_MAX_PARTITIONS` (0 = unbounded, today's
-  behaviour, the default), the way 0008 added `VALUE_CACHE_PRECISION`.
-  arcint's engine side is `--paged-attention-max-partitions N`, which reads
-  the key back after compile to detect a plugin that carries it, and never
-  refuses a load against a plugin that does not. Bounded, the mixed-stage
-  scratch term stops scaling with `n_ctx` past a small fixed partition
-  count instead of growing forever.
-- **The argument rebind fix**: `realloc_intermediates` can replace an
-  intermediate buffer's identity without raising the flags that make
-  `execute_stage` rebind kernel arguments — harmless while `tmp_out` grew
-  without bound on every chunk, live once the bound above makes its size
-  plateau and a later genuine reallocation can occur with nothing else on
-  that call touching outputs. `PagedAttentionOptImpl` now records the
-  identity of every intermediate its kernel arguments were last bound to
-  and forces a rebind on any change, closing a use-after-free that only
-  appears once the buffer stops growing every call (this patch's own
-  header, section "FIX A"/"the argument rebind"; DESIGN.md §7.0.2ac).
-
-Bit-exact at `PAGED_ATTENTION_MAX_PARTITIONS == 0` by construction. The
-plugin's 220 paged-attention unit tests pass. At the unbounded setting the
-patched plugin is byte-identical to the unpatched one on both cards. On
-the 24 GB card, bound 0 against 32: the 64-token greedy output and the
-acceptance answer are byte-identical between the two arms and the task
-scores 10/10 on both. On the 16 GiB card, the patched plugin at the bound
-serves a 119,074-token prompt from a 131,072-token pool that the
-unpatched plugin cannot; with a deeper, 165,680-token pool the same
-prompt still crashed at the time this patch's header was written (a
-separate, pre-existing defect in the asymmetric packed-value path,
-patches 0008–0010, tracked in DESIGN.md §7.0.2ac/§7.0.2ad, not this
-patch's). **Upgrade note**: this inserts an option into the GPU
-model-cache blob's positionally-serialised property list — clear the GPU
-model cache (`--cache-dir`, if set) when upgrading to a plugin level
-carrying this patch; 0008's own schema guard (`execution_config.cpp`)
-rejects a stale-schema blob outright rather than misreading it.
-
-Upstream: not yet filed.
-
-### 0016-paged-attention-intermediate-sizing.patch
-
-`get_internal_buffer_descs` reused the previous call's `num_of_partitions`
-whenever `m_rt_params` was already non-null, because nothing resets that
-field between calls — the "already computed" branch fires on every call
-after the first and sizes the current call's intermediates
-(`exp_sums`/`max_logits`/`tmp_out`) from the *last* call's partition count,
-not the one about to execute. Harmless while depth only grows a few rows a
-step, real once depth grows a full page and the buffers are undersized for
-the call about to run. Fixed by sizing from the current call. Regenerated
-on top of the corrected 0015 (same three files, same post-image hashes
-0015 leaves them at).
-
-Evidence: four unit tests — two red-first review tests
-(`paged_attention_review_swa_mirror_test`, the sliding-window shrink
-mirrored into the fresh sizing estimate, and
-`paged_attention_review_bound_governing_stage_test`, the bound gated on
-the stale stage that computed it) plus the two regression tests this
-patch was written for (`paged_attention_asymmetric_kv_deep_pool_test`,
-asymmetric deep-pool, and `paged_attention_growth_test`,
-repeated-execute growth) — plus a byte-identity ladder at 8,418 tokens
-(u8:i4, chunk 128, unbounded, 16 GiB card) — 0015+0016 together 6/6
-byte-equal to the untouched plugin's output, against the untouched
-plugin's own roughly 1-in-14 run-to-run noise. All 19 tests in the
-combined filter pass on the 24 GB card. Does not touch, and is not
-evidence about, the deep-prompt crash diagnosed in `DESIGN.md` §7.0.2ad as
-a driver/runtime fault outside this plugin (a page-fault storm at the
-OpenCL runtime's own direct-submission semaphore buffer) — this patch
-neither causes nor closes it.
-
-Upstream: not yet filed.
-
-### 0017-moe-cpu-tier-readback-decomposition.patch
-
-Decomposes the MoE host CPU tier's per-layer readback (patches/0011-0012)
-into named counters — `cpu_topk_id_ns`/`cpu_x_enq_ns`/`cpu_x_wait_ns`/
-`cpu_x_drain_ns`, a warm/steady split, and an env-gated queue-drain probe
-(`MOE_OTD_READBACK_PROBE`) — instead of one folded `avg_cpu_x_us`. Moves
-the x (hidden_states) and routing-weight readback destinations from
-pageable `std::vector` buffers to `usm_host`, and hoists that readback
-into the existing topk_id round trip so a tier-on layer pays one combined
-wait instead of two (`MOE_OTD_READBACK_NOHOIST=1` restores the old,
-separate order for isolating the hoist's own effect). No numeric
-behaviour change on any path: tier OFF is byte-for-byte the pre-patch
-code, tier ON runs the exact same `moe_cpu_expert` kernel over the same
-bytes, sourced from `usm_host` instead of `std::vector`. MEASURED on the
-16 GiB card at the M14 tier cell: the 283 µs readback attributed in an
-earlier record was mostly the x read landing on pageable memory after the
-queue had already drained on the topk_id read — `usm_host` cuts it to
-53 µs; the hoist alone is a null. Full derivation and the retraction of
-the cell's own decode-rate record (a device-pool env var was silently
-unset for that window) are in the arcint repository's `CHANGELOG.md`
-under "Unreleased" and `DESIGN.md` §7.0.2af.
-
-Upstream: not yet filed.
-
-### 0018-moe-cpu-tier-static-partition.patch
-
-Replaces the MoE host CPU tier's process-global LRU expert residency (F0,
-patches/0011-0013) with a static partition (F2): for each MoE layer, the
-resident set is the `slots` experts with the smallest
-`splitmix64(seed, layer_key, expert)` rank, fixed once at `bind()` and
-independent of every subsequent request, history, or arrival order. This
-closes a real DESIGN §3.4 violation — the LRU tier picked device-f16 vs.
-host-f32 arithmetic by residency, so greedy output depended on the
-process's request history, not just the request itself; a continuation
-restored from the prefix cache could fork from the same continuation
-served cold. An earlier draft (F1, a bit-equal host kernel matching
-device arithmetic exactly) was retired by review as impractical — F2 does
-not make host and device arithmetic agree, it makes the *set* of experts
-each one runs on independent of history, so the mismatch has no
-opportunity to depend on it.
-
-Five load-time bugs surfaced getting the allow branch to actually pass,
-not just compile — three fixed on the arcint side (the device-pool
-plateau probe and the prefill fallback both assumed an
-evictable/acquirable slot always exists, false under a 100%-pinned pool;
-`ARCINT_FIT_SLOT_BYTES` could bypass the `--prefix-cache-mib` refusal
-entirely) and two fixed here in the plugin: the refusal gate queried the
-static-partition property on the wrong (pre-compile) object, and the
-property's own default never checked whether the tier was even on,
-reporting the partition active on every load regardless. Full account,
-file:line, in this patch's own header and in the arcint repository's
-`DESIGN.md` §7.0.2ae. MEASURED, `tests/equivalence/run.sh` against
-`--moe-cpu-tier --prefix-cache-mib 4096 --kv-block-size 32` on the 24 GB
-card, twice (once per plugin rebuild fixing the two plugin-side bugs):
-**all checks pass**, continuation-restore included — the check this
-patch exists to fix.
-
-Not fixed, investigated and reported instead of guessed at: a false
-return from `on_load_expert_weights` is genuinely overloaded (OTD off
-vs. not resident under this partition) and its one caller does not
-distinguish them, but the ambiguous path is reachable only when
-`MOE_USE_GROUPED_GEMM_PREFILL` is forced off, which arcint never does —
-dormant in every configuration this repository drives today. *(Fixed by
-0019, below.)*
-
-Upstream: not yet filed.
-
-### 0019-moe-prefill-fallback-tristate.patch
-
-Closes the item 0018's header reported. `on_load_expert_weights` now
-answers three ways — no offload tier (every expert's weights are on the
-device as initialised), a device slot acquired or pinned, or the host
-tier (not resident under the static partition) — and the per-expert
-prefill loop takes the device path for both device answers. Under 0018 a
-resident-only load reaching that loop, which needs both fast prefill
-paths forced off through internal properties arcint never sets, took the
-host branch for weights that were on the device through a downcast of the
-wrong provider type. An assertion now guards the downcast.
-
-Red first: a new plugin unit test, `moe_3gemm_prefill_fallback.resident_
-load_with_grouped_prefill_off_matches_reference` (40 tokens, both fast
-paths off, no offload, checked against the suite's own reference), failed
-on the 0018 tree — the misread provider tried to map a weight file that
-does not exist — and passes with the patch; the four
-`moe_3gemm_static_partition.*` and sixteen smoke accuracy cases pass
-alongside it, 21 of 21 on each card, 2026-09-05. The three acceptance
-cells the campaign named as the no-change proof were not run for this
-patch (a quick functional test, on the operator's word); the branch is on
-none of their paths. Full account in the patch header and arcint's
-`DESIGN.md` §7.0.2ap.
-
-Upstream: not yet filed.
-
-### 0020-paged-kv-asymmetric-micro-sdpa.patch
-
-The served asymmetric pairing — u8 keys by channel, i4 values by token —
-ran its prefill on the generic paged-attention kernel because 0009
-declined micro-SDPA for any key/value pair of differing packing classes,
-and paid +55 % / +90 % prefill time at 37.7k / 71.7k tokens against u8
-at the same chunk (DESIGN §7.0.2ar). The generator now sets the value
-operand's type and layout from the value precision, the kernel source
-gates each side's four-bit layout on its own macro, the value pointer's
-per-chunk advance derives its packing from the value cache rather than
-the new-token input port, and the selector admits eight-bit keys with
-four-bit values (four-bit keys with eight-bit values, and four-bit
-values under BY_TOKEN keys, still decline — the latter measured as NaN
-past 128 keys, not diagnosed, and not the plugin's default).
-
-Red first: a new mixed-stage unit test with u8 keys and u4 values failed
-on the 0019 tree with the dump naming the generic kernel, and passes
-with the patch (3/3 shapes, the float reference at 1e-2); 0015's
-asymmetric prefill regressions at a 2,048-token past now run on
-micro-SDPA and match; 276/277 of the paged-attention set pass.
-MEASURED on the recipe-built plugin, 16 GiB card, coder, chunk 128:
-u8:i4 459 against u8 457 t/s at 37,707 tokens and 401 against 398 at
-71,727 — parity — with the u8:i4 outputs byte-identical to the generic
-path's and the Prüfstand 10/10 through the u8:i4 server. The values
-stay four-bit in VRAM; the microkernel unpacks them in registers.
-DESIGN §7.0.2as.
-
-Upstream: not yet filed.
-
-### 0021-fully-connected-kquant.patch
-
-GGUF K-quant weights (Q4_K, Q5_K, Q6_K, Q8_0) served as stored through
-the fully-connected path (arcint 0.4.0 stage 1, `docs/design-gguf-
-native.md`): arcint builds an op the plugin recognises by type name
-("FullyConnectedKQuant", "arcint_opset") over a u8 constant holding the
-file's rows, and a new kernel decodes the super-blocks in its inner
-loop — no unpack at load, no reorder at compile, no second copy of the
-weights. One lane per output column, two variants from one source
-chosen by the row count: decode with a broadcast activation read and K
-split over four subgroups; prefill on the subgroup matrix multiply
-(XMX) with the super-block's activation tile staged in local memory
-per work-group of eight subgroups. Eleven correctness cases against a
-host reference on both cards, a malformed request refused at shape
-inference, the fully-connected suite otherwise unchanged, a timing test
-(disabled by name) at the dense model's gate projection. MEASURED: the
-dense Qwen3.8-27B Q4_K_M file opens on the dense IR template and scores
-10/10 on the Prüfstand through the served endpoint; against Intel's own
-int4 IR export on the 24 GB card it prefills 3.2× to 7.6× slower and
-decodes at about half the rate (213 / 9.9 t/s at 856 tokens, 174 / 8.5
-at 71.7k, the IR 1,609 / 23.1 and 552 / 16.5). The header records the
-eight-version ladder that got the kernel here from 28.8 / 3.5. DESIGN
-§7.0.2ay.
-
-Upstream: not yet filed.
-
-### 0022-kquant-decode-split.patch
-
-The K-quant kernel's decode variant (arcint 0.4.1 lever 1, `docs/
-milestone-0.4.1.md`): the super-blocks packed for the subgroup matrix
-multiply on Xe-HPG — the quantised integers become f16 bit patterns with
-a shift, a mask and an or, the scale and the offset applied to the
-multiply's sums — which makes the 16 GiB card's decode launch 3× faster
-(509 → 179 µs at the gate projection); the fused multiply-add path kept
-on Xe2, where a one-row matrix multiply occupies the systolic array like
-an eight-row one (measured, 46 cycles); and the decode work-group sized
-by the projection's width on both, so a narrow projection fills the
-card. The served decode rate on the 24 GB card did not move (10.0
-against 9.9 t/s). Three readings refuted on the way are in the header.
-DESIGN §7.0.2az.
-
-Upstream: not yet filed.
-
-### 0023-kquant-decode-rows.patch
-
-The K-quant kernel's decode variant in llama.cpp's shape (DESIGN
-§7.0.2bc): a work-group per group of output rows (four, sixteen on the
-long-K down projection), four subgroups with their lanes along K, a
-subgroup taking one super-block per iteration. A Q4_K/Q5_K
-super-block's 128 quant bytes are one sub-group block read (lane l holds
-positions l and l + 16 of every sub-block) and its 256 activations
-another, read once and shared by the group's rows; the eight scale/min
-pairs are decoded by lanes 0–7 and broadcast. Q6_K's 2-aligned blocks
-are block-read as dwords from the dword below and redistributed with one
-shuffle (a 16-bit block read two bytes off a dword returns the wrong
-word on every lane but the first — measured); on Xe2 the subgroup
-prefetches its next Q6_K super-block, one cache line per lane (the
-Q4_K/Q5_K shapes and the 16 GiB card lose with the same prefetch and do
-not get it). Exact: f32 accumulation over f16 activations. The tiled
-prefill variant is unchanged.
-
-Measured streamed at steady state on the 24 GB card against 0022 in the
-same instrument: the gate projection 141 µs (355 GB/s, 79 % of the
-card's measured random-read ceiling) against 170, the Q4_K down
-projection 146 against 219, Q5_K 5,120² 60 against 137, the Q6_K down
-projection 397 against 646, the N 1,024 projections 20–33 µs. Served,
-dense Qwen3.8-27B Q4_K_M native, `u8` KV: 12.1 t/s decode at 856 tokens
-against 0.4.0's 9.9, 10.1 at 71.7k against 8.5, Prüfstand 10/10,
-outputs byte-identical at both depths (DESIGN §7.0.2bc–bd).
-
-Also carried: the timing test streams (eight weight buffers in rotation
-on one queue; ten launches of one buffer had let a third of it hit the
-18 MB L2 and overstated every launch figure of 0021 and 0022), warms
-every network to steady state before the clock (a network's second
-execution costs twice its third) and runs over the served model's own
-tensor types and shapes.
-
-On the 16 GiB card (Xe-HPG), same instrument, against 0022: the gate
-projection 154 µs against 159, Q5_K 64 against 98, the N 1,024 shapes
-ahead — and the long-K down projections behind, Q4_K 204 against 172
-and Q6_K 510 against 467, with the host's rule per architecture (eight
-rows × eight subgroups there; sixteen × four, the 24 GB card's, was 224
-and 842). That card does not serve a GGUF-opened model of this size.
-
-Built into `+p8` on 2026-09-06 (13 minutes, incremental) and deployed on
-the dev host; the IR path's equivalence suite on the 16 GiB card is 9/9
-under it (DESIGN §7.0.2be). The per-architecture rule postdates the
-package: `+p8` as installed carries the 24 GB card's rule on both; `+p9`
-carries this rule.
-
-Upstream: not yet filed.
-
-### 0024-kquant-q6k-tail-block-read.patch
-
-The Q6_K decode row's last twenty bytes (qh's last word, the sixteen
-scales, d) as one 16-bit sub-group block read at the dword below them
-and broadcasts, in place of four per-lane gathers: six load messages
-per super-block per row become three (DESIGN §7.0.2bh). Exact, 14/14 on
-both cards, served outputs byte-identical. Measured streamed at steady
-state: the 16 GiB card's Q6_K down projection 510 → 385 µs and its
-N 1,024 shape 44 → 34; the 24 GB card unchanged (397 → 400, 34 → 34),
-where the same window measured the row's arithmetic and shuffles at
-~105 µs each and its three reads at 353 of the 400, insensitive to
-alignment, layout and dispatch — the next Q6_K form is a load-time
-reorder into 224-byte blocks read as two byte-wise block reads, on the
-record, not in this patch.
-
-Package: `+p9` (2026-09-07).
-
-### 0025-kquant-q6k-no-shuffles.patch
-
-The Q6_K decode row without variable-index shuffles (DESIGN §7.0.2bi):
-16-bit sub-group block reads at the dword below the 2-aligned block put
-each lane's own words in place for even blocks, and one fixed-delta
-shuffle-down per register does it for odd ones; the scales and `d` are
-constant-index broadcasts. The ISA count had put 118 of the row's 296
-instructions per row and super-block on word fetches from other lanes.
-Exact, 14/14 on both cards, served outputs byte-identical, Prüfstand
-10/10. Measured streamed at steady state: the Q6_K down projection
-400 → 259 µs on the 24 GB card and 385 → 262 on the 16 GiB card; served,
-the mixed form's decode 13.4 → 15.3 t/s at 856 tokens and 9.6 → 11.9 at
-71,727 (eight milliseconds off the step at both depths).
-
-Package: `+p10` (2026-09-07).
-
-### 0026-kquant-q6k-224-byte-blocks.patch
-
-A second Q6_K type id (114) whose super-blocks are 224 bytes — the
-file's 210 then 14 zero bytes, laid out by arcint at load
-(`--gguf-q6k aligned`, the default) so every block is dword-aligned and
-0025's decode row takes its shuffle-free path unconditionally; the
-same decoders at the wider stride (DESIGN §7.0.2bj). Exact, 16/16 on
-both cards, served outputs byte-identical, Prüfstand 10/10. Measured
-streamed at steady state: the Q6_K down projection 262 → 204 µs on the
-24 GB card (the probe's 183–210 prediction) and 260 → 247 on the 16 GiB
-card; the K = 5,120 shapes unchanged. Served, the mixed form's prefill
-418 → 531 t/s at 856 tokens and 291 → 335 at 71,727 (the tiled
-variant's loads were paying for the alignment too), the decode step
-1–2 ms shorter; 6.7 % more bytes on the Q6_K set.
-
-Package: `+p10` (2026-09-07).
-
-### 0027-kquant-fused-ops-run.patch
-
-The plugin's runtime fusion check accepts the K-quant kernel (DESIGN
-§7.0.2bk). Until now a fused eltwise on a dynamic fully-connected node
-was accepted only on the bf_tiled and reference kernels, so every
-K-quant node with a fused residual add was executed through the
-unfused-subgraph fallback, whose output read drains the queue: 79
-`clFinish` per served decode step, the card idle at each — the "host
-time per K-quant node" of §7.0.2bg, named by a call log, a thread-local
-and a gdb stack. The kernel's fused ops take the value the unfused path
-stored (the sum rounded to the output type), so nothing changes bit-wise;
-five correctness cases with a fused residual added. Served on the 24 GB
-card: the mixed form's decode step 59.8 → 54.7 ms at 856 tokens (17.2
-t/s, Prüfstand 10/10 at 18.4) and 77.7 → 73.3 at 71,727, byte-identical.
-
-Package: `+p10` (2026-09-07).
-
-### 0028-kquant-tiled-a-layout.patch
-
-The tiled (prefill) variant stages its activation tile in the matrix
-unit's own layout, so each A operand is one block read of local memory
-instead of eight per-lane gathers (128 one-element local-memory
-gathers per loop body against sixteen `dpas` in the ISA; DESIGN
-§7.0.2bm). Same stores, same arithmetic: exact, 21/21 on both cards,
-served outputs byte-identical. The 2,048-row gate launch 39.5 → 34.6 ms
-on the 24 GB card; served, the mixed form's prefill 551 → 672 t/s at
-856 tokens and 341 → 385 at 71,727.
-
-Package: `+p11` (built 2026-09-07 18:24, installed on the dev host, both units on it).
-
-### 0029-kquant-tiled-2d-block-loads.patch
-
-The tiled (prefill) variant reads both operands by Xe2's 2D block
-loads (`cl_intel_subgroup_2d_block_io`): the activation block straight
-from global memory in the matrix unit's layout, with no tile staged,
-no barrier and no local memory, and the subgroup's sixteen weight rows
-by transposed 32-bit block reads, one message per 32 bytes of sixteen
-rows instead of a dword gather per lane per dword; the decode runs on
-registers through the same arithmetic (DESIGN §7.0.2bn). Xe2 only, for
-the dword-aligned layouts (Q4_K, Q5_K, the 224-byte Q6_K); everything
-else keeps 0028's staged path. With the loads in place the row tile is
-64 in the 256-register mode on Xe2 (the tiled kernel is compiled in
-its own batch with `-cl-intel-256-GRF-per-thread`; the decode kernel
-stays at 128, where it measured better); Xe-HPG keeps 32 rows and
-gains the mode. Exact: 21/21 on both cards, served outputs
-byte-identical, Prüfstand 10/10. Served on the 24 GB card, the mixed
-form's prefill 672 → 907 t/s at 856 tokens and 385 → 451 at 71,727;
-the Q6_K down projection's launch at 856 rows 11.1 → 4.4 ms. The
-timing test's operands move to device memory (they were in the
-lockable host allocation, which timed the bus, not the kernel: every
-tiled figure it gave before this patch is retracted as an absolute),
-its rows get valid scales, and it gains the served row count.
-
-Package: `+p11` (built 2026-09-07 18:24, installed on the dev host, both units on it).
-
-### 0030-kquant-tiled-tall-a-reads.patch
-
-The tiled (prefill) variant reads its activation block 32 rows per 2D
-message on Xe2 (`intel_sub_group_2d_block_read_16b_32r16x1c`; the
-destination holds the rows in order, so each 8-row slice is one row
-group's operand unchanged), which takes the activation messages per
-super-block per subgroup from 128 to 32 on a 64-row tile; the work-group
-is 16 subgroups there (8 on Xe-HPG's staged path); Q5_K takes a 128-row
-tile where the 2D loads run and keeps the 8-row read on it (DESIGN
-§7.0.2bp). Exact: 22/22 on both cards (a 141-row Q5_K case added),
-served outputs byte-identical, Prüfstand 10/10; the decode kernel is
-untouched. The timing test in device memory on the 24 GB card, 856 /
-2,048 rows: the gate Q4_K 3.37 / 7.18 → 2.86 / 6.16 ms, Q5_K 1.04 /
-2.22 → 0.99 / 1.89, the 224-byte Q6_K down projection 4.40 / 9.97 →
-3.59 / 8.23, the small Q6_K 1,024 × 5,120 0.295 → 0.250 at 856. Measured
-and not shipped: the next super-block's weight prefetch (loses on every
-type before the tall read, Q5_K 2.4×; 2–3 % on the gate after it at 4 %
-on Q5_K), the next sub-block's activation prefetch (loses everywhere),
-16-row reads (54 % worse on Q5_K), a split of the two matrix-unit calls
-over the row groups (inert under the tall read). Served on the 24 GB card (arcint 0.4.2, the exact mixed
-form): the warm 856-token prefill 940 → 1,001 t/s (first request 903 →
-962), 71,727 tokens 451 → 464; the decode steps unchanged (54.8 / 73.7
-ms); outputs byte-identical at both depths.
-
-Package: `+p12` (built 2026-09-08 01:00 local on the dev host, installed there at 01:05, both units on it; the served figures above were taken with patch 0030 staged into the +p11 runtime before the package existed).
-
-### 0031-fc-deterministic-gemm.patch
-
-The f16-activation compressed fully-connected — the form a GGUF-opened
-model's repacked projections take — sets oneDNN's deterministic
-attribute before its primitive descriptor is built. oneDNN's gemm
-selector scores a k-parallel strategy (split-K across work-groups with
-atomic accumulation) best whenever the plain M × N tiling underfills the
-device, and that reduction's order varies run to run: the same 235-token
-prompt to one process gave five different greedy texts over twelve
-requests, on 0029 and 0030 alike, with MTP and the logits slice on or
-off, while 64 and 856 rows were byte-stable and the IR at 235 was too
-(DESIGN §7.0.2br). With the attribute the 235-token prompt is one text
-4/4, and the served rates are unchanged (856 tokens warm 1,008 t/s and a
-54.1 ms step; 71,727 tokens 464 t/s and 73.0 ms; the outputs the same;
-at 85 and 145 tokens the text changes with the kernel, chosen knowingly).
-Found by the equivalence suite, which runs on a GGUF-opened model since
-its stateful section became skippable. Open after it: a two-text
-alternation at 85 tokens on the GGUF path (the native form too, so not
-this gemm), and a process fault at about 190–215 tokens in the mixed form
-at the default prefill chunk (an engine memory CAT error at 16.5 GiB
-resident; not at `--prefill-chunk 64`, not in the native form, not in the
-IR) — both in the patch header, neither fixed.
-
-Package: `+p13` (built 2026-09-08 05:14 local on the dev host, installed there at 05:17, both units on it; the served figures above were taken with patch 0031 staged into the +p12 runtime before the package existed).
-
-### 0032-sdpa-micro-k-prefetch-bounds.patch
-
-The micro-SDPA prefill's two cooperative K-tile prefetches in upstream
-master's form (openvinotoolkit/openvino PR #37878, merged 2026-09-08,
-eighteen days after the pin). The pinned nightly prefetched the *next* K
-tile with its geometry in oneDNN's transposed-K order -- the remaining
-keys as the row length, d = 256 as the row count, at a stride of one
-element -- so its pointer landed inside row 0 of K and it walked 256
-rows of up to 256 B from there whatever the tile, unclamped (the
-helper's clamp comes from the same swapped geometry): a prefill chunk
-of N keys with a next tile, 129 to 255 keys, read 256 − N rows past the
-end of K; 256 keys and beyond are in bounds. Whether the pages behind
-the K buffer were mapped decided between a served prompt and an engine
-memory CAT error with a compute-engine reset -- the "190–215-token
-fault" of 0031's header (190–214 served faults; the reproducer faults
-at 193–217), which was never the gemm. The patch fixes the
-stride (ldk unless TRANSPOSE_K), the row length (d) and the row count
-(the remaining keys) for both calls, and adds a regression test: the
-paged-attention primitive alone, the served geometry (24 heads, 4 KV
-heads, head 256, u8 KV by channel), one subsequence of 193–217 new
-tokens on exact-size buffers -- red on the pinned nightly (faults or
-hangs), 11/11 green with the patch (DESIGN §7.0.2bs). Found with the
-intercept layer (the launch pinned, every argument and its buffer
-dumped, all correct), the disassembled micro-gemm blobs (their loads
-are surface-bounded), and one environment switch per access class in
-the generator (the host prefetches off: 5/5 pass). Served on the 24 GB
-card: 190/205/211 tokens six requests in one process, one text, where
-a fresh process died on its first request before; the plugin's
-paged-attention and SDPA suites 264/264. Rates unchanged: 856 tokens
-warm 1,008–1,009 t/s against 1,010 on +p13, the decode step 54.5–54.7
-ms against 54.7, the same greedy text, four requests each.
-
-Package: `+p14` (built 2026-09-08 09:14 local on the dev host, installed
-there at 09:15, both units restarted onto it and serving; the served
-figures above were taken with patch 0032 staged into the +p13 runtime
-before the package existed).
-
-### 0033-sdpa-micro-value-alignment.patch
-
-The micro-SDPA generator gives the V*S micro-gemm the packed row's
-alignment whenever the *value* precision is four-bit. Under u8 keys with
-i4 values -- the served pairing -- it used the f16 row's, 128 bytes for a
-132-byte row (68 at head 128; `alignment_for_ld` returns the lowest set
-bit of `head * 2`, capped at 128): patch 0020 keyed the operand's type on the value
-precision and left the alignment on the key's. A gemm strategy told its
-rows are 128-byte aligned addresses them accordingly, and what it read
-depended on the physical pages a request happened to get: the agent
-configuration's greedy text alternated by request parity (the page pool
-is a stack -- odd requests get an ascending run of pages, even ones a
-descending run) and was wrong from the first request, MTP on differing
-from MTP off (DESIGN §7.0.2bu). One condition fixes it.
-
-The plugin test of that exact shape was green for two reasons, both
-corrected here: the harness built only ascending contiguous block tables
-and addressed cache pages as `start + j` in ten places (now through the
-table, with `page_order` per test: reversed, or a gap after page 0 -- the
-served pool's third request), and its fill made every page look alike
-(all past keys −1, past values 0, a query of 8: a one-hot softmax on each
-page's last token). The fill now gives every token, head and page its own
-key (within 4e-4 of the u8 by-channel grid) and value (all sixteen four-bit
-levels in every token-and-head row, stored exactly), with a query of 1/64; the served geometry (24 heads, 4 KV heads, head 256) is in the
-cases under the three page orders. The harness also packed past tokens'
-four-bit values as (dim, dim + 16) pairs where the production writer and
-the readers use adjacent pairs -- invisible while every dim of a token
-carried the same value; corrected.
-
-Measured 2026-09-08 on the 24 GB card. Plugin test, full statistics over
-every element against the float reference: before the line the u8:i4
-cases err by 2.0–2.3 on 98–99 % of elements (value range 15) and the
-served three-token case hangs the test binary; with it exact: at most 0.001 on every case, none over 1e-2. The same
-fill through f16 KV and through u8 KV is exact to the tolerance. The tests'
-tolerance stays at 1e-2. Retracted on the record (DESIGN §7.0.2bu): a first
-fill with eight levels per row measured its own quantisation as a 0.11
-"floor" of the four-bit value path; the review's arithmetic reproduced the
-element map from the fill, and sixteen levels per row removed it.
-Served (arcint 0.4.3, the IR agent model, u8:i4, MTP on, one process): 130
-tokens six times, 825b1747 ×6 = the MTP-off text (before: two texts
-alternating, neither the MTP-off one); 8,005 tokens twice, one text;
-prefill 865/870 t/s against 869/874, decode at 8k within the noise. The
-equivalence suite on the fixed plugin passes every gate including the new
-one (MTP at u8:i4, three requests of one process byte-identical); on the
-unfixed plugin that gate fails and the rest pass. The whole paged-attention
-suite passes under the default and a reversed table, the SDPA suite too.
-
-Package: `+p15`.
-
-### 0034-sdpa-micro-tail-test-and-by-token-reproducer.patch
-
-Two tests, no kernel change; arcint's runtime floor stays at +p15
-(DESIGN §7.0.2bv).
-
-The **single-query micro-SDPA tail test** (5 cases) asks whether the output
-depends on what lies *past* the sequence length in the K/V allocation: K and V
-as a 129-row view of a 151-row allocation whose tail holds NaN (or 65504),
-against the same rows in an exact allocation. It is the non-paged neighbour of
-what 0032 fixed on the paged side, where the prefill's next-K-tile prefetch
-walked 256 rows from inside row 0 of K. A served drafter head (24 heads, head
-256, 129 keys) reuses a grown buffer on its second request, so a kernel reading
-past the sequence length would change its draft with no input changing. Green
-5/5 on the 24 GB card; it had been carried in no patch.
-
-The **by-token reproducer** is DISABLED, and it is why patch 0020's decline
-(four-bit values under BY_TOKEN keys) stays in place. Re-measured 2026-09-08
-with 0033's discriminating fill under the three page orders, on the 24 GB card,
-routing read from the dispatched kernel list rather than assumed: the by-token
-cases fail as *total NaN* on the generic kernel -- and so do **eight-bit**
-values under by-token keys, a pairing that decline does not govern and which
-runs on micro SDPA. Two kernels, one fill, the same all-NaN output — something the two runs share. The fill is
-not the explanation: at the test's default geometry (32 heads, 2 KV heads, head
-128) the by-token cases are exact at 36 keys (max 0.002, no NaN, both value
-precisions) and all-NaN at 132; at the served head 256 the NaN is a quarter of
-the elements already at 36 keys, three quarters at 102, all from 126. At 132 keys and beyond the failure is total at both value
-precisions and on both kernels; the partial gradient below 132 was measured on
-four-bit values and the generic kernel only. **No mechanism is claimed** -- the common element
-(the harness's own by-token page writing, its cache sizing, or the key
-dequantisation both kernels share) was not measured. The re-test therefore
-cannot reach a verdict on this instrument, since the instrument fails in a
-configuration the decline does not govern. The six cases that carry the finding
-ship disabled so the next reader starts from the measurement
-(`--gtest_also_run_disabled_tests`).
-
-Nothing served is affected: arcint never selects BY_TOKEN keys (the plugin
-defaults to BY_CHANNEL and forces BY_TOKEN only for a graph with cache-block
-rotation, which arcint's do not carry, DESIGN §7.0.2br), and every by-channel
-case is exact. The dispatch assertion is now conditional for that reason: the
-by-channel cases still assert micro SDPA, the by-token ones print the kernel
-they actually got.
-
-Not retracted, not reproduced: 0020's own note recorded this pairing as NaN
-"for every query whose causal context passes 128 keys, and only those",
-measured 2026-09-05 on the staged tree with that patch's own by-token test and
-the fill of the time. A quarter of the elements NaN at 36 keys is not that
-pattern; the two were taken on different fills and geometries, and which
-difference accounts for it is unmeasured.
-
-Measured on the patch's exact content, a plugin test build reconfigured with
-`ENABLE_DEBUG_CAPS=OFF`: the whole paged_attention and sdpa suites 320 ran,
-280 passed, 40 skipped (pre-existing vlsdpa), 0 failed; the disabled
-instantiation contributes 0 runs. Served unchanged: 825b1747 on three requests
-of the agent configuration's 130-token prompt, and the equivalence suite passes
-on both units' configurations.
-
-### 0035-sdpa-by-token-test-key-fill.patch
-
-Test-only: fixes the BY_TOKEN test harness's key fill (constant per-dimension →
-per-dimension linear ramp, the same correction FIX 2 applied to the value fill).
-No kernel change, no served behaviour change. Part of 0034's measurement pass.
-
-### 0036-sdpa-micro-flash-next-kv2-geometry.patch
-
-RED-C-03: Flash-Next's full-attention geometry (24 query heads, 2 KV heads,
-head_dim 256) through the u8:i4 paged-attention/micro-SDPA regression harness.
-Every prior cell uses `(24, 4, 256)` (dense/agent) or `(16, 2, ~128)`
-(MoE/coder); Flash-Next is a third combination — GQA group size 12 — that no
-test exercises. One factory function (`u8i4_mixed_micro_flash_next`, identical
-to 0033's `u8i4_mixed_micro_served` with `num_kv_heads` changed from 4 to 2),
-seven instantiations under ascending, reversed and gapped page tables, the same
-patterns 0033 exercises for the served shape. No kernel change; 0033's
-infrastructure (discriminating fill, permuted page tables, float reference,
-1e-2 tolerance) carries this shape as-is.
-
-**MEASURED 2026-09-09: 7/7 cells PASS.** RED-C-03 CLOSED GREEN. The "fits,
-unverified" verdict for 0010/0020/0032/0033 at Flash-Next's shape becomes
-"fits, verified by measurement." Three pre-existing BY_TOKEN failures in
-the 0035 suite (original geometry, "reverse" page order) are the known
-block-size gate from 0034, not flash-next related.
-
-### 0037-moe-hybrid-prefill-split.patch
-
-Hybrid grouped-GEMM/host prefill for the MoE static partition. Under a
-static half-partition every MoE layer's routed batch contains at least one
-non-resident expert, so the grouped-GEMM prefill path refused every batch and
-fell back to the serial per-expert loop (`grouped_fallbacks=40×layers`,
-§7.0.2ai). The fix wires `cpu_tier_misses` into both grouped-GEMM callers
-(`on_before_prefill` for the micro-GEMM path, `build_grouped_mask_otd` for
-the grouped oneDNN path). Non-resident experts receive `kCpuTierSentinelSlot`
-in the lease; the grouped-GEMM proceeds over the resident subset, and the
-non-resident subset is dispatched to `moe_cpu_expert` on the host after the
-GEMM completes. `get_expert_mask_from_gpu` skips the exact sentinel instead
-of throwing; any other out-of-range value still throws (the shape-predictor
-overflow guard). The scatter-reduce kernel's pre-existing UINT_MAX sentinel
-handling covers the new slot; no GPU kernel change.
-
-New OTD perf counter: `hybrid_prefill_layers` — the number of grouped-GEMM
-invocations that took the hybrid path instead of the full per-expert fallback.
-
-Design note: `docs/design-static-partition-prefill.md`. Campaign:
-`docs/campaigns/static-partition-prefill.md`.
-
-**MEASURED:** see DESIGN §7.0.2bx. The coding defect is eliminated
-(`grouped_fallbacks` 400→0), §3.4 identity and E2 pass, decode improves
-(18.2 t/s, above gate of 14.8). The campaign's prefill gate (within 25% of
-OFF) is **not met** — the host dispatch for non-resident experts serialises
-through ~128 experts per layer and dominates prefill time. The campaign
-remains open.
-
-### 0042-moe-hybrid-prefill-gather-filled-count.patch
-
-The fix for patch 0037's page fault on the Arc Pro B60 (Xe2). Under the
-hybrid prefill split the grouped-GEMM tables hold only the resident
-(token, k) pairs and the rest of `tokens_per_expert_cpu` stays -1, but the
-gather kernel was still launched over `token_num * max_topk` work-groups;
-every work-group past the fill computed `token_index = -1 * HIDDEN_SIZE`
-and added it to the kernel's `uint` offset, which wraps to ~2^32 elements,
-~8 GiB PAST the buffer — the B60's faulted address (0x1f0f5e000, ~8.2 GiB)
-is consistent with that; why the A770 never faulted on the same read is
-NOT explained on the record. The gather
-(and the stages it sizes) now runs over the filled count, the token tables
-are zero-initialised on both prefill paths (the micro-GEMM path carries the
-same over-sized launch, latent for arcint: grouped on), the GPU mask-gen's
-device table is zeroed before the kernel, and a batch with no resident
-expert takes the per-expert path as before 0037, counted as a grouped
-fallback. Known, not fixed: the filled count is also the oneDNN grouped
-primitive cache key, routing-dependent on the hybrid path (rebuilds per
-prompt; bucketing owed).
-
-Bisected on the served binary (2026-09-17): +p13 serves, +p16 faults,
-+p16 without 0037 serves, the LRU partition serves, and within 0037 a
-`stream.finish()` after every grouped-path stage showed the first
-synchronisation after the gather already throwing. Campaigns:
-`docs/campaigns/static-partition-prefill.md`,
-`docs/campaigns/sub4bit-vram-kernel.md` (status 2026-09-17).
-
-**MEASURED:** the 35B at `--offload-ratio 99 --moe-cpu-tier` on the B60
-serves Paris, warm repeat identical, decode 23.6 t/s (B60, KV u8, f16 inference, prefill chunk 512, one lane), the
-hybrid path active; no fault. Owed: the unit-ladder cell (tables with sentinel entries,
-filled count against launch size).
-
-Package: `+p18` (built 2026-09-17 20:31–20:43 local on the dev host from tree 83701d6; the packaged plugin's own cell on the B60 — the 35B at ratio 99 with the tier, KV u8, f16 — serves Paris at 23.3 t/s; not installed on any host by the seat that built it).
-
-### 0043-native-expert-formats-through-the-tier.patch
-
-The checkpoint's own expert blocks computed as they are, instead of the u4
-grouped-affine repack that costs 0.10–0.13 relative RMS per expert tensor
-and 0.73 nats at depth 48 against the model's own llama.cpp logits
-(DESIGN §7.0.2bz; `docs/design-routing-aware-expert-execution.md`
-§2.3a–d). The serving-shape emitter carries each expert weight in the
-fused op's rank-4 group-32 layout — IQ4_NL / IQ4_XS as u4 codes plus an
-f16 per-32 scale (a 16-entry table decode), IQ3_XXS as u8 grid indices
-plus u8 sign indices in the zero-point slot plus the f16 scale, Q8_0 as i8
-codes plus the f16 scale — and decodes them in standard ops. This patch:
-(1) three pattern blocks (`pattern_blocks/native_expert_block.*`) and a
-pass `ConvertTiledMoeBlockNativeToMoeCompressed` beside the stock tiled
-matcher, lowering the three chains straight to `MOECompressed` with a
-`weight_format` per projection in the config (visited, so it serialises;
-the shape checks relax at the weight's last dimension and the zero-point's
-under a native format); (2) the tier executes every routed expert under a
-native format (`_native_tier_only`: the batched-GEMV path forced, every
-expert a sentinel, the fused kernels never launched) with three row
-decoders in `moe_cpu_expert.cpp` (the tables verbatim from llama.cpp's
-ggml-common.h, pinned in arcint's `src/core/gguf_dequant.cpp` against
-gguf-py on the real shards); (3) the new source is listed in the
-transformations library's `sources.cmake` (no glob there — a source not
-listed is silently not built); (4) three host-only cells in
-`tests/unit/test_cases/moe_cpu_expert_test.cpp` (`moe_cpu_expert_native.*`)
-pin the three row decoders to hand-built blocks through
-`compute_stage_f32` (declared for them, outside the anonymous namespace).
-Reviewed before packaging (2026-09-18): the first form had the three
-native-format members missing from `clone()`'s field list (the executing
-impl would have run affine on native bytes — patch 0038's defect one
-patch earlier) and read `_native_tier_only` before assigning it; both
-fixed, the format is read off the primitive's config at the top of the
-constructor. The cells run without `ENABLE_TESTS`: compile the test file
-with `moe_cpu_expert*.cpp`, gtest from `thirdparty/gtest`,
-`-DOV_MOE_CPU_TIER_HAVE_AVX2 -mavx2 -mfma -mf16c`, the source tree's
-`src/inference/dev_api` on the include path, linked against the built
-`libopenvino` (8 cells, all green on the dev host). The OpenCL decode in
-the fused and per-expert kernels is the next patch.
-
-Two more relaxations found on the card: the impl's static
-`validate_impl` refused an f16 zero-point slot (IQ4_NL / Q8_0 gate-up: no
-impl, "No layout format available"), and the offload runtime's payload
-transpose asserted one byte per group in the zero-point slot (IQ3_XXS: four
-sign indices per group) — under a native format that slot is neither
-type-checked nor transposed; only the tier reads it, from the file.
-
-**MEASURED (2026-09-18, `tests/python/test_native_lowering_gpu.py`, tree
-dffd272, plugin 5a6968ec):** on BOTH cards — Arc A770 (GPU.1) and Arc Pro
-B60 (GPU.0) — the stock-affine control fuses (`moe_router_fused` +
-`moe_3gemm_fused_compressed`, corr 0.999999 against the CPU plugin) and
-the two native pairs (IQ3_XXS/IQ4_NL, IQ4_XS/Q8_0) lower to
-`MOECompressedNative`, run every routed expert through the tier and match
-the CPU plugin at corr 1.000000, max diff at 0.19 / 0.15 of the band the
-control's f16 noise calibrates; peaks vram0 94 MiB. The first form of this
-patch (before the review's clone-list fix) had wedged the B60 at the
-process's first job — with that form the executing impl ran the fused GEMV
-over native-layout bytes; the wedge has not recurred since the fix on
-either card (three legs), which is consistent with, not proof of, that
-mechanism. Owed: the served depth-4 and depth-48 native artifacts through
-the tier, the KLD gate's native reading.
-
-### 0044-moe-otd-routing-trace.patch
-
-A per-call routing TRAIL beside patch 0013's aggregate histogram, so the
-0.5.2 VENICE census can be taken from the SERVED path (campaign
-`docs/campaigns/expert-hot-set-lru.md`, design
-`docs/design-expert-hot-set-lru.md` §4b). Patch 0013 answers "which experts
-route" but not "in what order", so it cannot feed the per-layer LRU replay;
-an aggregate is not a trace. This patch adds an opt-in env
-`MOE_OTD_ROUTING_TRACE=<path>`: each `OffloadExpertWeightProvider` reads it
-once at construction (same per-provider, construction-time discipline as
-`MOE_OTD_ROUTING_HIST`), and `try_acquire_simultaneous` appends one line
-
-    <call_seq> <layer_key> <top_k> <expert id...>
-
-at the SAME point patch 0013 counts (before the dedup/hit-miss split, so it
-records what the router picked, not what the pool served). `<call_seq>` is a
-process-wide atomic counter under a mutex, and each line is flushed
-immediately so a `SIGKILL`'d window keeps every record already written (the
-aggregate dump only runs at exit). `layer_key` is the structural weight-file
-offset (patch 0018's key), so the trace is independent of the
-construction-order `layer_seq_id`.
-
-The offline half is `tools/hot_set_census.py`: `parse_call_trace`,
-`split_topk_chunks`, `layer_key_index_map`, `call_trace_to_v1` and the
-`from-call-trace` subcommand. Both silent-if-wrong assumptions have
-red-first cells in `tools/test_hot_set_census.py`: a call carrying two
-tokens' ids splits into the right `top_k` chunks and a mis-sized call is
-REFUSED, not truncated; and the `layer_key` -> decoder index map is the
-ascending export order by default, while an exported map with a duplicate
-index or a missing key is refused. A call carrying more than one token's
-ids is refused by the decode converter (per-token `token_idx` is undefined
-for a batched/prefill call in this trace), which is the stated caveat;
-`from-call-trace --skip-batched` skips and COUNTS the opening prefill call
-instead (an all-batched trace is still refused, never an empty census), and
-the CLI requires a `--provenance` file with a non-empty `artifact_sha256=`
-(or `artifact=`) and `card=` -- the artifact/card part of §2's header is
-enforced, the rest is not machine-checked here.
-
-MEASURED (2026-09-21, dev build host): applied on top of the 41 patches
-against pin `71640275` and built (`ninja openvino_intel_gpu_plugin`); the
-third-prefix install reports plugin version
-`2026.4.0-22849-71640275d29-marfrit-p19` and carries the `routing_trace`
-string. NOTE: that stamp is deliberately left at `p19`, which the packaging
-record already uses for patches 0003-0043, so the stamp alone cannot tell a
-0044 build from a 0043 one; the trace build is identified by its
-`routing_trace` symbol, and a future window must cite the symbol, not only
-the version string. The offline cells are 66 green (`tools/test_hot_set_census.py`,
-including the corpus-split census and the raw-`layer_key` join).
-OWED: the served card window (the census's own authority) and its
-stability statement; the measurement plugin and the debug-caps install are
-untouched, the new plugin lives in its own prefix.
-
-### 0045-native-expert-ocl-decode.patch
-
-The OpenCL decode of the checkpoint's own expert blocks, inside the per-expert
-kernel (campaign `docs/campaigns/sub4bit-vram-kernel.md`; design
-`docs/design-routing-aware-expert-execution.md` §2.3a–d, step 3). Patch 0043
-carried IQ3_XXS / IQ4_NL / Q8_0 experts into the fused op and ran every routed
-expert on the scalar CPU tier, with an in-code assert that did so "until the
-OpenCL decode exists"; this is that decode.
-
-`moe_expert_swiglu.cl` gains the three decode tables (the ones of the
-repository's `src/core/gguf_dequant.cpp` / `tools/q4e/native_blocks.py`,
-llama.cpp `ggml-common.h` pinned clone 56b9eb28) as `__constant` arrays and two
-entry points, `expert_gate_up_native` and `expert_down_native`, with the same
-dispatch geometry and argument list as patch 0040's `expert_gate_up` /
-`expert_down`. The weight bytes are decoded per element inside the K-loop — no
-dequantised row is ever written to memory. The per-tensor slot strides are the
-tensor bytes divided by the expert count (`expert_tensor_span`), i.e.
-`INTERMEDIATE_SIZE*HIDDEN_SIZE/{2,4,1,8}` by role and format; the scales arrive
-transposed to `[groups, oc]` by `maybe_transpose_scale_zp` exactly as the
-affine path's do, while the IQ3_XXS sign indices are copied row-major (0043
-skips the native zero-point transpose).
-
-`moe_3gemm_swiglu_opt.cpp` compiles those stages for a native config, lifts
-0043's "native + per-expert dispatch not combined" refusal, and dispatches the
-native stages for the resident experts while the misses keep going to the CPU
-tier (patches 0011/0012) exactly as before — the routing-aware split patch 0040
-built. A gate/up projection is refused at stage compile unless its format is
-IQ4_NL (1) or IQ3_XXS (2), rather than silently running the IQ4_NL decode over
-Q8_0 bytes.
-
-The same arithmetic is pinned device-free in the arcint repository before any
-card: `tools/q4e/native_expert.py` is the CPU reference (decode fused with the
-dot) and `tests/python/test_native_expert_gemv.py` its ladder — block-scale
-application per format, the fused-vs-materialised equality, a K that is not a
-multiple of 32 REFUSED, an unknown format REFUSED, and a deliberately wrong
-(affine) reading of IQ4_NL's bytes that must be caught rather than silently
-absorbed.
-
-MEASURED (2026-09-21, dev build host): applied on top of the 44 patches
-against pin `71640275` and built (`ninja openvino_intel_gpu_plugin`, clean);
-the plugin carries the `expert_gate_up_native` / `expert_down_native` symbols
-and the native tables. The version stamp stays deliberate at `marfrit-p19`
-(0003–0043's stamp), so the 0045 build is identified by its
-`expert_gate_up_native` symbol, not only the version string. The device-free
-cells are **16 green** (`tests/python/test_native_expert_gemv.py`).
-
-The per-expert `.cl` also had a **pre-existing** build blocker, found on the
-card: the plugin compiles a primitive's kernels into ONE program, so the
-`.cl` body appears once per kernel and its file-scope helpers
-(`expert_gate_up_gemv_u4`, `expert_down_gemv_u4`, `load_x_interleaved`)
-were defined twice -> `clBuildProgram` `CL_BUILD_PROGRAM_FAILURE` on xe2.
-That is why patch 0039/0040's per-expert kernel had never built on a card
-(the 2026-09-17 record). 0045 wraps every file-scope helper in a persistent
-`#ifndef` guard so the concatenated copies define them once; the native
-kernel then compiles (`lgc load: language model ready`, device-resident
-8.06 GiB).
-
-MEASURED (2026-09-21, 24 GB card GPU.0 = PCI 8086:e211, native d48n, ratio
-99 and 80, per-expert dispatch): the model **loads and compiles**, but the
-served per-expert path then **faults before the HTTP server comes up** --
-`xe ... Faulted Address 0x0000d556aa740000, Fault response: Unsuccessful
--ENOENT` on the blit engine (`EngineClass: 3 bcs`), engine reset, and an
-`arcint` `segfault ... in libc.so.6` (memcpy) at the same instant; no
-`per_expert_gpu_invocations` was measured. The fault is a finding to
-localise (the upload/gather/sentinel path, not the decode arithmetic,
-which the device-free cells pin), recorded in the campaign status and the
-handoff.
-
-OWED: the served native per-expert reading -- a fix for the card fault,
-then the GPU-dispatch counter, rate and correctness.
+reason to move the pin. `build-openvino.sh` resets the checkout hard and
+applies `patches/*.patch` in numeric order; the whole series 0003–0067 is
+packaged as **`+p20`**. Upstream status: none of these is filed as a PR yet
+except where named (0032 is upstream's own fix, backported).
+
+"The 16 GiB card" is the Arc A770 (Xe-HPG), "the 24 GB card" the Arc Pro B60
+(Xe2). Unless a line says otherwise a patch is byte-neutral on every path it
+does not target, and its correctness cells are in its own header.
+
+## MoE expert offload and the host compute tier (0003–0019, 0037, 0042)
+
+- **0003 — MoE expert-mask subbuffer churn.** At `token_num > 1` the MoE
+  implementation rebuilt its per-expert mask subbuffers every inference (20,480
+  `create_subbuffer` calls per two-token forward) for a prefill fallback the
+  batched-GEMV path never reads. Skipped below the GEMV threshold, created
+  lazily for the fallback. Byte-identical; the 35B's two-token verify forward
+  27.3 → 18.1 ms on the 24 GB card, which is what lets MoE speculation pay.
+- **0004 — OTD perf counters.** `[OTD_PERF]` counters (evictions,
+  acquisitions, slot tiers, staging bytes). An instrument; no served change.
+- **0005 — device-resident slot pool.** Expert slot buffers charged against a
+  per-compile device budget (`MOE_OTD_DEVICE_POOL_BYTES`), so slots that fit
+  live in VRAM instead of host memory.
+- **0006 — async batched slot uploads.** One call's misses uploaded as one
+  batch through a staging ring, waited on once.
+- **0007 — drop the redundant per-layer `stream.finish()`** before the
+  top-k read on an in-order queue.
+  Together, 0005–0007: the 35B on the 16 GiB card from 0.4 t/s (ratio 25,
+  unpatched) to 9.1–10.4 t/s at ratio 50 with an 8 GiB pool.
+- **0011 — the host CPU compute-tier kernel.** AVX2 and scalar kernels over
+  the plugin's grouped-int4 layout, a thread pool, the `MOE_CPU_TIER`
+  property. Built at per-source `-O3`: the library builds at `-Os`, under which the
+  in-situ task took 2,542 against 270 µs per expert.
+- **0012 — the tier's decode split.** A `(token, expert)` pair that would evict
+  a slot is computed on the host instead of uploaded; the OpenCL kernels skip
+  it by a sentinel; the host result joins before `mlp_reduce`. With 0011: the
+  35B at ratio 50 / 8 GiB 15.0–15.5 against 10.4–10.6 t/s, byte-identical on
+  the measured prompt, 10/10.
+- **0013 — routing histogram** (`MOE_OTD_ROUTING_HIST`), counted before the
+  hit/miss split. A diagnostic.
+- **0017 — the tier's readback decomposed.** Named readback counters,
+  `usm_host` destinations for the hidden state and routing weights (the
+  former 283 µs "readback" → 53 µs), the reads hoisted into one wait
+  (`MOE_OTD_READBACK_NOHOIST=1` restores the old order). What remains per
+  layer is the host waiting for the GPU to reach that layer's router.
+- **0018 — the static residency partition.** The tier's LRU residency chose
+  device-f16 or host-f32 arithmetic per expert by request history, so a
+  continuation restored from the prefix cache could fork from a cold one
+  (a DESIGN §3.4 violation). Each layer's resident set is now fixed at
+  `bind()` by a `splitmix64(seed, layer_key, expert)` rank, independent of
+  history; `MOE_CPU_TIER_STATIC_PARTITION` (on the compiled model, true only
+  with the tier on) lets arcint admit the prefix cache with the tier. The
+  equivalence suite passes with the tier and the cache, continuation-restore
+  included.
+- **0019 — the prefill fallback's weight answer is three-way** (no offload
+  tier / device slot / host tier), closing a dormant misrouting 0018 left in a
+  path arcint does not drive.
+- **0037 — hybrid prefill split.** Under the static partition every prefill
+  batch holds a non-resident expert, so the grouped GEMM refused every layer.
+  Now resident experts run through the grouped GEMM and the rest on the host
+  tier afterwards (`hybrid_prefill_layers` counter). The grouped fallback is
+  gone (400 → 0) and tier decode improves (18.2 against 12.5 t/s OFF on the
+  16 GiB card); the tier's prefill stays at a third of tier OFF's, owned by the
+  serial host dispatch.
+- **0042 — 0037's gather ran past its tables.** Only resident pairs fill the
+  grouped tables, but the gather launched over every pair and a `-1` table
+  entry wrapped its `uint` offset ~8 GiB past the buffer — a page fault on the
+  24 GB card. The gather runs over the filled count, the tables are
+  zero-initialised, a batch with no resident expert takes the per-expert path.
+  The 35B with the tier at ratio 99 serves on the 24 GB card at 23.6 t/s.
+  Known, not fixed: the filled count is also the oneDNN grouped-primitive
+  cache key, so a new prompt can rebuild primitives.
+
+## Paged attention and KV precision (0008–0010, 0014–0016, 0020, 0032–0036)
+
+- **0008 — `VALUE_CACHE_PRECISION`**, an independent value-cache precision
+  beside `KV_CACHE_PRECISION`, plus the signed-read fix for the value cache
+  (the value read's signedness had followed the declared port type).
+- **0009 — the asymmetric-KV kernel plan**: a genuine packing mismatch refused
+  at config time instead of miscompiling.
+- **0010 — u8-key / i4-value decode and write kernels** (the write path split
+  per operand, mirroring the read). With 0008–0009: `u8:i4` KV at 8.8 against
+  11.3 KiB/token on the coder, +28% auto-fit context, 10/10.
+- **0014 — GPU Assign adopts a same-type, same-rank output layout** instead of
+  asserting — the DFlash2 head's state window at exactly its row count. The
+  drafter now drafts past 2,048 prompt tokens.
+- **0015 — bounded attention partials.** `tmp_out` sized at the output type's
+  width (it had been allocated at twice what the kernel addresses);
+  `PAGED_ATTENTION_MAX_PARTITIONS` (0 = unbounded, the default, bit-identical to
+  the unpatched plugin) bounds the mixed stage's partial buffers with an online
+  merge; and a forced argument rebind when an intermediate's identity changes.
+  **Upgrade note, still true:** this inserts an option into the GPU
+  model-cache blob's positional property list — clear the GPU model cache
+  (`--cache-dir`) when upgrading from a level below it.
+- **0016 — intermediates sized from the current call**, not the previous
+  call's partition count.
+- **0020 — `u8:i4` prefill on micro-SDPA.** The value operand's type and
+  layout follow the value precision, and the selector admits eight-bit keys
+  with four-bit values; the values stay four-bit in VRAM and are unpacked in
+  registers. `u8:i4` prefill at `u8`'s rate at a held chunk (459 against 457
+  t/s at 37.7k, 401 against 398 at 71.7k, 16 GiB card), the generic path's
+  depth-scaled scratch no longer allocated, 10/10.
+- **0032 — micro-SDPA's next-K-tile prefetch bound** (upstream PR #37878,
+  backported). The pinned nightly prefetched the next K tile with a transposed
+  geometry and read up to 256 rows past the buffer for prefill chunks of
+  129–255 keys; whether the pages behind were mapped decided between a served
+  prompt and an engine reset. Plus a regression test at the served geometry.
+- **0033 — micro-SDPA value alignment under `u8:i4`.** The V·S micro-gemm took
+  the f16 row's alignment for a 132-byte packed row, so what it read depended
+  on the physical pages a request got — the agent's text alternated by request
+  parity. One condition; MTP on becomes byte-equal to MTP off. The test harness
+  now permutes page tables and uses a fill that tells pages apart.
+- **0034 — a micro-SDPA tail test** (output must not depend on what lies past
+  the sequence length) and the by-token reproducer (disabled; see 0035).
+- **0035 — the by-token test's key fill.** The NaN 0034 recorded for four-bit
+  values under by-token keys was the harness's own constant fill overflowing
+  f16 in its zero point; with a ramp fill every case passes. Test-only.
+- **0036 — Flash-Next's attention geometry** (24 query heads, 2 KV heads, head
+  256) through the `u8:i4` micro-SDPA harness. Test-only; 7/7 pass.
+
+## The GGUF K-quant kernel (0021–0031)
+
+- **0021 — `FullyConnectedKQuant`.** GGUF K-quant rows (Q4_K, Q5_K, Q6_K,
+  Q8_0) served as stored: an op arcint builds over a u8 constant holding the
+  file's rows, decoded in the kernel's inner loop — no unpack at load, no
+  second copy. A decode variant (M = 1) and a tiled prefill variant on the
+  matrix unit. The first GGUF-opened model scored 10/10.
+- **0022 — the decode variant split by architecture**: the one-row matrix
+  multiply on Xe-HPG (3× faster there), fused multiply-add on Xe2, the
+  work-group sized by the projection's width.
+- **0023 — the decode variant in llama.cpp's shape**: lanes along K, one
+  super-block per subgroup iteration, sub-group block reads; exact f32
+  accumulation. Served decode on the native form 9.9 → 12.1 t/s at 856
+  tokens; the timing test now streams and warms (earlier launch figures were
+  L2-assisted).
+- **0024 — Q6_K tail as one block read** (six messages to three): a gain on
+  the 16 GiB card (510 → 385 µs on the down projection), none on the 24 GB
+  card.
+- **0025 — Q6_K without variable-index shuffles**: the down projection 400 →
+  259 µs on the 24 GB card; served decode on the mixed form 13.4 → 15.3 t/s.
+- **0026 — Q6_K in 224-byte dword-aligned blocks** (type 114, laid out by
+  arcint at load, `--gguf-q6k aligned`, +6.7% bytes on that set): the down
+  projection 262 → 204 µs; prefill up a quarter.
+- **0027 — the runtime fusion check accepts the K-quant kernel.** Every fused
+  residual add had run through the unfused-subgraph fallback, whose output
+  read drains the queue (79 `clFinish` per step). Decode step 59.8 → 54.7 ms
+  at 856 tokens, byte-identical.
+- **0028 — the tiled variant's activation tile in the matrix unit's layout**
+  (one block read per operand instead of eight gathers).
+- **0029 — 2D block loads on Xe2** for both operands of the tiled variant, and
+  a 64-row tile at 256 registers there (Xe-HPG keeps the staged path at 32
+  rows). Mixed-form prefill 672 → 907 t/s at 856 tokens. The timing test's
+  operands moved to device memory (earlier tiled figures timed the bus).
+- **0030 — tall activation reads**: 32 rows per 2D message on Xe2, 16
+  subgroups per work-group. Warm 856-token prefill 940 → 1,001 t/s; 71.7k
+  451 → 464 t/s, the first GGUF form over the 460 t/s depth bar.
+- **0031 — oneDNN's deterministic attribute on the f16-activation compressed
+  FC.** A split-K strategy with atomic accumulation made a 235-token prompt
+  give five texts in one process; with the attribute, one. No rate change.
+  (Correction on the record: the attribute scores the *global* k-parallel
+  strategies out; a local split-K keeps its work-group count — the patch
+  comment's wording to the contrary is wrong, its effect stands.)
+
+## Per-expert dispatch and the native expert formats (0038–0041, 0043–0067)
+
+- **0038 — the per-expert dispatch framework** (`MOE_PER_EXPERT_DISPATCH`):
+  the fused GEMV path is bypassed and only the routed experts are computed.
+- **0039 — the per-expert SwiGLU GEMV kernel** with in-kernel u4 dequant.
+- **0040 — the per-expert kernel wired into the live path**: resident experts
+  on the card, misses on the host tier, the shared expert still fused.
+- **0041 — skip expert-constant processing at compile** under per-expert
+  dispatch (no mmap faulting of every expert at compile).
+- **0043 — the native expert formats through the tier.** The checkpoint's own
+  IQ3_XXS / IQ4_XS / IQ4_NL / Q8_0 expert blocks carried in the fused op's
+  rank-4 group-32 layout, lowered straight to `MOECompressed` with a
+  `weight_format` per projection, with CPU-tier row decoders (llama.cpp's
+  tables verbatim). Removed the u4 repack's error on Flash-Next (KLD at depth
+  48 0.54 → 0.42 nats on the first native serve).
+- **0044 — routing trace** (`MOE_OTD_ROUTING_TRACE`), a per-call trail beside
+  0013's aggregate. An instrument.
+- **0045 — the native formats' OpenCL decode** inside the per-expert kernels
+  (no dequantised row ever written); also the helper-guard fix that let the
+  per-expert `.cl` build at all (see the hazards below).
+- **0046 — census-seeded static partition** (`MOE_CPU_TIER_SEED`): the
+  resident set from a recorded routing census instead of 0018's
+  frequency-free rank (measured at chance); malformed or budget-mismatched
+  seeds refuse the load. History-independent by construction.
+- **0047 — the per-expert slot pool is resident-sized**, not 0041's one-expert
+  placeholder (whose second slot was written out of bounds).
+- **0048 — the load-time pinned NVMe fill's schedule** (`MOE_OTD_PINNED_NVME_FILL`,
+  depth 4, a pinned expert not landed by the barrier is a load failure).
+- **0049 — the arcwell transport and the OpenCL slot import**: the pinned
+  expert set DMA'd from NVMe into xe VRAM BOs and imported as the slot pool
+  (24 GB card only). Cold TTFT 92.5 against 99.7 s host-fed at depth 4.
+- **0050 — IQ2_S as a native format** (Qwen3.6-35B's gate/up); IQ4_XS down
+  rides the IQ4_NL layout.
+- **0051 — the all-resident native pool**: `OFFLOAD_RATIO` 0 with a native
+  format enables the offload provider with every expert resident.
+- **0052 — IQ2_S-packed**: the checkpoint's own 82-byte block verbatim
+  (expert fill −48.6% against the re-laid form at depth 4).
+- **0053 — OpenCL load diagnostics** (batch and program build prints,
+  `rethrow` backtraces). Prints only.
+- **0054 — the packed block's fused-op scale anchor is the f16 `d` Constant.**
+  Without it no packed block fused, and the compile constant-folded every
+  decode chain (233.5 GiB allocated for a depth-4 compile).
+- **0055 — IQ2_S-packed decode walks all eight sub-blocks** (it had decoded
+  32 of every 256 values).
+- **0056 — per-expert dispatch: aliased zero points and down strides.** For
+  IQ4_NL / Q8_0 / IQ2_S-packed the zero point aliases the scale and its raw
+  upload overwrote the transposed scale; the Q8_0 down kernel had no slot
+  offset. Every per-expert-dispatch reading on these formats taken before this
+  patch is void.
+- **0057 — native blocks accept compressed value Constants**
+  (`--dense-fp16` artifacts fused 0 of 40 layers before, 40 of 40 after).
+- **0058 — the all-resident pool is filled at bind** (it had re-read each
+  expert from disk on first routing): depth-1 decode 3.0 → 7.3 t/s, load
+  245 → 155 s.
+- **0059 — per-expert dispatch batched**: one launch per stage for all of a
+  call's pairs instead of two per pair. Full-depth 35B on the 16 GiB card:
+  prefill 12.5 → 143.9 t/s at 4,096, decode 7.9 → 15.2.
+- **0060 — grouped by expert**: a tile of up to eight pairs of one expert
+  decodes each weight once (`MOE_DISPATCH_MODE`, auto = grouped at 64+ pairs).
+  Prefill → 222.9 t/s, decode → 18.0.
+- **0061 — several rows per load**: gate and up at 2 rows over a 4-pair tile,
+  down at 4 rows, tile-uniform indices through `sub_group_broadcast`, every
+  native kernel spill-free. Prefill → 625.7 t/s.
+- **0062 — no speculative hidden-state readback on the all-resident pool**
+  (no expert can miss). Prefill → 653.7 t/s.
+- **0063 — weight-rounding emulation arm** (`MOE_NATIVE_W_ROUND=f16|bf16`, off
+  by default): the measurement that ruled out an f16-rounded matrix-unit form.
+- **0064 — IQ2_S-packed gate/up on the matrix unit, exact.** The B operand
+  `(2s + 1) · grid · sign` is an integer ≤ 1,333, exact in f16; `d/8` scales
+  each 256-value chain once. One route for every call size (tiles of 16 pairs
+  for large calls, a K-split one-pair kernel for small ones), so a token's
+  bytes do not depend on the call (DESIGN §3.4). Xe-HPG only; down stays
+  scalar; `MOE_NATIVE_GU=scalar` restores 0061. Prefill → 952 t/s, 10/10,
+  the full equivalence suite passing.
+- **0065 — the CPU tier decodes a native expert row once per call** and dots it
+  with every job, each job keeping its own order and rounding. Flash-Next
+  prefill on the 16 GiB card 1.04 → 3.13 t/s at 512 tokens, same digests.
+- **0066 — the CPU tier's native dots one job per AVX2 lane**, compiled
+  `fp-contract=off` so each lane is the scalar multiply-then-add (0 `vfmadd` in
+  the built routine). Flash-Next prefill → 6.4 t/s at 512 tokens, same digests.
+- **0067 — decode routes on the device on the all-resident pool.** A kernel
+  writes the decode pair table from the router's ids (calls under 64 pairs),
+  so no layer waits on a host readback. The full-depth 35B decodes 19.3 →
+  28.1 t/s after 4,096 tokens on the 16 GiB card, same digests, 10/10;
+  `MOE_DEVICE_ROUTE=0` restores the host route.
+
+Standing configuration these add up to: the full-depth Qwen3.6-35B native
+artifact all-resident on the 16 GiB card at ~960 t/s prefill (4,096 tokens)
+and 28.1 t/s decode, max context 112,288 at u8 KV.
 
 ## Deliberately NOT applied
 
-> [CORRECTED 2026-09-23: only **0001** and **0002** below are genuinely not
-> applied — they live at the repository top level and not in this directory,
-> so `build-openvino.sh`'s `patches/*.patch` glob skips them. **0046**, **0047**
-> and **0048** are in this directory and ARE applied by that glob, in numeric
-> order. The heading above is stale for those three entries; they are kept in
-> place with this date rather than moved, so the correction stays visible.]
-
-These live in the arcint repository's `patches/` as records of measurements.
-They are listed here so that nobody re-derives the decision by trying them.
+These live at the top of the arcint repository's `patches/` and not in this
+directory, so the recipe's glob never applies them. Listed so nobody
+re-derives the decision by trying them.
 
 - **0001-null-implementation-control.patch** — an instrument, not a fix: it
   forces a null implementation so a node's cost can be measured by removal.
   Shipping it would disable real work.
 - **0002-fc-horizontal-fusion-bound.patch** — raises the horizontal FC fusion
-  bound. Measured and rejected: fusing the MLP quartet produces wrong output
-  (its fourth member is the width-1 `shared_expert_gate`), and with the bound
-  restricted to the GDN sets the gain is 66.6 against 66.4 t/s — inside the
-  noise. DESIGN records it as "not carried".
-
-### 0046-moe-cpu-tier-census-seed.patch
-
-The census-seeded static partition for the MoE host compute tier (campaign
-`docs/campaigns/expert-hot-set-lru.md`, design
-`docs/design-expert-hot-set-lru.md` §5.1). Patch 0018 chooses a layer's
-resident expert set with a frequency-FREE `splitmix64(seed, layer_key,
-expert)` rank, measured (`tools/expert_policy_compare.py`) to sit at CHANCE at
-every budget (0.92–1.10× `slots/512`). This patch replaces that ranking with a
-measured-frequency rank from a served-routing census, so the pinned half is
-the hot half, while keeping DESIGN §3.4: the seed is a pure function of the
-RECORDED census, not of run history.
-
-New file `census_seed.hpp` (deliberately OpenVINO-free): a parser for the
-"hot-set seed v2" format, one data line per layer
-
-    <layer_key> <expert> <expert> ...
-
-with a MANDATORY `# space=layer_key` header. Malformed lines, duplicate
-`layer_key`s, duplicate expert ids, a missing or wrong `space=` header, and an
-empty file are REFUSED (`std::runtime_error`), not defaulted. The consumer
-half, `census_seed_resident_experts()`, validates one layer against the model:
-the `layer_key` must be present, the expert count must equal the pool
-capacity (a budget that moved since the census is a mismatch), and every
-expert id must be `< num_expert`.
-
-`expert_weight_providers.{hpp,cpp}` gains `set_census_seed()` /
-`census_seed_active()`; `bind()` pins the census set when active, else patch
-0018's splitmix64 rank. `moe_3gemm_swiglu_opt.cpp` reads the per-run env
-`MOE_CPU_TIER_SEED=<path>` once per process (cached across the 48 layers),
-validates THIS layer's entry at construction -- so a mismatched seed REFUSES
-THE LOAD before any request is served -- and logs
-`seed_source=census|census_seed_fp=0x...` beside the existing
-seed/`resident_checksum` fields. With the env var unset, patch 0018's
-behaviour is unchanged.
-
-`tools/hot_set_census.py`'s `select` now emits this format: `--census
-<layer,expert,count CSV>` (the CORPUS census a hot set is seeded from, not the
-decode-only v1 rows), `--layer-keys <JSON decoder-index -> layer_key>` to key
-the seed by the structural `layer_key`, and a `# space=layer_key` header. A
-seed with no layer-key map declares `# space=layer` and is refused by the
-plugin parser -- a decoder-index seed can no longer be silently consumed.
-
-MEASURED (2026-09-22, dev build host): applied on top of the 43 carried
-patches (0003-0045) against pin `71640275` and built (`ninja
-openvino_intel_gpu_plugin`, clean); the plugin carries the
-`MOE_CPU_TIER_SEED` / `seed_source=` / `census seed: layer_key` strings. The
-version stamp stays at `marfrit-p19` (disclosed: `p19` is also the 0003-0043
-stamp, so the 0046 build is identified by its env/parse symbols, not the
-stamp). Device-free cells: **14 green** in `tools/test_census_seed.py`
-(compile `census_seed.hpp` with g++ and exercise every malformed/mismatched
-case; each refusal goes RED when its check is removed) plus **76 green** in
-`tools/test_hot_set_census.py`.
-
-MEASURED (2026-09-22, A770 GPU.1 / PCI 8086:56a0): the served quality row is
-PASS, no V4. Native d48n artifact, `--offload-ratio 99 --moe-cpu-tier`, KV u8,
-chunk 512; incumbent `splitmix64` seed and the corpus census seed, same
-256-token prompt and greedy 32 tokens, both produced greedy sha256
-`2169836b33e8bc74d7965fff867b13c1d3637388a4b52f11f639f381ce7cc36f` --
-byte-identical, because under the native artifact every routed expert runs on
-the host tier (patch 0043), so residency moves bytes, not arithmetic. The
-corpus S = 6 seed (one slot over the pool) was run first and REFUSED the load
-(`census seed: layer_key ... lists 6 experts but the pool has 5 slots
-(mismatched budget)`). Finding: the plugin's pool at ratio 99 is 5 slots/layer
-(integer division) while the fit ledger prices 6 (`ceil`); the served seed is
-the corpus top-5. The speed row stays EMPTY and G UNPINNED.
-
-### 0047-moe-per-expert-slot-pool-size.patch
-
-The per-expert dispatch path's slot pool must be resident-sized, not a
-1-expert placeholder (campaign `docs/campaigns/sub4bit-vram-kernel.md`,
-DESIGN §7.0.2cd). [code] Patch 0041, when `MOE_PER_EXPERT_DISPATCH` is on,
-gives
-every routed-expert Constant a 1-expert placeholder (`moe_offload_constant.cpp`:
-`upload_shape[0] = 1`, reinterpreted to the full constant layout) so that the
-data primitive exists and no mmap page is faulted. But the per-expert
-dispatch path uses that same buffer as its weight storage: the provider builds
-an LRU pool of `lru_expert_num` slots in it and `fill_weights_memory()` copies
-each resident expert to `dst_offset = slot × (tensor bytes / num_expert)`
-(`moe_otd_runtime.cpp`), while patches 0043/0045's per-expert OpenCL kernels
-index it by `slot_index` (`set_otd_weight_pointers` → `exec_batched_gemv`).
-The first slot with index ≥ 1 therefore ran past the 1-expert allocation.
-
-MEASURED (2026-09-22, 24 GB card / PCI 8086:e211): the served native `d48n`
-with `--moe-per-expert-dispatch` faulted before the HTTP server started —
-`arcint … segfault … error 6 in libc.so.6` (the memcpy vector) and, at the
-same instant, `xe 0000:0f:00.0 … Faulted Address 0x0000d556aa740000, Fault
-response: Unsuccessful -ENOENT` on the blit engine (`engine_class=bcs`, engine
-reset). A gdb attach localises the host crash to `paged_forward → load_paged`
-→ `libopenvino_intel_gpu_plugin.so` → `libigdrcl.so` →
-`__memcpy_avx_unaligned_erms`, i.e. the slot upload.
-
-**The engine/plugin slot-count off-by-one is disproven.** The fit ledger
-(`src/exec/fit.h expert_slot_bytes`) prices `ceil(512*(100-r)/100)` = 6 at
-ratio 99 while the plugin (`ops/moe.cpp`) integers to 5. The discriminating
-run is the ratio where both agree: ratio 75, both 128. The same segfault and
-the same fault address recurred there, so the divergence is not the mechanism;
-the fixed 1-expert placeholder is, and it is ratio-independent. The engine's
-ceiling only ever sizes the reservation/ledger, never a plugin buffer
-(`MOE_OTD_DEVICE_POOL_BYTES` is an env-set byte budget).
-
-Fix: allocate the resident slot pool exactly as the ordinary OTD path does
-(`upload_shape[0] = min(num_expert, resident_expert_num)`), while keeping the
-compile-time behaviour: `upload_bytes = 0` (deferred to runtime), `skip_evict`
-true (no mmap page faulting / VMA churn) and no device pool budget charged.
-A defensive `OPENVINO_ASSERT` states the (min()-guaranteed) pool ≤ full-layout
-invariant; it is not a runtime guard.
-
-MEASURED (2026-09-22, 24 GB card): the fault is gone, the plateau probe settles
-at `0.37 GiB` (`probe-static`), and the served path answers. On the native
-`d48n` at ratio 75 + tier, KV u8, chunk 128, one lane:
-`[OTD_PERF] … per_expert_dispatches=24676, per_expert_gpu_invocations=135874,
-gpu_hits=3623, gpu_misses=21053, gpu_hit_rate=14.6823%, cpu_tier_pairs=187903,
-created_onednn_kernels=0`; prefill 5 tokens 14.72 s, decode 16 tokens 28.21 s
-(0.6 t/s), answer ` Paris. Paris is the most populous city in France and one
-of the most visited`. The 16 GiB card serves the same cell too: load 675 s,
-16 tokens 36.5 s (0.44 t/s on the request wall, prefill + decode; the B60's
-0.6 t/s is decode-only), `per_expert_gpu_invocations=135634`,
-`per_expert_dispatches=24697`, hit 14.89%, `cpu_tier_pairs=188023`. The load
-takes 845 s on the 24 GB card — the residual stall is the CPU
-tier's scalar native decode during the load-time probe (seven
-`moe_cpu_expert` threads at ~90% CPU), not a JIT (no `ocloc`/`llvm-spirv`
-child) and not a deadlock; it terminates.
-
-### 0048-moe-otd-pinned-nvme-fill.patch
-
-The load-time pinned NVMe fill's schedule, wired into the static partition
-(campaign `docs/campaigns/nvme-direct-expert-tier.md`, design note
-`docs/design-nvme-direct-expert-tier.md` D2/D3). Membership is the pinned set
-patch 0018/0046 already fixes at `bind()`; the fetch is arcwell's batch
-surface (`AW_IOC_SUBMIT_BATCH` / `AW_IOC_BATCH_WAIT`), one batch per MoE
-layer, four batches in flight, collected and marked filled before the first
-routed call. There is **no fetch on the decode path**.
-
-New file `pinned_nvme_fill.hpp` (deliberately OpenVINO-free): the schedule —
-an injected `Transport` with setup/submit/collect and no synchronous read
-primitive, a `Scheduler` at depth 4 that fills the window before collecting
-the oldest, retries a short batch once, and REFUSES the load (never a silent
-demotion to the host tier) if a pinned expert is still not landed. It is the
-byte-identical twin of arcint's tracked `src/exec/pinned_nvme_fill.h`, checked
-by `tests/test_pinned_nvme_fill.cpp`, which is the one the device-free ladder
-tests.
-
-`expert_weight_providers.{hpp,cpp}`: the env opt-in `MOE_OTD_PINNED_NVME_FILL`
-(read once at construction, inert when unset); `reserve_static_partition()`
-factorised out of `bind()` so the coordinator can reserve every layer's slots
-before it marks them filled; `pinned_nvme_fill_batch()` (this layer's pinned
-membership as one batch); and `apply_pinned_nvme_fill_slot()` (the cache
-`set_filled(slot)` the note's §3.4 requires on collect). A translation-unit
-global coordinator starts at the first layer's `bind()`, enumerates the live
-providers in structural `layer_key` order, and runs the barrier. A failure
-anywhere in setup or the barrier throws — a load failure, per D3.
-
-`require_no_sync_read()` is the campaign's own red-first guard: a would-be
-synchronous `AW_IOC_READ_BLOCKS` is refused once serving has begun, so the
-losing configuration cannot be reached.
-
-MEASURED (2026-09-23, device-free): the patch applies cleanly to a pristine
-checkout of the pin **through the full sequential series 0003–0047**
-(`git apply --check` + apply, 45/45 then 0048), and compiles clean against the
-0047 tree (`ninja openvino_intel_gpu_plugin`, rc 0; only
-`expert_weight_providers.cpp` and `moe_3gemm_swiglu_opt.cpp` rebuilt). The
-schedule's ladder is 8 cells green in `tests/test_pinned_nvme_fill.cpp`; three
-mutants (guard removed, refusal replaced by a silent fill, depth ignored) each
-fail their named cell — raw output in the campaign's evidence packet. The
-version stamp stays at `marfrit-p19` (disclosed, the same as 0046/0047): the
-0048 plugin is identified by its `MOE_OTD_PINNED_NVME_FILL` / `pinned NVMe fill`
-symbols, not the stamp.
-
-**OWED, stated not faked.** The `Transport` has no production implementation
-in this patch: under the static partition the expert slot pool is host-mapped
-(`MOE_OTD_PERF_LOG` reports `device_slot_buffers=0`), and arcwell requires a
-dma-buf from an xe VRAM BO, so there is no destination a byte-transparent fill
-can land in yet. The per-expert dma-buf BO the artifact-format step named as
-the D2/D3 contract, the arcwell ioctl transport, and the card validation are
-OWED. Until they exist, an ENABLED `MOE_OTD_PINNED_NVME_FILL` refuses the load
-with that reason — exactly the note's "arcwell cannot be set up at all is a
-load failure" rule. With the env unset, patch 0018/0046/0047 behaviour is
-unchanged.
-
-## 0049 — the arcwell transport and the OpenCL slot import
-
-`0049-moe-otd-pinned-nvme-transport.patch` supplies the production `Transport`
-0048 injected empty, and the OpenCL import that makes the BO-backed slot the
-destination the resident expert is read from. Two new files:
-
-- `moe/pinned_nvme_transport.hpp` — `lgc::nvme_fill::ArcwellTransport`, the
-  `Transport` implementation. It owns the `/dev/arcwell` fd and the Arc render
-  node fd, creates one 64 KiB-rounded xe VRAM BO per (layer, tensor)
-  (`DRM_IOCTL_XE_GEM_CREATE` with VRAM placement + `NEEDS_VISIBLE_VRAM` +
-  `CPU_CACHING_WC`), exports the dma-buf (`DRM_IOCTL_PRIME_HANDLE_TO_FD`),
-  registers it peer-to-peer (`AW_IOC_MAP_BUFFER`, asserting
-  `AW_MAP_F_REQUIRE_P2P`), and drives `AW_IOC_SUBMIT_BATCH` /
-  `AW_IOC_BATCH_WAIT`, checking `out_submitted`/`out_err` (the ioctl return
-  alone is not enough; an unaligned geometry returns 0 with submitted=0,
-  err=-22). It expands one expert into THREE page-aligned requests — the store
-  record is `gate|up|down` concatenated and the plugin's device layout is
-  three per-tensor regions — with the store ordinal `dense_layer * capacity +
-  slot` and `expert_%04u.bin` (the ordering was verified layer-major, 0
-  mismatches against the manifest).
-- `moe/aw_uapi.h` — arcwell's uAPI header (BSD-2-Clause), vendored because the
-  plugin build cannot see `~/src/arcwell`.
-
-`expert_weight_providers.*` gains `create_pinned_nvme_pool()` (register the
-three BOs before the barrier), `pinned_nvme_geometry()`, and
-`bind_pinned_nvme_pool()` — which **imports the dma-bufs with
-`engine.import_buffer()`** and **replaces the host-mapped `gate_w`/`up_w`/
-`down_w`** with `reinterpret_buffer()`s of the imported pool, so the fused GEMV
-kernel reads the controller-DMA'd bytes directly. `moe_otd_runtime.*`'
-`fill_weights_memory()` gains `include_weights=false`, used to host-upload only
-the six scale/zp tensors (which the DMA slice excludes: adding them is 623.4375
-pages, not page-aligned, and they need the `[oc][group]`→`[group][oc]`
-transpose), completing each pinned slot at load on the engine's service stream.
-Customisation is opt-in and operator-set: `MOE_OTD_PINNED_NVME_FILL`,
-`MOE_OTD_PINNED_NVME_DRM`, `MOE_OTD_PINNED_NVME_STORE`,
-`MOE_OTD_PINNED_NVME_PART_START`.
-
-MEASURED (2026-09-24, device-free + one B60 leg): the patch, sha256
-`d6d3498d20fddf22b2972ba128c7b719dd8b759e4378a4b16f838296b54a630f`, reverse-
-applies and re-applies cleanly on the 0048 tree and compiles clean
-(`ninja openvino_intel_gpu_plugin`, `ninja_rc=0`); the apply transcript
-(`apply-check-0049.txt`) and the complete build log (`build-0049.log`) are in
-the packet. The mechanism was proven on the B60 end-to-end by the tracked
-non-arcint client `tools/arcwell_cl_slot_proof.c`: three per-tensor VRAM BOs,
-two real store experts DMA'd as six requests, imported into OpenCL, read back
-through the OpenCL queue **byte-identical** (sha256 `d463d1d5…`),
-`via_host_bounce` delta 0, `max_inflight` 6. All five red legs fail as required
-(`rc=1`, named failure, one transcript each in `mut-*.txt`): unaligned
-geometry, dropped partition offset, system-memory BO, corrupted readback,
-OpenCL corruption.
-
-**OWED, stated not faked.** The integrated served number — the fill running
-inside the serving loop and the depth-4 gate rows — is NOT measured here; the
-plugin was built and the mechanism proven, but the acceptance gate's three
-rows (`docs/window-053.md`) stay OPEN. The store ordering used by the
-transport is the store's own layer-major ordinal; a run against an artifact
-whose layer keys differ from the store's would need the store re-pointed.
-
-## 0050 — a fourth native expert format: IQ2_S (Qwen3.6-35B-A3B)
-
-`0050-native-expert-iq2s-format.patch` adds `MOECompressed::kWeightFormatIq2S
-= 4` and carries it through the pattern block, the op validation, the CPU
-tier's row decoder and the per-expert OpenCL decode — the shape of 0043/0045
-for one more format. `Qwen3.6-35B-A3B` (`qwen35moe`) ships IQ2_S (ggml type
-22) gate/up on all 40 layers over IQ3_XXS (37) / IQ4_XS (3) down, and IQ2_S
-is not one of 0043's three: one 10-bit grid index per EIGHT values (four per
-32) packed as little-endian u16 in a u8 `[E, out, K/32, 8]` weight slot, a
-RAW sign byte per 8 values in the zero-point slot, and TWO 4-bit sub-block
-scales per 32 (low nibble for values 0..15, high for 16..31) as f16
-`[E, out, K/32, 2]`. `moe_otd_runtime.cpp` skips the device scale transpose
-for IQ2_S (the two sub-scales are read row-major).
-
-**IQ4_XS down needs no new format**: `iq4_xs_split` folds its 6-bit sub-block
-scales into the per-32 f32 scale and lands on the IQ4_NL layout 0043 already
-carries, so the three IQ4_XS down tensors ride `kWeightFormatIq4Nl`
-unchanged (measured 2026-09-24 on `blk.34/38/39.ffn_down_exps`, split ->
-decode vs gguf-py `max|diff| 0.0`).
-
-MEASURED (2026-09-24, device-free): the patch applies, reverse-applies and
-re-applies on the 0049 tree, and `ninja -j6 openvino_intel_gpu_plugin` in
-`build-prod` is clean (rc 0, 47 targets, the plugin links). The plugin unit
-cell `moe_cpu_expert_native.iq2_s_row_decodes_...` compiles to an object with
-the plugin's own flags and the vendored gtest headers (that build dir has no
-unit-test target configured).
-
-**OWED.** The GPU compile of a 256-expert/IQ2_S block — the plugin's own
-`ConvertTiledMoeBlockNativeToMoeCompressed` firing and the native per-expert
-kernel launching — is NOT measured here; only the library build and the
-serialised pattern are. That is the A770 window. The emitter
-(`tools/q4e/serving_shape.py`'s IQ2_S branch and
-`build_qwen35moe_serving_shape_ir`) is in the arcint tree, not in this patch.
-
-## 0051 — the all-resident native pool: ratio 0 is a configuration, not an absence
-
-`0051-native-fully-resident.patch` fixes a three-link dead end that made the
-all-resident **native** configuration unreachable (and, with it, the fastest
-native route: every expert on the GPU, only the routed ones computed). The
-links, each on its own tree:
-
-- `src/config.cpp` refused `--moe-cpu-tier` when the ratio was 0;
-- the arcint backend set the plugin's `OFFLOAD_RATIO` (and `ov::weights_path`)
-only when the ratio was `> 0`, so an explicit `0` was swallowed;
-- the plugin's `prepare_moe_otd_params` (`ops/moe.cpp`) computed
-`lru_expert_num = 0` when `otd_ratio == 0` in the stock form, so
-`moe_3gemm_swiglu_opt.cpp` selected the **Resident** provider — which has no
-slot pool and **no native reader** — while patch 0043's assert demanded
-`_cpu_tier && is_offloaded()`, a combination unsatisfiable at 0.
-
-This patch:
-
-- `ops/moe.cpp`: for a native format at `otd_ratio == 0`, enable OTD when the
-caller supplied `ov::weights_path` (an explicit 0 is thereby distinguishable
-from unset) and size the pool at `num_expert` — every expert resident, read
-through the offload provider's native reader. `ratio == 100` stays disabled
-(all on disk cannot run).
-- `moe_3gemm_swiglu_opt.cpp`: the assert requires `_weight_provider->is_offloaded()`
-only. The tier was needed because (0043) no OpenCL decode existed yet; 0045
-added it, so the tier is unnecessary when there are no misses.
-
-MEASURED (2026-09-25, device-free): the patch reverse-applies cleanly on the
-0050 tree, and `ninja -j8 openvino_intel_gpu_plugin` in the debug-caps-OFF
-build dir is clean (rc 0, 6 targets, the plugin links). The arcint-side
-companion (`src/config.cpp` guard, a `offload_ratio_set` flag, and
-`src/exec/backend_ov.cpp` setting the property for an explicit 0) is in the
-arcint tree, not in this patch. The version stamp stays at `marfrit-p19`,
-disclosed the same as 0046-0050 (the built plugin reports
-`2026.4.0-22849-71640275d29-marfrit-p19`; its sha256 is
-`7a10444e7ab088232f8404ffb43c4ebbf51268a0e7d8f6983c16f313b25f0324`).
-
-**OWED.** The served gate — the all-resident native arm actually loading on
-the A770 and its rate against the tiered arm — is the card leg's, not this
-patch's.
-
-## 0052 — IQ2_S-packed: the checkpoint's own block, verbatim
-
-The checkpoint (`Qwen3.6-35B-A3B-UD-IQ3_XXS`) serves 80 IQ2_S expert tensors.
-The 0050 route re-laid each into a split form -- a u16 index, a sign byte and
-an f16 scale per 8 values -- at 128 B per 256. This patch carries the
-checkpoint's own block instead, with the f16 `d` lifted into the scale slot:
-**80 self-contained bytes** (32 B qs low-2-bit indices | 32 B RAW sign masks |
-8 B qh high-2-bit | 8 B 4-bit sub-block scales) plus one f16 per 256-value
-block -- **82 B/256**, the GGUF's own size (design note 12.4: 10.35 GiB of
-experts against 14.47). Added additively: `kWeightFormatIq2S` (4) and every
-other path are untouched.
-
-- `ov_ops/moe_compressed.{hpp,cpp}`: `kWeightFormatIq2SPacked == 5`, the
-`is_native_format` membership, the weight-shape assert
-`[E, out, K/256, 80]` (K = dim 2 × 256), and the affine `group_size`
-cross-check skipped -- this format's scale is per 256, not per group.
-- `native_expert_block.{hpp,cpp}`: `NativeIq2sPackedWeightsBlock`. It matches
-the emitter's chain (`tools/q4e/serving_shape.py _native_packed_expert`): four
-`Slice`s carve qs / signs / qh / sub-block scales out of the last axis; the
-2-bit high index bits and the 4-bit sub-block scales come out in f32
-arithmetic (a per-l divisor broadcasts over a new last axis, `floor` + mod --
-no shifts, no `Concat`); the magnitudes are `Gather(iq2s_grid[1024,8])` and
-the signs the RAW byte (bit j flips value j). Anchors: `weight`, `scale`,
-`reshape`.
-- `convert_tiled_moe_block_to_gather_matmuls.cpp`: the block joins the native
-`Or` (tried first -- its first op after the Constant is a `Slice`, not the
-IQ2_S block's `Reshape`); `resolve` sets format 5 with `zp` aliasing `scale`;
-`hidden_size` takes 256 values per group row for it.
-- `moe_cpu_expert.{hpp,cpp}`: `kQuantFormatIq2SPacked == 5` and the CPU-tier
-row decoder (80-byte block, `d` from `m.s[n*nblk + ib]`).
-- `moe_expert_swiglu.cl`: `native_dot_iq2s_packed` -- the OCL per-expert decode
--- plus the gate/up/down weight and scale slot strides for format 5.
-- `moe_otd_runtime.cpp`: the scale transpose is skipped for format 5 (the
-scale slot is a plain per-256 f16 vector, not an `[oc, groups]` payload).
-- `moe_3gemm_swiglu_opt.cpp`: the native gate/up and down asserts admit 5.
-
-MEASURED (2026-09-25/26, device-free): the 0050 build dir (`build-meas-0050`,
-debug caps OFF) relinks clean with the patch applied -- the GPU plugin links,
-rc 0. Emitter side: the packed chain decodes random blocks to `max diff/bound
-1.28e-07` against `native_blocks.iq2_s_packed_decode` (bit-exact modulo the
-f32 dot's summation order), and all four sampled real IQ2_S expert tensors
-(`blk.0` gate/up, `blk.2` gate, and the IQ3_XXS down that stays on its own
-route) are byte-identical to the checkpoint's own blocks -- 80 B weight plus
-the f16 `d`, `w80exact=True dexact=True`. A depth-4 export
-(`tools/export_serving_artifact.py --layers 4 --expert-format native
---native-packed`, `qwen36-35b-a3b-d4packed-ov`) against the re-laid depth-4
-artifact: **expert fill 2,415,919,104 -> 1,241,513,984 B (-48.6 %)** and the
-language-model `.bin` 4,284,499,713 -> 3,898,623,853 B. (The 48.6 % is below
-the 82/128 = 64 % the IQ2_S bodies alone would give; the IQ3_XXS downs, which
-stay on their own route, are unchanged.)
-
-**OWED.** The card leg: a packed artifact compiling through the GPU plugin
-(the matcher firing) and serving under all-resident. The OTD CPU-tier decode
-path is untested against the emitter's chain.
-
-## Not carried either: the measurement instrument
-
-The arcint session's working tree also carries per-stage timing accumulators
-(`network.cpp`, `primitive_inst.cpp`, `stage_acc.hpp`). Those are how the
-20,480 calls were found. They are **not** part of any patch here, and the
-build script resets to the pinned commit and applies only this directory, so a
-dirty measurement tree cannot leak into a package.
-
-## 0053 — the OCL load diagnostics (2026-09-26)
-
-Three prints, no behaviour change: `kernels_cache::build_batch` prints every
-batch's hash, bucket, batch id, kernel count, `options` and entry-point names,
-and prints the same line plus `what()` if that batch's `build_kernels` throws;
-`ocl_kernel_builder::build_kernels` prints `fmt`/`bytes`/`options`/kernel names
-before each program build and grabs `CL_PROGRAM_BUILD_LOG` on failure;
-`ocl_common::rethrow` prints an `err`/`msg` line and a `backtrace()`.
-
-They exist because arcint's packed route (`0052`, `native_dot_iq2s_packed`)
-fails at load on the A770 with `Check 'false' failed` at
-`program_builder.cpp:168`, wrapping `CL_OUT_OF_RESOURCES`. The build *path*
-itself is exonerated by these prints: on a d4packed load all five
-`build_batch` batches and all five `ocl_kernel_builder` programs succeed (no
-`ARCINT_KC EXC`, no `ARCINT_KB FAIL`), so the failure is **not** a kernel
-build. `ARCINT_BT` names it instead:
-
-```
-ARCINT_BT err=-5 msg=[GPU] clEnqueueNDRangeKernel, error code: -5 CL_OUT_OF_RESOURCES
-```
-
-a **kernel launch**, not a compile. The artifact is 3.63 GiB
-(`qwen36-35b-a3b-d4packed-ov`, smaller than the 3.99 GiB re-laid control that
-loads and serves), so artifact fit is not it either. The failing kernel is
-**not yet named** — the backtrace frames are unsymbolized (a stripped Release
-plugin, `addr2line` lands on unrelated std noise). Next step: a `-g` plugin
-or an `nm`-on-the-archives mapping of those offsets.
-
-## 0054 — IQ2_S-packed: the fused op's scale is the f16 `d` Constant (2026-09-26)
-
-`0052` registered the packed block's `scale` **Multiply** as the anchor the
-fused op takes as its scale; the callback's Constant guard then refused every
-packed block, the tiled MoE stayed unfused, and the GPU compile constant-folded
-the whole decode chain -- on the host (`ConstantFolding` inside
-`ConvertPrecision`, `MultiplyMultiplyFusion`: 1 GiB f32 per expert tensor,
-233.5 GiB allocated for a depth-4 compile) and on the card (`propagate_constants`,
-where the packed depth-4 load died with `CL_OUT_OF_RESOURCES` in an eltwise
-launch, the kernel 0053 left unnamed). The earlier "matcher fires" rested on a
-print inside `resolve()`, before the guard. This patch anchors `dd`.
-
-MEASURED (2026-09-26): `tools/native_moe_match_probe.cpp` on the packed depth-4
-IR -- `MOE_COMPRESSED 0` on the 0052 core, 4 with 0054; the scale slot is
-`Constant f16 [E, out, K/256, 1]`. Cell: `tests/python/test_native_moe_match.py`.
-
-## 0055 — IQ2_S-packed decode: eight sub-blocks per 256 values (2026-09-26)
-
-The CPU-tier row decoder and the OpenCL `native_dot_iq2s_packed` both indexed
-qs / signs / qh / scales and the input by the 256-value block index and decoded
-32 of every 256 values. Both now loop the eight 32-value sub-blocks.
-
-MEASURED (A770, one E = 256 top-8 block against the CPU plugin's exact decode,
-`tools/native_moe_block_ab.cpp`): 86x the band -> 0.12-0.39 on every route.
-
-## 0056 — per-expert dispatch: aliased zero points, down strides (2026-09-26)
-
-For IQ4_NL, Q8_0 and IQ2_S-packed the matcher sets `zp = scale`, and the
-constant cache gives both inputs one memory: the slot fill wrote the scale
-device-transposed (offsets 3..5) and then the zp's raw copy over the same bytes
-(6..8), so the per-expert kernels read a row-major scale as `[groups, oc]`. A
-native zp that aliases its scale is no longer uploaded (the device zp of a
-native format is never read by a kernel). Also: the Q8_0 down kernel had no
-slot offset (every expert read slot 0), and IQ2_S as a down projection had the
-wrong weight stride, no sign/scale strides and no decode branch.
-
-MEASURED (A770, E = 256 top-8, T 1 and 6): IQ4_NL 67-249x and Q8_0 101-263x
-the band under dispatch -> every pair either checkpoint uses at <= 0.40 on the
-resident-dispatch, tier-dispatch and non-dispatch routes. Still refused at
-compile (`Unable to cast reference from base to derived type`): IQ2_S as down
-and Q8_0 as gate/up under dispatch, which neither checkpoint uses.
-
-## 0057 — native blocks accept compressed value Constants (2026-09-26)
-
-`save_model(compress_to_fp16=True)` (the exporter's `--dense-fp16`) turns
-every f32 Constant into f16 + `Convert`, the decode chains' grids, tables, +-1
-and divisors included, and the blocks' bare `wrap_type<Constant>` then matched
-no layer. The blocks now take a value Constant bare or behind that `Convert`;
-all such values are exact in f16 and the kernels carry their own tables.
-
-MEASURED (probe, full-depth IRs): the f16 re-laid 40-layer artifact fused 0 of
-40 on the 0052 core (its 50.1 GiB compile was the chains being folded), 40 of 40
-with 0057; the re-exported packed one likewise.
-
-## 0058 — the all-resident pool is filled at bind (2026-09-26)
-
-At ratio 0 (0051) the pool holds every expert and the static partition's
-resident set is sorted by expert id, so slot i is expert i -- the layout the
-compile's constant upload already wrote. The provider nevertheless re-read each
-expert from the `.bin` on its first routing (measured, the full-depth 35B on
-the A770, plugin 0003-0057, depth 1: 7,267 misses, 50,354 tensor reads at
-5.0 ms, decode 1.0 t/s). With 0058, in the gate configuration: 0 misses,
-T_boot 245 -> 155 s, depth-1 decode 3.0 -> 7.3 t/s, the same digests. `bind()` now uploads only the scale/zp tensors (the kernels
-read the scale device-transposed) and marks every slot filled.
-
-## 0059 — per-expert dispatch, batched (2026-09-26)
-
-The native per-expert dispatch enqueued TWO kernels per (token, expert) pair
--- gate/up and down, each a one-row GEMV -- so a 1,024-token prefill chunk cost
-16,384 launches per MoE layer. Measured on the full-depth 35B (A770): 3,482,240
-invocations in a 4096-token run, the host waiting ~91 ms per MoE layer call on
-the queue to drain, prefill 12.5 t/s, while the profiled device node time was
-~86 us a token. Now the pairs of a call go to a small USM-host table (slot,
-flat id, top-k position) and two batched kernels cover them in one launch per
-stage; each work-group row runs the per-pair body (factored into a `FUNC()`
-helper per compiled source), so a pair computes exactly what its own launch
-did. The table is rewritten only after the layer's blocking top-k readback,
-which on the in-order queue has already waited for every earlier launch.
-`MOE_PER_PAIR_DISPATCH=1` restores the per-pair launches.
-
-MEASURED (A770): the output BYTES of the lowering cell's block (E = 4, top-2,
-hidden 512, inter 256, with a shared expert) are identical to the per-pair
-launches for IQ2_S-packed/IQ3_XXS, IQ3_XXS/IQ4_NL and IQ4_XS/Q8_0 at T 1 and 6
-(`test_batched_dispatch_is_bit_identical_to_per_pair`; a mutant ignoring the
-top-k position fails all six). At the 35B's routing (E = 256, top-8, T 1 and
-6) the band matrix against the CPU oracle reads the same values as the
-per-pair plugin to every printed digit. Served, the same digests
-at depth 4 and 40. Depth 4: prefill 120.1 -> 832.2 t/s, decode 57.6 -> 86.9,
-invocations 413,760 -> 608. Full depth: prefill 12.5 -> 143.9 t/s @4096,
-decode 7.9 -> 15.2, T_boot 173 -> 95 s.
-
-## 0060 — per-expert dispatch, grouped by expert (2026-09-26)
-
-After 0059 the full-depth prefill was device-bound, and a traced 4096-token
-prefill put 77 % of the device time in the two batched per-expert kernels
-(gate/up 56.0 %, down 21.3 %): each (token, expert) pair read and decoded its
-expert's weights on its own. 0060 generalises the native body to a TILE -- one
-expert slot and up to `NATIVE_TILE_M` (8, a JIT constant) of its pairs -- with
-tile decoders that decode each weight element once and give every token's
-lane accumulator the same left-to-right product the one-token decoder
-computes. Per-pair and batched launches pass tiles of one; the new grouped
-entries take the pairs stably sorted by slot and cut into tiles. The default
-policy (`auto`) is grouped for a call of 64+ pairs and batched below (grouped
-leads at prefill, trails at decode); `MOE_DISPATCH_MODE=pair|batched|grouped|auto`
-selects. The pairs table is written through the usm_host pointer instead of a
-blocking queued copy (0059 review).
-
-MEASURED (A770): the lowering cell's block gives the same output BYTES in
-batched and grouped mode as per pair (nine format/T cases each, T in
-{1, 6, 17}; the T=1/6 hashes equal 0059's per-pair ones); a mutant dropping a
-tile member's top-k position fails all grouped cases it was run on (six, before
-T=17 was added). Review 2026-09-26: T in {1, 6} never filled a tile (four
-experts, top-2: at most six pairs a slot); T=17 forces nine or more, a full tile
-and a split one, and a mutant letting a tile take nine pairs is red at T=17 (3/3)
-and green at T=1/6. The equality is by measurement, not by construction: the
-source keeps each token's product and order, but the plugin builds with
-`-cl-mad-enable`, so contraction is the compiler's choice per kernel. Depth 4:
-prefill 922 (0060's batched mode) -> 1063 t/s (auto), decode unchanged at
-~95-107; tile 16 measured no better than 8. 0059's own depth-4 row (832.2) is
-the 0059 build; 0060 changes the batched path too (the tile-of-one body, the
-table write) and the two were not separated. Full depth: prefill 143.9 ->
-222.9 t/s @4096, decode 15.2 -> 18.0, T_boot 95 -> 75 s, the same digests.
-
-## 0061 — native per-expert kernels: several rows per pass, uniform indices (2026-09-26)
-
-The per-expert kernels held 71 % of the 0060 device window (DESIGN §7.0.2cl;
-74.4 % in the 0061 timeline). On one real-geometry block (hidden 2048, inter
-512, 256 experts, top-8, 1,024 tokens, IQ2_S-packed gate/up over IQ3_XXS down),
-the grouped gate/up kernel read 45.7 ms and down 17.5 ms, as the median of 20
-repeats. Timing-only mutants split gate/up's 45.7 ms: without the activation
-loads it read 27.0 ms, without the IQ2_S grid lookup 42.9 ms. Every output row
-re-read the tile's activations from global memory, gate and up separately.
-
-0061 decodes several rows per pass: gate and up together, NATIVE_GU_TILE_N (2)
-rows of each, and NATIVE_DOWN_TILE_N (4) rows of down (IQ3_XXS, IQ4_NL). The
-tile shrinks from 8 pairs to 4. A first form kept 8 pairs and spilled (IGC
-dump: 5,664 B at 4 rows); served full-depth prefill fell to 46.5 t/s at 4 rows
-and 116.2 at 2, against 349.2 at 1. The block grid: gate/up 19.3 ms at 4 x 2,
-313 ms at 8 x 2, 454 ms at 16 x 4. The tile, pair and row indices go through
-`sub_group_broadcast`. The compiler had kept them per lane, and the 0060
-gate/up kernel spilled 2,304 B. Removing that spill alone did not move the
-served rate (354.0 against 349.9 t/s). Every native kernel is now spill-free.
-
-The helpers are compiled once per program, and one program holds gate/up and
-down. So each projection has its own row constant, and both generators define
-both: one shared name would give down the first source's value.
-`MOE_NATIVE_TILE_N=1` restores the row-at-a-time loop; 2 or 4 sets both.
-
-MEASURED (A770): the lowering cell's block gives the same output bytes with row
-blocking (default, 2 and 4) as with 1. That holds in batched and grouped mode,
-at T 1, 6 and 17, and every hash equals 0060's. A mutant reassociating the
-gate/up product (`x * (dd * mag) * sign`) is red at T 6 and 17 (8 cases). The
-same reassociation in the down decoders stayed GREEN: the cell reads the
-block's f16 output, and a rounding-level change in the down sum did not move
-it. A gross down mutant (sign dropped, IQ4_NL halved) is red on both formats,
-so the down path does run in the cell. The real-geometry block: gate/up 45.7
--> 19.3 ms, down 17.5 -> 9.7 ms, same hash. Depth 4: prefill 3,353 -> 5,826
-t/s @4096, the same digests. Full depth: prefill **349.9 -> 625.7 t/s**
-@4096, decode 19.2 / 18.4 -> 20.9 / 19.8, the same digests. The lowering cells:
-81 passed, 1 skipped. MEASURED (2026-09-26): the series 0003–0061 (59 patches)
-applies on the pinned tree, byte-identical to the built one; the plugin
-compiles clean; C++ ladder 617 run, 0 failed. The `r >= nr` tail (rows computed
-on n0 and dropped) is correct by reading (`code`) and never exercised: N_BLOCK
-4 is a multiple of every row count and every measured projection size is a
-multiple of 4. `MOE_NATIVE_TILE_N=4` (gate/up 4 x 4) is run by the cell for
-bytes only, never timed.
-
-## 0062 — all-resident pool: no speculative hidden-state readback (2026-09-26)
-
-0017 hoisted the CPU tier's readback: every MoE call copied topk_id, the whole
-hidden state (T x hidden f16) and the routing weights to the host, before
-knowing whether any expert would miss. On the all-resident native pool
-(0051/0058) every expert holds a slot, and no call can miss (`code`: the
-static partition reserves min(capacity, num_expert) experts, and 0058 fills
-every slot at bind). MEASURED (A770): the 0061 prefill timeline still carried
-the copy, 320 device-to-host copies (4 chunks x 40 layers x {x, rw}) and 345
-ms of a 6.75 s window: 4 MiB per MoE layer at a 1,024-token chunk.
-
-0062 reads topk_id alone when `resident_slot_count() >= num_expert`, as
-`MOE_OTD_READBACK_NOHOIST` does. A miss there (impossible by construction,
-`code`) would still fetch x/rw after the slot upload, through NOHOIST's late
-branch. A pool smaller than the expert count keeps 0017's hoist unchanged.
-
-MEASURED (A770, 2026-09-26): the 0062 timeline has no device-to-host memcpy in
-the request window. The blocking topk_id read into host memory stays, and was
-never among the 320. OTD_PERF on this route: `avg_cpu_x_*` read 0, and
-`avg_cpu_topk_id_us` is the topk read alone (`code`). The warm-up span sums
-its two legs under NOHOIST and here alike. Full depth, all-resident, u8 KV, chunk 1024: prefill
-625.7 -> **653.7 t/s** @4096, decode 20.9 / 19.8 -> 21.1 / 19.9, the same
-digests. Lowering cells: 81 passed, 1 skipped (the tier50 route keeps the
-hoist). Series 0003–0062 (60 patches) applies byte-identical to the built
-tree; the plugin compiles clean.
-
-## 0063 — native per-expert kernels: a weight-rounding emulation arm (2026-09-26)
-
-A measurement instrument for the matrix-unit route
-(`docs/design-native-dpas-expert-kernel.md` §6.2). The unit takes f16
-weights. `MOE_NATIVE_W_ROUND=f16` rounds each decoded weight — the f32
-product of its factors — to f16 before the multiply, in the tile and row
-decoders the served route runs. `bf16` is the instrument's red. Unset, the
-`NATIVE_W3`/`NATIVE_W2` macros expand to the kernels' own left-to-right
-product.
-
-MEASURED (A770, 2026-09-26):
-- Unset, the output bytes are 0062's: 81 cells pass, and the real-geometry
-  block hash is unchanged (`8fd20d91d867c8c4`). f16 and bf16 each move it.
-- What the served logits read is in the design note §6.2a: a deterministic
-  floor that the rounding does not resolve. The block-level reading (§6.1a,
-  `tools/native_kernel_harness.py`) does resolve it.
-- The rounded arms also reassociate: `x * f16(a*b*c)` against the unset
-  `((x*a)*b)*c`. That is an f32 term of about 2^-24 relative beside the
-  2^-11 rounding. The arms do not count subnormal weights.
-- A `--cache-dir` does not key on this switch. The paged load switches the
-  model cache off before compiling its graph (`backend_ov.cpp`,
-  `ov::cache_dir("")`), so the served arms compiled fresh; a cached path
-  would import the unrounded kernels silently.
-- Unset, the served digest at depth 40 is 0062's (`b1a16fbc9d4c`). The
-  real-geometry block hash (`tools/native_moe_block_ab.cpp`, 1,024 tokens,
-  IQ2_S-packed/IQ3_XXS, 256 experts, seed 2) reads `8fd20d91d867c8c4` on the
-  0063 build unset. The same runner on the 0061 build read the same value;
-  that run's log is operator-local, and this is the first time the value is
-  on the record.
-- Series 0003–0063 (61 patches) applies byte-identical to the built tree; the
-  plugin compiles clean.
-
-## 0064 — IQ2_S-packed gate/up on the matrix unit (2026-09-26)
-
-The native per-expert gate/up (IQ2_S-packed, every layer of the 35B) moves
-from the vector units to the matrix unit (`intel_sub_group_f16_f16_matrix_mad_k16`,
-Xe-HPG, subgroup 8); `docs/design-native-dpas-expert-kernel.md` is the design
-and its record.
-
-- **Exact operands.** The B operand is (2s + 1) · grid · sign, an integer of
-  magnitude at most 1,333, exact in f16, read from a half2 copy of the IQ2_S
-  grid (`NATIVE_IQ2S_GRID_H2`). A 16-deep chain covers one 256-value block,
-  and d/8 then scales it once per column. Every product the unit forms is
-  exact, so there is no weight rounding. The f16-rounded alternative (the
-  emulation arm, 0063) was measured and not taken.
-- **One route for every call size.** Kind 3: tiles of up to 16 pairs of one
-  expert, one work-group per tile and 64 columns, with the activations
-  gathered into local memory in the unit's A layout. Kind 4, for calls under
-  64 pairs: one pair per work-group, with K split across 8 subgroups whose
-  chains meet in local memory and are scaled in block order. A pair's bytes
-  are the same whichever kernel runs it, so they do not depend on the call.
-- **Down stays scalar** (0061): IQ3_XXS/IQ4_NL have no exact fold.
-- **Scope.** The stage is added only on Xe-HPG with the matrix unit and an
-  IQ2_S-packed gate/up. The executing impl copies `_gu_dpas`: the clone list
-  missed it at first, and the kernel silently did not run.
-- `MOE_NATIVE_GU=scalar` restores 0061's gate/up.
-
-MEASURED (A770, 2026-09-26):
-- Block (real geometry, 1,024 tokens, 256 experts, median of 20): gate/up
-  19.34 -> 7.98 ms, the block 41.5 -> 29.4 ms.
-- Block numerics (the kernel harness, f32 against f64 models): 4.48e-8 of
-  S, the scalar kernel's own level (4.96e-8).
-- Lowering cells: 85 passed, 1 skipped. The IQ2_S-packed block stays in the
-  CPU-oracle band (0.113).
-- Call independence: token 0 is byte-identical at T = 1 and 17 (one-pair
-  kernel) and T = 40 (tiled), batched and grouped. The scalar control is
-  green. Mutants on the final form:
-  - A-gather off by one in the tiled kernel: red at T = 40 only, as the
-    routing predicts (an earlier tiled-only build read it red at T = 17 and
-    40, and 377x out of band).
-  - The one-pair kernel's block order reversed: GREEN at hidden 512, where
-    the two blocks per row did not reach gate/up's f16 output, and RED at
-    hidden 2048, the 35B's eight blocks. There token 0 read
-    `dcebee691f6d72c1` in the one-pair kernel against the tiled kernel's
-    `75bcb4da4b4497e4`. The cell now runs at both widths (89 passed, 1
-    skipped on the final build), so it reads the served kernels' summation
-    order.
-- Full depth, all-resident, u8 KV, chunk 1024: prefill 653.7 -> **952.1
-  t/s** @4096; the greedy digests at depth 1 (`6d6c6660f021`, moved) and 4096
-  (`b1a16fbc9d4c`, unchanged).
-- Decode: 0062 read 20.0–21.1 / 18.3–20.0 t/s over four runs, 0064
-  19.1–20.4 / 19.3–19.4. The ranges overlap, and the means are 2.8 % and
-  0.9 % below (depth 1, depth 4096): less than 0062's own spread.
-- A decode-step timeline: the matrix gate/up takes 92.8 µs per launch
-  against the scalar kernel's 120.0. The unchanged dense GEMMs read 39.6
-  against 34.3 µs. The mean busy clock over the whole runs was 1,650
-  against 1,902 MHz; the clock cause is not isolated.
-- Served logits against 0063 unset: depth 4, request records mean KL
-  4.0–7.8e-5 and argmax 1015–1021/1024; depth 40, KL 0.016–0.206 and argmax
-  474–492/512. Both are inside the pre-registered bounds; the gather mutant
-  reads KL 0.47–0.72.
-- Gate 4, the equivalence suite (`tests/equivalence/run.sh`) at full depth: all checks passed. Two greedy runs byte-identical; the logits slice leaves the answer; warm cache byte-identical to cold (hit 192 tokens, 81.7 %), and a restored continuation matches a cold run; speculative decoding deterministic and copy-exact. Chunked prefill differs from unchunked, which the suite reports but does not gate. Stateful vs paged is skipped (the serving shape is paged only), and so is MTP (no head).
-- Gate 3, the Prüfstand (the Lua CSV task, greedy, thinking off, the full-depth artifact): **10/10** on 0064, and 10/10 on 0062 in the same window. The answers differ (663 against 529 tokens), as a changed summation order can make them. Decode while answering: 20.2 against 20.8 t/s.
-- Series 0003–0064 (62 patches) applies byte-identical to the built tree;
-  the plugin compiles clean; the C++ ladder reads 617 run, 0 failed.
-- Scope, `code`: only Xe-HPG (`arch == xe_hpg`, the matrix unit present);
-  the B60 (Xe2) keeps 0061's scalar gate/up. A model whose intermediate size
-  is not a multiple of 64, or whose hidden size is not a multiple of 256,
-  takes the scalar route. The kernels carry `#error` guards for the same.
-- The gate numbers (rate, logits, Prüfstand, equivalence) were measured on
-  the build before the review's guards and arch narrowing. Those are compile
-  guards and a device check; the cells re-ran on the final build.
-
-## 0065 — CPU tier, native formats: each expert row decoded once per call (2026-09-26)
-
-`moe_cpu_expert()` receives all of one expert's jobs, one per (token, expert)
-pair, together. For a native format the reference path still decoded the
-expert's whole gate, up and down matrices once per job (`code`), so a prefill
-chunk repeated the decode for every token routed to the expert. That is about
-ten tokens per expert at chunk 512 for Flash-Next's top-10 of 512 experts.
-
-0065 makes the path stage-major (`compute_stage_f32_jobs`): a row is decoded
-once and dotted with every job. Each job keeps the per-job path's own dot
-(`acc += x[k] * w[k]` in k order) and the same rounding at every stage
-boundary, so its bytes are the per-job call's. Affine matrices keep their
-per-job calls.
-
-The unit cells (standalone, `-mavx2 -mfma -mf16c`):
-- **New:** a native expert (IQ3_XXS gate/up, IQ4_NL down, random blocks, seven
-  jobs) gives every job, in one call, the bytes of a call with that job
-  alone. A mutant feeding every job job 0's activations is red. Both calls
-  run the new stage-major code, so the cell checks the grouping, not the
-  pre-image. The pre-image claim rests on the code reading (the dot and the
-  rounding are the 0011/0043 text) and on the served digests. 0066 adds a
-  bitwise cell against the pre-image `compute_stage_f32`.
-- **Fixed:** the IQ2_S row cell (0050) wrote group 1's index bytes at
-  `w[0..7]`, group 0's place. The decoder, the exporter and the OpenCL
-  kernel all read group g at byte `g*8` (`code`), so as written the cell
-  failed against the correct decoder. No run of it is on record before
-  this one. Its bytes now sit at `w[8..15]`.
-- 10 of 10 pass.
-
-MEASURED (A770, Flash-Next `d48n`, ratio 75 + tier + dispatch, u8 KV, chunk
-512, 2026-09-26):
-- Prefill of 128 tokens: 148.19 s -> 77.44 s.
-- Prefill of 512 tokens: 491.76 s -> 163.64 s (1.04 -> 3.13 t/s).
-- Decode unchanged at 0.5 t/s (one job per expert).
-- Digests unchanged against 0064 at each length (`eec6f2f2acb5d988` at 128,
-  `e4b40e198c8f22a6` at 512); the same tier pair count (709,175).
-- The whole leg, load probes included: 37 min -> 14 min.
-- Series 0003–0065 (63 patches) applies byte-identical to the built tree;
-  the plugin compiles clean.
-
-## 0066 — CPU tier, native formats: one job per AVX2 lane (2026-09-26)
-
-After 0065 each native row is decoded once per call, but every job's dot still
-ran as a scalar `mulss`/`addss` chain (`measured-here`: the built plugin's
-`compute_stage_f32_jobs`, objdump). 0066 runs the dots over several jobs one
-job per AVX2 lane (`native_dot_jobs_avx2`, in the AVX2 translation unit). It
-takes four decoded rows per pass, so four independent chains hide the add
-latency; the activations are transposed once per stage to [ic][jobs]. Each
-lane is the scalar dot's own sequence along k, a multiply then an add. The
-routine is compiled `fp-contract=off`, and the built plugin's copy carries
-4 `vmulps` and 0 `vfmadd` (`measured-here`, objdump). So a job's bytes do not
-change. A single job keeps the scalar loop.
-
-The unit cells:
-- The standalone build now uses the plugin's per-file flags: `-O3 -mavx2
-  -mfma -mf16c` for the AVX2 source only. Built with `-mfma` everywhere, the
-  scalar reference itself could contract to FMA.
-- **New:** a bitwise cell compares `compute_stage_f32_jobs` over 11 jobs, at
-  Flash-Next's K = 2560, with the per-job `compute_stage_f32` (the
-  pre-image), at f32. A mutant letting the lanes contract to FMA (4
-  `vfmadd`) is red there. It passed the whole-expert cell, whose f16 outputs
-  at small dimensions could not see a last-bit change.
-- 11 of 11 pass.
-
-MEASURED (A770, Flash-Next `d48n`, ratio 75 + tier + dispatch, u8 KV, chunk
-512, 2026-09-26):
-- Prefill of 128 tokens: 77.44 -> 61.74 s.
-- Prefill of 512 tokens: 163.64 -> **79.94 s (6.4 t/s)**; 491.76 s on 0064.
-- Decode unchanged at 0.5 t/s.
-- Digests unchanged against 0064/0065 (`eec6f2f2acb5d988`,
-  `e4b40e198c8f22a6`); tier pairs 709,175.
-- Series 0003–0066 (64 patches) applies byte-identical to the built tree;
-  the plugin compiles clean.
-
-## 0067 — All-resident decode routes on the device (2026-09-26)
-
-On the all-resident native pool every MoE layer's decode call read `topk_id`
-back to the host, blocking, and built the pair table there. The device sat
-idle through that round trip at each of the 40 layers (DESIGN §7.0.2cr).
-0067 writes the pair table on the device instead.
-- The new kernel is `expert_route_native`, one work-item per routed pair. It
-  applies when the pool is the identity (slot i = expert i, asserted at bind
-  by 0058) and no routing trace or histogram is on. It covers calls below
-  the grouped threshold (64 pairs) under the auto dispatch.
-- The fused kernels read a constant all-sentinel slot list.
-- `MOE_DEVICE_ROUTE=0` keeps the host route. `device_routed_calls` joins the
-  OTD perf log.
-
-Build hazards met on the way, both recorded in the patch:
-- The route source must not set the per-expert helper guard. Landing first
-  in the batched program, it would leave the native copies without their
-  helpers (`CL_BUILD_PROGRAM_FAILURE`).
-- The guard must stay in the bare `#ifndef`/`#define` form. The kernel-db
-  generator exempts only that pattern from the `#undef` list it appends to
-  each copy; an `#if !defined(...) && ...` guard is undefined between copies
-  and redefines the helpers.
-
-The unit cell (`tests/python/test_native_lowering_gpu.py`,
-`test_decode_routed_on_the_device_gives_the_host_routes_bytes`) compares the
-device route with the host route by output bytes and asserts the counter in
-both arms:
-- red on 0066;
-- 12/12 green on 0067;
-- a mutant that writes top-k position 0 is 12/12 red.
-
-MEASURED (A770, the full-depth 35B packed u8, all-resident + dispatch, u8
-KV, 2026-09-26), three interleaved pairs:
-- Decode 19.3 -> **28.1 t/s** after 4096 tokens, and 18.4–20.3 ->
-  28.7–30.1 t/s at depth 1.
-- Prefill unchanged (about 960 t/s at 4096).
-- Digests identical across all six legs.
-- The Prüfstand gives 10/10, with the answer byte-identical to 0064's;
-  decode while answering is 29.4 t/s (20.2 on 0064).
-- After the review's fixes, one more pair on plugin `730ef0292cc959ab`
-  reproduces the rates and digests. The review's fixes: both route buffers
-  are sized once for 63 pairs (no drain precedes a device-routed call, so
-  none is released under a queued kernel), `MOE_DISPATCH_MODE=auto` counts as
-  unset, and the 64-pair threshold is one file-scope constant.
-- Series 0003–0067 (65 patches) applies byte-identical to the built tree;
-  the plugin sha256 prefix is `730ef0292cc959ab`.
-
-## Hazard: the measurement tree's patch set is applied but UNCOMMITTED
-
-The dev tree the measurement plugin is built from (its path is operator-local)
-carries this directory's patch set applied **to the working tree, not
-committed**. `git status` there shows the patched files as modified. So:
-
-**`git checkout -- <file>` in that tree silently reverts an arcint patch.**
-On 2026-09-26 a cleanup checkout of `src/plugins/intel_gpu/src/runtime/ocl/
-ocl_memory.cpp` dropped `0005`'s OTD device-resident-slot lock guard
-(`OPENVINO_ASSERT(!otd_device_slot, ...)`), unnoticed until `git diff --stat`
-was read. Before and after any file-level revert there, run
-
-```
-git -C <measurement tree> diff --stat <file>
-```
-
-and re-apply anything lost. Do not `git checkout` a file in that tree without
-checking its diff first; the patch set is the tree's only record of itself.
+  bound. Fusing the MoE block's FC quartet produces wrong output (its fourth
+  member is the width-1 `shared_expert_gate`); restricted to the GDN sets the
+  gain is inside the noise.
+
+The per-stage timing accumulators a measurement tree may carry
+(`network.cpp`, `primitive_inst.cpp`, `stage_acc.hpp`) are part of no patch;
+the recipe's hard reset keeps them out of a package.
+
+## Hazards, still true
+
+- **One program per primitive, one copy of the `.cl` per kernel.** The plugin
+  concatenates a primitive's kernel sources into one program, so file-scope
+  helpers must sit behind a persistent guard, and the guard must be the bare
+  `#ifndef`/`#define` pair: the kernel-db generator exempts only that pattern
+  from the `#undef` list it appends to each copy. Per-kernel JIT constants that
+  helpers read need distinct names in every generator of the program (0045,
+  0061, 0067).
+- **The executing impl is a clone.** `clone()` copies an explicit field list;
+  a new member left out of it is default-constructed in the impl that actually
+  runs (0043's native-format members, 0064's `_gu_dpas` — both caught, the
+  first after it wedged a card).
+- **Equality across kernel forms is by measurement, not by construction**: the
+  plugin builds with `-cl-mad-enable`, so contraction is the compiler's choice
+  per kernel. Every byte-equality claim above is a measured cell.
+- **The version stamp does not identify every build.** Measurement builds of
+  0044–0067 before the `+p20` package kept the `marfrit-p19` stamp (which is
+  also 0003–0043's); such a build is identified by its symbols (e.g.
+  `routing_trace`, `expert_gate_up_native`, `MOE_OTD_PINNED_NVME_FILL`), not by
+  the version string. A release names its package level.
+- **A measurement tree with the series applied but uncommitted** silently
+  loses a patch to a file-level `git checkout` (it once dropped 0005's
+  device-slot lock guard). Run `git diff --stat <file>` before and after any
+  file-level revert there, and re-apply what is lost.
+- **The GPU model cache keys on neither the patch level nor the plugin's
+  environment switches.** Clear it when changing levels (0015 changed the
+  blob's schema); arcint's paged load compiles its language model with the
+  cache off.
+- **A new source file must be listed** in the transformations library's
+  `sources.cmake` (no glob there): an unlisted source is silently not built
+  (0043).
