@@ -1477,7 +1477,7 @@ first two were measured on the probe before the branch existed):
 4. The allowlist: `qwen3.8-flash-next-d4` / `qwen38-flash-next-d4-ov`, hashes
    read off the directory above; the registry cells went from 6 to 7 entries.
 
-Ladder on the exact tree, dirac, `ARCINT_GGUF_REAL` = shard 2: **532 cases
+Ladder on the exact tree, the dev host, `ARCINT_GGUF_REAL` = shard 2: **532 cases
 run, 0 failed, 0 skipped** (`RUN@wt+6743ffb`, ladder-1.log).
 
 ### The command, one card per process
