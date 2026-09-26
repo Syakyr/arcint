@@ -1,4 +1,4 @@
-# window-054 — 0.5.4 LYON acceptance (LYON-001: row 3c READ on the 35B by operator ruling; rows 1, 2, 3a, 3b EMPTY)
+# window-054 — 0.5.4 LYON acceptance (LYON-001: rows 1 and 3a READ on Flash-Next, row 3c READ on the 35B by operator ruling; rows 2 and 3b EMPTY)
 
 Recorded 2026-09-26, before any LYON card window exists and before the
 compile-once/replay path is built. This file is the acceptance commit of 0.5.4
@@ -61,7 +61,7 @@ prefill.
 
 ## What LYON-001 owns
 
-Three acceptance rows (row 3c READ on the 35B by the operator's ruling of 2026-09-26, Status; the rest EMPTY):
+Three acceptance rows (rows 1 and 3a READ on Flash-Next and row 3c READ on the 35B by the operator's ruling, 2026-09-26, Status; rows 2 and 3b EMPTY):
 
 1. **a 32k prompt answered on-card** — multi-block prefill across the 2051
    boundary, greedy answer pasted raw, digest recorded;
@@ -102,6 +102,8 @@ a scale point, or the gate closes on the A770 alone.
   (`absmax` printed); rope positions reach ≥ 32,000; the answer's **digest**
   recorded. The answer's *content* is report-only (this is not a quality
   campaign) — the digest is the determinism handle for row 3.
+- **Row 1, READ (`RUN@5a783b7`, `measured-here`, 2026-09-26) — PASS**, on
+  Flash-Next `d48n` hybrid on the A770; the raw lines are in its Status entry.
 - **Why 32k and not more**: 32k is the roadmap's pinned length (`code`:
   `ROADMAP-0.5.x.local.md`:167) and is the smallest length that both spans 2051
   and forces ≥ 16 chunks at the served 2048 chunk. It is the length where the
@@ -150,6 +152,8 @@ Row 3 carries both halves:
 - **Report-only beside it**: the one-time compile seconds, the per-chunk wall
   time, and the amortized compile share over a 32k prompt
   (`compile_s / (compile_s + prefill_s)`).
+- **3a: EMPTY** — see the row-1 Status entry (`RUN@5a783b7`): the property
+  was read on the incumbent sequential core, not on the chunked core.
 - **3c, READ (`RUN@bdbb0aa`, `measured-here`, 2026-09-26)**, on the model and
   configuration of the operator's ruling below (the Qwen3.6-35B-A3B, not
   Flash-Next): **778.9 t/s at 32,768 tokens on the A770 at the document's
@@ -370,4 +374,60 @@ at the end, not many. **No measurement before the feature exists.**
   - Row 1 is run next under a hard 2 h cap, with 3a's compile-once reading
     from the same process (a 2,048- and a 32,768-token prompt). Its result
     is recorded in its own entry.
+- 2026-09-26, **row 1 READ — PASS; row 3a stays EMPTY** (`RUN@5a783b7`,
+  `measured-here` unless a class is named). Flash-Next on the A770, on the
+  **sequential served core** — the incumbent, not the chunked LYON core, which
+  has not served (`code`: `d48n` was exported 2026-09-18, the chunked core
+  landed 2026-09-26; the entries above record its card legs):
+  - `GPU.1`, `d48n`, **hybrid**: `--offload-ratio 75 --moe-cpu-tier
+    --moe-per-expert-dispatch` (a quarter of the experts on the host tier),
+    u8 KV, chunk 2048, `--n-ctx 36864`;
+  - plugin series 0003–0066 (plugin sha256 prefix `a3d55894bc3600d2`,
+    binary `780d2a30a862273b`);
+  - one process, a 2,048-token then a 32,768-token prompt;
+  - the prompt ids file sha256 prefix `786c9efb1079317c`;
+  - greedy: the bench runner posts `/v1/completions` with `temperature: 0`
+    and `ignore_eos` (`code`: the runner's request body);
+  - wall time 47 min, inside the operator's 2 h budget.
+  Raw lines, server log and bench runner:
 
+      load: compiling PAGED language model on GPU.1 (big model first by design)
+      load: language model ready in 63.2 s (paged); device-resident 8.06 GiB
+      load: n_ctx 36864 | device GPU.1 | prefill chunked at 2048 tok | 1 lane
+      slot 0: prefill  2048 tok in 150.65 s ( 13.6 t/s) | graph 150.57 s, embed 0.06 s, pages 0.00 s, restore 0.03 s, wait 0.00 s, other 0.00 s
+      slot 0: prefill 32768 tok in 2176.39 s ( 15.1 t/s) | graph 2173.86 s, embed 2.20 s, pages 0.29 s, restore 0.04 s, wait 0.00 s, other 0.00 s
+      slot 0: decode     32 tok in 64.35 s (  0.5 t/s) | graph 63.28 s, embed 0.26 s, sample 0.01 s, emit 0.81 s, wait 0.00 s, other 0.00 s
+      POINT depth 32768 digest d5942c7f784184705a5c80d32456f46a52784e62a94f2297c9f071c7ca7cf91a
+
+  `POINT` is the bench runner's line: the digest is the sha256 of the 32-token
+  greedy continuation. Read from the leg's outputs, not server lines:
+  - the continuation begins `" got format \n\n<think>\nThe user hasn't asked
+    a question yet."`;
+  - the `ARCINT_LOGITS_DUMP` file's final prefill record is `past=30720
+    n=2048 rows=1`, all finite, absmax 21.8846, argmax 2597;
+  - the server log holds one "compiling PAGED language model" line and one
+    "language model ready" line.
+  - **Row 1** checks each criterion:
+    - greedy text non-empty. The prompt is not a question, and the
+      continuation is report-only, as the cell allows;
+    - the last-position logits finite (absmax 21.88, the dump record above);
+    - rope positions reach 32,767. This is derived, not read: the record's
+      `past + n` = 30,720 + 2,048 = 32,768, and the position input is
+      `past + i` (`code`: `src/exec/backend_ov.cpp`, the paged forward);
+    - the digest recorded (`d5942c7f…`).
+  - **Row 3a stays EMPTY**; recorded report-only:
+    - the served IR is one graph of 18,995 nodes whose per-token inputs are
+      T-dynamic (`[1,?,…]`; read device-free, xml sha256 prefix
+      `641fcb1863f83629`), so its node count does not depend on T (`code`, by
+      construction);
+    - this process compiled it once and served two lengths, 2,048 and 32,768
+      (the one compiling line).
+    The cell asks for three lengths in one process. The property also held on
+    the incumbent before 0.5.4 wrote a line (`docs/design-lyon-stateful-prefill.md`:
+    "the served serving-shape graph is ALREADY the stateful form"). The
+    ruling above leaves 3a to the graph that "still has to be built".
+  - **Row 3b stays EMPTY.** The load's 63.2 s covers reading the model, the
+    paged transformation and the 8.06 GiB device upload. window-050's
+    `compile_s` is a compile-only time: the law's bound, 18,995 x 2.38 ms =
+    45.2 s, needs that measurement.
+  - **Row 2 stays EMPTY** (an open numerics campaign).

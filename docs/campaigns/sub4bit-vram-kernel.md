@@ -1363,7 +1363,10 @@ the campaign rules say it becomes its own document.
     **Corrected 2026-09-26** (DESIGN §7.0.2cl): the paged load now takes the
     token axis from the head's declared shape. The `qwen3_5_moe` serving shape
     slices at load (`measured-here`, depth 4 and 40, the same digests). The
-    `qwen4_exp` runs are unmeasured with it.
+    `qwen4_exp` runs are unmeasured with it. [Corrected 2026-09-26,
+    `RUN@5a783b7`: measured on Flash-Next `d48n` (A770, arcint binary
+    `780d2a30`) — the logits dump holds one row for a 2,048-token chunk;
+    `docs/window-054.md` row 1.]
   * **OWED**: the full-depth 40-layer export and its served reading; the
     logits-level V4 A/B; a depth-4 int4 comparand; the depth-4 artifact's
     answer quality (degenerate greedy text — truncation or an emitter

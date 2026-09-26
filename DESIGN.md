@@ -10129,7 +10129,10 @@ the same digests.
 
 Not measured: the `qwen4_exp` serving-shape IR (Flash-Next), whose served
 arms also carry `--no-logits-slice`. It has the same `[1, tokens, hidden]`
-layout by its export, but no load of it has run the new axis. Row 3c (460
+layout by its export, but no load of it has run the new axis. [Corrected 2026-09-26, `RUN@5a783b7`: measured. In the Flash-Next row-1
+leg (`d48n`, A770, arcint binary `780d2a30`), the logits dump's final
+prefill record is `n=2048 rows=1`: one row for a 2,048-token chunk;
+`docs/window-054.md` row 1.] Row 3c (460
 t/s) is not met; the per-expert kernels are now the remaining 71 % of the
 device window.
 
