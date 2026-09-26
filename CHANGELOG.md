@@ -508,6 +508,12 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
   the built plugin), so the bytes are unchanged. Flash-Next (`d48n`) prefill
   on the A770 (ratio 75 + tier + dispatch, u8 KV, chunk 512) 3.13 -> 6.4 t/s
   at 512 tokens. Stamp unchanged at `+p19`.
+- **All-resident decode routes on the device** (plugin patch 0067, DESIGN
+  §7.0.2cs): a kernel writes the decode pair table from the router's ids,
+  so no MoE layer waits on a host readback at decode (prefill chunks and calls of 64 pairs or more keep it). The 35B full depth on the A770
+  (all-resident, u8 KV) decodes 19.3 -> 28.1 t/s after 4096 tokens, with
+  the same digests and the Prüfstand 10/10. `MOE_DEVICE_ROUTE=0` restores
+  the host route. Stamp unchanged at `+p19`.
 - **Instruments**: `tools/bigalloc.c` (large host allocations by call
   stack, peak-attributed), `tools/native_moe_match_probe.cpp` (the native
   matcher pass alone, device-free), `tools/native_moe_block_ab.cpp` (one

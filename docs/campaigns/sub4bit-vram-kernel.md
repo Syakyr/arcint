@@ -1577,3 +1577,13 @@ plugin 0003–0066, one run per arm, matrix-unit and scalar gate/up.
 - The dense GEMM and down kernels run 15–21 % slower in the matrix-unit arm
   than in the scalar one; the mechanism is unmeasured.
 See DESIGN §7.0.2cr.
+
+[DATED IN PLACE 2026-09-26 (decode routes on the device, patch 0067)]: on the
+all-resident pool a kernel writes decode's pair table from `topk_id`, so the
+per-layer readback is gone. Measured on the A770 (`measured-here`, the full-depth
+packed u8 35B, u8 KV, three interleaved pairs): decode 19.3 -> **28.1 t/s**
+after 4096 tokens and about 20 -> 30 t/s at depth 1. Prefill is unchanged,
+the digests are identical, and the Prüfstand gives 10/10 with a byte-identical
+answer. The unit cell is red on 0066, green 12/12 on 0067, and its mutant is
+red 12/12. See DESIGN §7.0.2cs.
+

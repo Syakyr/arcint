@@ -197,8 +197,9 @@ def _run_ab(xml, dev, T, props, extra_env=None):
     import subprocess
     env = dict(os.environ, LD_LIBRARY_PATH=_AB_LIB + os.pathsep + os.environ.get("LD_LIBRARY_PATH", ""))
     env.update(extra_env or {})
-    out = subprocess.run([_AB, xml, dev, str(T), "2"] + [f"{k}={v}" for k, v in props.items()],
-                         capture_output=True, text=True, env=env, check=True).stdout
+    run = subprocess.run([_AB, xml, dev, str(T), "2"] + [f"{k}={v}" for k, v in props.items()],
+                         capture_output=True, text=True, env=env, check=True)
+    out = run.stdout
     moe_typed = native_nodes = 0
     st = {}
     got_hash = None
@@ -215,6 +216,10 @@ def _run_ab(xml, dev, T, props, extra_env=None):
         elif f and f[0] == "HEAD":
             st_head = kv["fnv1a64"]
     assert st, out
+    # the plugin's exit counters (MOE_OTD_PERF_LOG=1), when the caller asked for them
+    for ln in run.stderr.splitlines():
+        if ln.startswith("[OTD_PERF]") and "device_routed_calls=" in ln:
+            st["device_routed_calls"] = int(ln.split("device_routed_calls=")[1].split(",")[0])
     st["got_hash"] = got_hash
     st["head_hash"] = st_head
     return moe_typed, native_nodes, st
@@ -326,3 +331,38 @@ def test_a_tokens_bytes_do_not_depend_on_its_call(tmp_path, dev, gate_up_fmt, do
         heads[T] = st["head_hash"]
     print(f"\n[call-independence {mode} h{hidden}] {dev} {gate_up_fmt}/{down_fmt}: token 0 at T=1/17/40: {heads}")
     assert heads[1] and heads[1] == heads[17] == heads[40]
+
+
+@_skip
+@pytest.mark.skipif(not _AB, reason="needs the C++ runner (ARCINT_NATIVE_BLOCK_AB): two GPU runs compared by bytes")
+@pytest.mark.parametrize("dev", _GPUS)
+@pytest.mark.parametrize("gate_up_fmt,down_fmt", [("IQ2_S_PACKED", "IQ3_XXS"), ("IQ3_XXS", "IQ4_NL")])
+@pytest.mark.parametrize("T", [1, 6, 17])
+@pytest.mark.parametrize("hidden", [512, 2048])
+def test_decode_routed_on_the_device_gives_the_host_routes_bytes(tmp_path, dev, gate_up_fmt, down_fmt, T, hidden):
+    """Patch 0067: on the all-resident pool a call below the grouped threshold
+    (decode, and the short calls up to 63 pairs) routes on the device -- a
+    kernel writes the pair table from topk_id, and the host neither reads the
+    ids back nor builds the table. The output bytes must be the host route's
+    (MOE_DEVICE_ROUTE=0 in the same build). The plugin's exit counter must show
+    the device route took the calls in the first arm and none in the second,
+    or equal hashes would compare the host route with itself. IQ2_S-packed
+    gate/up takes the matrix unit's one-pair kernel, IQ3_XXS the scalar
+    batched one. T = 1, 6, 17 are 2, 12 and 34 pairs at the cell's top-2.
+    Measured on the A770 (GPU.1), as the cells above."""
+    arena, _ = _build(tmp_path, T, gate_up_fmt, down_fmt, hidden)
+    xml = str(tmp_path / "moe.xml")
+    props = dict(_ROUTES["resident"], WEIGHTS_PATH=str(tmp_path / "moe.bin"), INFERENCE_PRECISION_HINT="f16")
+    try:
+        _, native_d, on_dev = _run_ab(xml, dev, T, props, {"MOE_OTD_PERF_LOG": "1"})
+        _, native_h, on_host = _run_ab(xml, dev, T, props, {"MOE_OTD_PERF_LOG": "1", "MOE_DEVICE_ROUTE": "0"})
+    finally:
+        arena.close()
+    assert native_d and native_h, "the native pass did not take the block"
+    print(f"\n[device-route h{hidden}] {dev} {gate_up_fmt}/{down_fmt} T={T}: {on_dev['got_hash']} vs "
+          f"{on_host['got_hash']}; device-routed calls {on_dev.get('device_routed_calls')} / "
+          f"{on_host.get('device_routed_calls')}")
+    assert on_dev.get("device_routed_calls", 0) > 0, "the device route did not fire"
+    assert on_host.get("device_routed_calls") == 0
+    assert on_dev["got_hash"] and on_dev["got_hash"] == on_host["got_hash"]
+    assert on_dev["max_over_band"] <= 1.0

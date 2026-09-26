@@ -1817,6 +1817,53 @@ MEASURED (A770, Flash-Next `d48n`, ratio 75 + tier + dispatch, u8 KV, chunk
 - Series 0003–0066 (64 patches) applies byte-identical to the built tree;
   the plugin compiles clean.
 
+## 0067 — All-resident decode routes on the device (2026-09-26)
+
+On the all-resident native pool every MoE layer's decode call read `topk_id`
+back to the host, blocking, and built the pair table there. The device sat
+idle through that round trip at each of the 40 layers (DESIGN §7.0.2cr).
+0067 writes the pair table on the device instead.
+- The new kernel is `expert_route_native`, one work-item per routed pair. It
+  applies when the pool is the identity (slot i = expert i, asserted at bind
+  by 0058) and no routing trace or histogram is on. It covers calls below
+  the grouped threshold (64 pairs) under the auto dispatch.
+- The fused kernels read a constant all-sentinel slot list.
+- `MOE_DEVICE_ROUTE=0` keeps the host route. `device_routed_calls` joins the
+  OTD perf log.
+
+Build hazards met on the way, both recorded in the patch:
+- The route source must not set the per-expert helper guard. Landing first
+  in the batched program, it would leave the native copies without their
+  helpers (`CL_BUILD_PROGRAM_FAILURE`).
+- The guard must stay in the bare `#ifndef`/`#define` form. The kernel-db
+  generator exempts only that pattern from the `#undef` list it appends to
+  each copy; an `#if !defined(...) && ...` guard is undefined between copies
+  and redefines the helpers.
+
+The unit cell (`tests/python/test_native_lowering_gpu.py`,
+`test_decode_routed_on_the_device_gives_the_host_routes_bytes`) compares the
+device route with the host route by output bytes and asserts the counter in
+both arms:
+- red on 0066;
+- 12/12 green on 0067;
+- a mutant that writes top-k position 0 is 12/12 red.
+
+MEASURED (A770, the full-depth 35B packed u8, all-resident + dispatch, u8
+KV, 2026-09-26), three interleaved pairs:
+- Decode 19.3 -> **28.1 t/s** after 4096 tokens, and 18.4–20.3 ->
+  28.7–30.1 t/s at depth 1.
+- Prefill unchanged (about 960 t/s at 4096).
+- Digests identical across all six legs.
+- The Prüfstand gives 10/10, with the answer byte-identical to 0064's;
+  decode while answering is 29.4 t/s (20.2 on 0064).
+- After the review's fixes, one more pair on plugin `730ef0292cc959ab`
+  reproduces the rates and digests. The review's fixes: both route buffers
+  are sized once for 63 pairs (no drain precedes a device-routed call, so
+  none is released under a queued kernel), `MOE_DISPATCH_MODE=auto` counts as
+  unset, and the 64-pair threshold is one file-scope constant.
+- Series 0003–0067 (65 patches) applies byte-identical to the built tree;
+  the plugin sha256 prefix is `730ef0292cc959ab`.
+
 ## Hazard: the measurement tree's patch set is applied but UNCOMMITTED
 
 The dev tree the measurement plugin is built from (its path is operator-local)

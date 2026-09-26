@@ -10397,6 +10397,102 @@ Campaign: `docs/campaigns/sub4bit-vram-kernel.md`; no code change.
   position), one row per routed pair. A device kernel can write that table
   from `topk_id` directly, with no readback. Prefill keeps the host tiling.
 
+#### 7.0.2cs Decode routes on the device on the all-resident pool: the 35B decodes 19.3 -> 28.1 t/s on the A770 (2026-09-26)
+
+Campaign: `docs/campaigns/sub4bit-vram-kernel.md`; plugin patch 0067.
+
+- [code] On the all-resident pool slot i is expert i (asserted at bind,
+  0058), so no call can miss. For a call below the grouped threshold (64
+  pairs), a new kernel `expert_route_native` writes the pair table the
+  batched native kernels read, from the router's `topk_id`. The table rows
+  are the ones the host writes.
+  - The host no longer reads the ids back or builds the table, and the
+    device no longer waits on it (§7.0.2cr).
+  - The fused kernels read a constant all-sentinel slot list, as the host
+    path gives them under per-expert dispatch.
+  - The route stays off when a routing trace or histogram needs the ids,
+    and when `MOE_DISPATCH_MODE` forces a mode other than `auto`.
+    `MOE_DEVICE_ROUTE=0` keeps the host route; a `device_routed_calls`
+    counter joins the OTD perf log.
+  - The two route buffers are sized once for 63 pairs and never regrown:
+    no queue drain precedes a device-routed call, so a buffer an earlier
+    call's kernels may still read is not released (review finding).
+  - The OTD perf counters change meaning on this route.
+    `per_expert_gpu_invocations` adds 2 per device-routed call, where the
+    host path with the matrix-unit gate/up adds 3. `per_expert_dispatches`
+    no longer counts device-routed calls.
+- [measured-here] The route source's first build failed to compile: the
+  program is built from concatenated per-kernel copies of the .cl, and the
+  route copy, landing first, set the per-expert helper guard with the
+  native helpers skipped. Skipping the section for the route source with an
+  `#if !defined(...) && ...` guard then broke a second rule: the kernel-db
+  generator exempts only the bare `#ifndef`/`#define` pair from the #undef
+  list it appends to each copy (`code`: `kernels_db_gen.py`,
+  `detect_guard_patterns`), so the helpers were redefined. The patch nests
+  the bare guard inside `#ifndef NATIVE_ROUTE_ENABLE`.
+- [measured-here, A770] A new cell compares a one-layer block on the device
+  route with the same build's host route (`MOE_DEVICE_ROUTE=0`) by output
+  bytes: IQ2_S-packed and IQ3_XXS gate/up, T = 1/6/17, hidden 512 and 2048.
+  - It asserts from the perf log that the route fired in the first arm and
+    not in the second.
+  - On 0066 it is red (the counter absent, the host route compared with
+    itself).
+  - On 0067 it is 12/12 green.
+  - A mutant route kernel that writes top-k position 0 for every pair is
+    12/12 red.
+  - Restored, the plugin rebuilds byte-identical (`b684c887`).
+- [measured-here, A770 `GPU.1`, `qwen3.6-35b-a3b-native-d40packed-u8`,
+  all-resident + dispatch, u8 KV, chunk 1024, plugin 0003–0067 `b684c887`,
+  binary `780d2a30`] Three interleaved pairs, fresh process each, route on
+  vs `MOE_DEVICE_ROUTE=0`, 32 greedy tokens:
+
+  | | decode at depth 1 | decode after 4096 | prefill 4096 |
+  |---|---|---|---|
+  | device route | 28.7 / 30.1 / 30.1 t/s | 28.1 / 28.1 / 28.0 t/s | 956.3 / 962.0 / 961.8 t/s |
+  | host route | 18.4 / 20.3 / 20.3 t/s | 19.1 / 19.4 / 19.3 t/s | 959.9 / 961.6 / 959.7 t/s |
+
+  - Digests: all six legs identical at both depths (`6d6c6660f021`,
+    `b1a16fbc9d4c`).
+  - The counter reads 2,600 device-routed calls per route-on process and 0
+    per host-route process. 2,600 = 40 x 65, which fits the 64 decode steps
+    plus the depth-1 one-token prompt; that composition is inferred, not
+    read from a log.
+  - Prefill is unchanged: its calls are above the threshold.
+- [measured-here] After the review's fixes (plugin `730ef029`) one more
+  interleaved pair reproduces all of the above: decode 30.0 / 27.9 t/s with
+  the route, 20.3 / 19.3 t/s without, prefill 960.7 / 960.0 t/s, and the same
+  digests. The unit cell is 12/12 green on it.
+- Not covered by the cell:
+  - a fused op carrying the shared expert (experts_per_token != top_k). The
+    cell's model and the served 35B have none; the flat id's shared-expert
+    term is checked against 0040 by reading only;
+  - a process mixing host-routed calls of 64 pairs or more with
+    device-routed ones. The cell's largest call is 34 pairs; only the
+    served legs and the Prüfstand exercise the mix;
+  - the trace, histogram and dispatch-mode switches that turn the route off.
+- [measured-here] Gate 3, the Prüfstand (the full-depth artifact, thinking
+  off, on `b684c887`): **10/10**, 663 tokens, the answer byte-identical to 0064's
+  (`a41cd0c41c67625f`). Decode while answering is 29.4 t/s, against 20.2 on
+  0064.
+- [arithmetic on the measured-here means] Against §7.0.2cr's ceiling (the
+  traced step without both per-layer gaps,
+  36.5 of 60.1 ms), the untraced step went from about 51.9 to about
+  35.6 ms (depth 4096 means), 16.3 ms less. The traced per-layer gaps summed
+  to 23.6 ms, so part of them was the tracer's own work at synchronising
+  calls (next bullet); how much is not separated.
+- [measured-here, traced, the same configuration at depth 1] 0067's decode
+  step reads 42.4 ms traced:
+  - the device is busy 29.2 ms: dense GEMMs 15.3, MoE 4.5, the rest 9.4;
+  - gaps above 100 µs fall from 88 to 8 per step;
+  - one gap of 9.3 ms remains, between the forward's last GEMM and the
+    output copy.
+  With the intercept's call logging on, that gap is the instrument. The
+  inference thread's `clFinish` waits 5–6.5 ms on the device, so the host is
+  ahead of the device there. The intercept's own "device timing overhead" and
+  "chrome trace flush overhead" events (about 8 and 6 ms) then run before the
+  next call. Untraced, the step is 35.6 ms against 29.2 ms of traced device
+  work: decode is now mostly device time, and the dense GEMMs are half of it.
+
 #### 7.0.3 KV precision on the paged path — u8 is the lever, u4 is a tax
 
 The plugin accepts f16/u8/i8/u4/i4 for `KV_CACHE_PRECISION` on the paged path,
