@@ -10328,6 +10328,75 @@ Campaign: `docs/window-054.md`; plugin patch 0066.
   reads 14.8 t/s (`docs/window-054.md`), which brings LYON row 1 inside the
   operator's 2 h budget.
 
+#### 7.0.2cr The 35B decode step on the A770: 40 per-layer routing waits are the largest idle term (2026-09-26)
+
+Campaign: `docs/campaigns/sub4bit-vram-kernel.md`; no code change.
+
+- [measured-here] Configuration: A770 `GPU.1`,
+  `qwen3.6-35b-a3b-native-d40packed-u8`, all-resident + dispatch, u8 KV,
+  plugin series 0003–0066, a depth-1 prompt, 32 greedy tokens, one run per
+  arm.
+  - Two arms were traced with an OpenCL intercept device timeline: the
+    matrix-unit gate/up (0064), and `MOE_NATIVE_GU=scalar`.
+  - The steps are split at the one host-to-host copy each step makes.
+  - The server reads 15.3 / 15.0 t/s traced (graph 1.91 / 1.87 s for 32
+    tokens). No untraced decode at this depth and length was taken in this
+    leg, so the tracer's own cost is not known.
+- [measured-here] Matrix-unit arm, medians over 32 steps: step
+  **60.1 ms**, device busy **32.3 ms**, idle **27.8 ms**. The idle time sits
+  mostly in 88 gaps above 100 µs per step, and these recur at each of the 40
+  MoE layers (per-step sums, medians):
+  - **16.1 ms** of device idle between the router's last kernel (a
+    `generic_eltwise_ref`, identified by position) and the `topk_id`
+    readback (MtoH). About 400 µs a layer. What the host does in that time
+    is not measured: the tracer, the plugin's host work before the read, or
+    enqueue lag after the previous layer's wait are all candidates;
+  - **7.5 ms** between the readback and the next kernel (the stock
+    `moe_3gemm_swiglu_mlp_gate_up`). About 190 µs a layer, the host's
+    post-read work;
+  - 0.7 ms between steps. The means are 4.9 ms (this arm) and 7.1 ms
+    (scalar), both carried by single outlier steps (maximum step 150.6 /
+    214.0 ms). That is the likely reason the scalar arm's server rate is
+    lower while its median step is shorter.
+- [code] The blocking `topk_id` read in `on_before_batched_gemv` predates
+  the patch series. 0017 hoisted it beside the x/rw read, and 0062 left it
+  alone on the all-resident pool. After it the host builds the slot list and
+  the pair table. The slot list goes through `copy_from(..., true)` into
+  host-accessible memory; no per-layer host-to-device copy appears in the
+  timeline.
+- [measured-here] The device term (matrix-unit arm):
+  - dense GEMMs 15.6 ms over 391 launches. One launch above 200 µs per step,
+    1.7 ms; inferred to be the LM head from its size;
+  - native MoE kernels 5.7 ms: gate/up 3.7, down 2.0;
+  - the fused op's stock kernels 0.6 ms;
+  - 10.5 ms over eltwise, slicing, paged attention, top-k, norms and copies.
+- [measured-here] Scalar arm: step 58.7 ms, busy 30.8 ms, and the same
+  16.1 + 7.6 ms of per-layer gaps.
+  - Its gate/up is slower, 4.8 vs 3.7 ms.
+  - The kernels both arms share run faster there: dense GEMMs 13.5 vs
+    15.6 ms (+15 % in the matrix-unit arm), down 1.6 vs 2.0 ms (+21 %).
+  - This matches the earlier 0064 decode timeline, on one run per arm.
+  - The 50 ms `act_freq` samples read 2.0–2.4 GHz in both arms' last active
+    segments (means 2,226–2,274 MHz matrix-unit, 2,220–2,372 MHz scalar),
+    aligned by position, not by timestamp. That does not resolve a clock
+    difference. The mechanism is unmeasured.
+- Arithmetic on the traced step: if both per-layer gaps vanished, the
+  matrix-unit median step would fall from 60.1 to about 36.5 ms. That is a
+  ceiling, not a forecast: part of the pre-read gap may be host work that
+  stays, or tracer cost.
+- [code, FreeToken `python/freetoken/layers/moe.py`:261–264] The comparison
+  route's GPU slot-cache decode is "All device-side with fixed shapes, so the
+  decode call is CUDA-graph capturable". The id-to-slot rewrite is
+  flashlib's `lru_ensure` (`python/freetoken/moe/offload_kernels.py`:8,28,
+  not in the checkout, so the kernel itself was not read). Its CPU-decode
+  layers do ship hidden state and routing to host memory
+  (`layers/moe.py`:266–268).
+- [code] The lever. The all-resident pool asserts slot i = expert i at bind
+  (patch 0058, `expert_weight_providers.cpp`), so on it no call can miss.
+  Decode's batched kinds read a pair table of (slot, flat id, top-k
+  position), one row per routed pair. A device kernel can write that table
+  from `topk_id` directly, with no readback. Prefill keeps the host tiling.
+
 #### 7.0.3 KV precision on the paged path — u8 is the lever, u4 is a tax
 
 The plugin accepts f16/u8/i8/u4/i4 for `KV_CACHE_PRECISION` on the paged path,

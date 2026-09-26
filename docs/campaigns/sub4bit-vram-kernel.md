@@ -1561,3 +1561,19 @@ OWED: the q/k/v horizontal-fusion mechanism under compressed weights; the fit
 ledger's ≈0.4 GiB undercount at the edge; a full-depth KLD of the u8 artifact;
 the prefill rate under dispatch (LYON). See DESIGN §7.0.2ci and
 `docs/design-fit-levers.md`.
+
+[DATED IN PLACE 2026-09-26 (the 35B decode-step budget)]: an OpenCL intercept
+timeline of 32 decode steps. Configuration (`measured-here`): A770, the
+full-depth packed u8 artifact, all-resident + dispatch, u8 KV, depth 1,
+plugin 0003–0066, one run per arm, matrix-unit and scalar gate/up.
+- The traced median step is 60.1 ms, with the device busy for 32.3 ms:
+  dense GEMMs 15.6, native MoE 5.7, the rest 11.0.
+- The largest idle term recurs at each of the 40 MoE layers. It is 16.1 ms of
+  device idle before the `topk_id` readback, whose host content is
+  unmeasured, plus 7.5 ms of post-read host work. Both arms carry it.
+- The lever: on the all-resident pool (slot = expert, `code`, patch 0058) a
+  device kernel writes decode's pair table from `topk_id`, so the readback
+  goes. Its A/B measures how much of the gap goes with it.
+- The dense GEMM and down kernels run 15–21 % slower in the matrix-unit arm
+  than in the scalar one; the mechanism is unmeasured.
+See DESIGN §7.0.2cr.
