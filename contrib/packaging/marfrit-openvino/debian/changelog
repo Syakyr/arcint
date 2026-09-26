@@ -1,3 +1,73 @@
+marfrit-openvino (2026.4.0~dev20260821+p19-1) bookworm trixie; urgency=medium
+
+  * One more patch on top of +p18, same upstream commit (71640275), same
+    smallest-sufficient-divergence numbering:
+    - patches/0043: the checkpoint's own expert formats (IQ4_NL, IQ4_XS,
+      IQ3_XXS, Q8_0) lowered from the serving-shape emitter's standard-op
+      decode chains straight to MOECompressed (a weight_format per
+      projection in the config) and executed on the CPU tier with three
+      row decoders; the fused kernels are never launched under a native
+      format (the OpenCL decode is the next patch). Replaces the u4
+      grouped-affine repack of the experts, the measured residual of the
+      Flash-Next serving artifact (0.73 nats at depth 48). The new source
+      is listed in the transformations library's sources.cmake. The
+      on-card cell is owed: the first attempt reached the op translation
+      (the pass fires), the second wedged the B60 at its first job before
+      any of this patch's device code ran.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Fri, 18 Sep 2026 17:00:00 +0200
+
+marfrit-openvino (2026.4.0~dev20260821+p18-1) bookworm trixie; urgency=medium
+
+  * Five more patches on top of +p16, same upstream commit (71640275), same
+    smallest-sufficient-divergence numbering (+p17 shipped 0038-0040 without
+    an entry here; this one records them):
+    - patches/0038-0040: the per-expert dispatch framework, its OpenCL
+      kernel and the dispatch integration (campaign sub4bit-vram-kernel),
+      behind the MOE_PER_EXPERT_DISPATCH property, default off.
+    - patches/0041: skip expert-constant processing at compile time under
+      per-expert dispatch; measured inert on the fused offload route.
+    - patches/0042: THE FIX for 0037's page fault on the Arc Pro B60. Under
+      the hybrid prefill split the grouped-GEMM tables hold only the
+      resident (token, k) pairs and the rest of tokens_per_expert_cpu stays
+      -1, but the gather kernel was launched over token_num * max_topk
+      work-groups; every one past the fill read input[-HIDDEN_SIZE], one
+      row before the activation buffer -- unmapped on Xe2 (xe page fault,
+      device coredump, CL_OUT_OF_RESOURCES), mapped by luck on Xe-HPG. The
+      gather and the stages it sizes now run over the filled count, and a
+      batch with no resident expert takes the per-expert path as before
+      0037. Bisected and measured 2026-09-17: the 35B at --offload-ratio 99
+      --moe-cpu-tier serves on the B60, 23.6 t/s decode (KV u8, f16).
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Thu, 17 Sep 2026 20:05:00 +0200
+
+marfrit-openvino (2026.4.0~dev20260821+p16-1) bookworm trixie; urgency=medium
+
+  * One more patch applied on top of +p15, same upstream commit (71640275),
+    same smallest-sufficient-divergence numbering:
+    - patches/0037: under a static half-partition every MoE layer's routed
+      batch contains at least one non-resident expert, and the two
+      grouped-GEMM callers (on_before_prefill, build_grouped_mask_otd) called
+      try_acquire_simultaneous without a cpu_tier_misses destination -- so
+      the first non-resident entry returned nullopt and the WHOLE layer fell
+      back to exec_prefill_onednn's per-expert loop: ~5,520 kernel launches
+      where the grouped path needs ~120, on all 40 layers
+      (grouped_fallbacks=400 per process). The fix wires cpu_tier_misses into
+      both callers; non-resident entries take a sentinel slot id (num_expert)
+      that the mask-gen kernels already exclude and scatter_reduce's
+      UINT_MAX skip already handles, and the host tier runs them after the
+      grouped GEMM completes. New OTD perf counter: hybrid_prefill_layers
+      (arcint DESIGN 7.0.2bx).
+    - MEASURED: grouped_fallbacks 400 -> 0, decode 18.2 t/s against a gate of
+      14.8, 3.4 identity and E2 pass. The campaign's prefill gate (tier ON
+      within 25 % of tier OFF) is NOT met -- the host dispatch for the
+      non-resident experts serialises through ~128 experts per layer and
+      dominates prefill -- and static-partition-prefill stays open. This
+      level ships because the coding defect is gone, not because the
+      campaign closed.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Wed, 16 Sep 2026 13:00:00 +0200
+
 marfrit-openvino (2026.4.0~dev20260821+p15-1) bookworm trixie; urgency=medium
 
   * One more patch applied on top of +p14, same upstream commit (71640275),

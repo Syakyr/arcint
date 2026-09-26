@@ -309,6 +309,46 @@ std::vector<ModelEntry> build_registry() {
     }
 
     {
+        // THE FUSED-MoE REWRITE OF THE DEPTH-12 RUNG (2026-09-17): the d12
+        // artifact above, rewritten in memory by tools/moe_tiled_rewrite.py
+        // at tree 0b66c43 and written back with ov.save_model. Not an
+        // export: the same u4 codes and zero-points, the scales rounded to
+        // f16, the MoE block in the shape the GPU plugin's tiled matcher
+        // accepts (two Reshapes, a one-input Swish, an f16 dequant chain with
+        // a trailing Convert). The first Flash-Next serving-shape artifact
+        // that compiles to moe_3gemm_fused_compressed; at --offload-ratio 99
+        // with the CPU tier it is 3.00 GiB device-resident on the 24 GiB
+        // card against 17.73 GiB unfused (campaign sub4bit-vram-kernel,
+        // status 2026-09-17). Hashes read off the artifact with
+        // --inspect-artifact. Superseded by a re-export from the shards.
+        ModelEntry e;
+        e.id                      = "qwen3.8-flash-next-d12r";
+        e.family                  = "qwen3.8";
+        e.artifact_aliases        = {"qwen38-flash-next-d12r-ov"};
+        e.ov_arch                 = "Qwen4ExpForConditionalGeneration";
+        e.model_type              = "qwen4_exp";
+        e.moe                     = true;
+        e.has_mtp_head            = false;
+        e.mtp_head_pinned         = true;   // the export writes none
+        e.mtp_in_checkpoint       = true;
+        e.n_embd                  = 2560;
+        e.n_expert                = 512;
+        e.full_attention_interval = 4;
+        e.n_layer                 = 12;     // of 48: layers 3, 7, 11 are attention
+        e.n_ctx_train             = 262144;
+        e.quants                  = {Quant::Q4};
+        e.arch_hash               = "d1d1005332c96fbc";
+        e.template_hash           = "12827f24b742ea4e";  // the GGUF's own chat template
+        e.tokenizer_hash          = "87a7830d63fcf43b";  // passthrough; vocab == the GGUF's
+        e.weights_bytes           = 22141633733ull;
+        e.status                  = "measurement artifact: depth 12 of 48, the fused-MoE "
+                                    "rewrite of the first rung; not the model's answers";
+        e.sampler = qwen_card_defaults();
+        split_layers(e);
+        r.push_back(std::move(e));
+    }
+
+    {
         // SEGMENTED (2026-09-14): ALL 48 layers as a chain of four 12-layer
         // compiled models (tools/export_serving_artifact.py --layers 48
         // --segment-layers 12, tree c00500f): segment0/..segment3/ each hold
@@ -385,6 +425,85 @@ std::vector<ModelEntry> build_registry() {
         e.status                  = "full depth, 48 of 48: built; the served-path compile on the A770 was "
                                     "refused by HOST memory (USM host staging of 69 GiB of constants, "
                                     "window-050 §4.10); not servable on this host";
+        e.sampler = qwen_card_defaults();
+        split_layers(e);
+        r.push_back(std::move(e));
+    }
+
+    {
+        // FULL DEPTH IN THE FUSED SHAPE, THROUGH THE CORRECTED FILL
+        // (2026-09-18): the 48-layer serving-shape IR re-exported from tree
+        // f91ea73 after the fill's three provenance defects were found and
+        // fixed against llama.cpp's own tensors of the same GGUF (DESIGN
+        // 7.0.2bz: the converter's folded norm gammas and -exp(A_log)
+        // undone at the feed, the sigmoid output gate, the tiled key-head
+        // pairing). Its depth-4 sibling agrees with llama.cpp at every cut
+        // (layer 3 out corr 0.9987, campaign serving-shape-logits). The
+        // first full-depth artifact (d48f, tree da52858, xml f89a1623) is
+        // superseded: it served logits with no information about the model
+        // (KL 12.4 nats against the model's own capture) and is not admitted
+        // any more. Hashes read off the export log.
+        ModelEntry e;
+        e.id                      = "qwen3.8-flash-next-d48g";
+        e.family                  = "qwen3.8";
+        e.artifact_aliases        = {"qwen38-flash-next-d48g-ov"};
+        e.ov_arch                 = "Qwen4ExpForConditionalGeneration";
+        e.model_type              = "qwen4_exp";
+        e.moe                     = true;
+        e.has_mtp_head            = false;
+        e.mtp_head_pinned         = true;   // the export writes none
+        e.mtp_in_checkpoint       = true;
+        e.n_embd                  = 2560;
+        e.n_expert                = 512;
+        e.full_attention_interval = 4;
+        e.n_layer                 = 48;
+        e.n_ctx_train             = 262144;
+        e.quants                  = {Quant::Q4};
+        e.arch_hash               = "a077e6e4bfa9b847";
+        e.template_hash           = "12827f24b742ea4e";
+        e.tokenizer_hash          = "87a7830d63fcf43b";
+        e.weights_bytes           = 80061287197ull;
+        e.status                  = "full-depth fused-MoE artifact through the corrected fill; "
+                                    "the KLD gate against the model's own capture is its acceptance";
+        e.sampler = qwen_card_defaults();
+        split_layers(e);
+        r.push_back(std::move(e));
+    }
+
+    {
+        // qwen3.8-flash-next-d48n (2026-09-18): the 48-layer serving-shape IR
+        // with the checkpoint's OWN expert blocks (IQ3_XXS / IQ4_XS gate-up,
+        // IQ4_NL / Q8_0 down, per layer as the GGUF ships them) decoded in
+        // standard ops, tree 69dfffd -- the native-format artifact of campaign
+        // sub4bit-vram-kernel (design-routing-aware-expert-execution 2.3a-d).
+        // Serves through marfrit-openvino +p19 (patch 0043): every routed
+        // expert on the CPU tier. Its depth-4 sibling agrees with llama.cpp at
+        // layer 0/1/2/3 out corr 0.99991 / 0.99989 / 0.99970 / 0.99953 (the u4
+        // repack's d48g sibling: 0.99924 / 0.99918 / - / 0.99873). Hashes read
+        // off the export log. d48g stays registered beside it.
+        ModelEntry e;
+        e.id                      = "qwen3.8-flash-next-d48n";
+        e.family                  = "qwen3.8";
+        e.artifact_aliases        = {"qwen38-flash-next-d48n-ov"};
+        e.ov_arch                 = "Qwen4ExpForConditionalGeneration";
+        e.model_type              = "qwen4_exp";
+        e.moe                     = true;
+        e.has_mtp_head            = false;
+        e.mtp_head_pinned         = true;   // the export writes none
+        e.mtp_in_checkpoint       = true;
+        e.n_embd                  = 2560;
+        e.n_expert                = 512;
+        e.full_attention_interval = 4;
+        e.n_layer                 = 48;
+        e.n_ctx_train             = 262144;
+        e.quants                  = {Quant::Q4};   // the registry's coarse label; the experts are the GGUF's IQ3_XXS/IQ4_XS/IQ4_NL/Q8_0
+        e.arch_hash               = "641fcb1863f83629";
+        e.template_hash           = "12827f24b742ea4e";
+        e.tokenizer_hash          = "87a7830d63fcf43b";
+        e.weights_bytes           = 77492280673ull;
+        e.status                  = "full-depth artifact with the checkpoint's native expert formats (patch 0043, "
+                                    "every routed expert on the CPU tier); the KLD gate against the model's own "
+                                    "capture is its acceptance";
         e.sampler = qwen_card_defaults();
         split_layers(e);
         r.push_back(std::move(e));

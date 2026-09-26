@@ -805,7 +805,232 @@ OFF) is **not met** — the host dispatch for non-resident experts serialises
 through ~128 experts per layer and dominates prefill time. The campaign
 remains open.
 
+### 0042-moe-hybrid-prefill-gather-filled-count.patch
+
+The fix for patch 0037's page fault on the Arc Pro B60 (Xe2). Under the
+hybrid prefill split the grouped-GEMM tables hold only the resident
+(token, k) pairs and the rest of `tokens_per_expert_cpu` stays -1, but the
+gather kernel was still launched over `token_num * max_topk` work-groups;
+every work-group past the fill computed `token_index = -1 * HIDDEN_SIZE`
+and added it to the kernel's `uint` offset, which wraps to ~2^32 elements,
+~8 GiB PAST the buffer — the B60's faulted address (0x1f0f5e000, ~8.2 GiB)
+is consistent with that; why the A770 never faulted on the same read is
+NOT explained on the record. The gather
+(and the stages it sizes) now runs over the filled count, the token tables
+are zero-initialised on both prefill paths (the micro-GEMM path carries the
+same over-sized launch, latent for arcint: grouped on), the GPU mask-gen's
+device table is zeroed before the kernel, and a batch with no resident
+expert takes the per-expert path as before 0037, counted as a grouped
+fallback. Known, not fixed: the filled count is also the oneDNN grouped
+primitive cache key, routing-dependent on the hybrid path (rebuilds per
+prompt; bucketing owed).
+
+Bisected on the served binary (2026-09-17): +p13 serves, +p16 faults,
++p16 without 0037 serves, the LRU partition serves, and within 0037 a
+`stream.finish()` after every grouped-path stage showed the first
+synchronisation after the gather already throwing. Campaigns:
+`docs/campaigns/static-partition-prefill.md`,
+`docs/campaigns/sub4bit-vram-kernel.md` (status 2026-09-17).
+
+**MEASURED:** the 35B at `--offload-ratio 99 --moe-cpu-tier` on the B60
+serves Paris, warm repeat identical, decode 23.6 t/s (B60, KV u8, f16 inference, prefill chunk 512, one lane), the
+hybrid path active; no fault. Owed: the unit-ladder cell (tables with sentinel entries,
+filled count against launch size).
+
+Package: `+p18` (built 2026-09-17 20:31–20:43 local on the dev host from tree 83701d6; the packaged plugin's own cell on the B60 — the 35B at ratio 99 with the tier, KV u8, f16 — serves Paris at 23.3 t/s; not installed on any host by the seat that built it).
+
+### 0043-native-expert-formats-through-the-tier.patch
+
+The checkpoint's own expert blocks computed as they are, instead of the u4
+grouped-affine repack that costs 0.10–0.13 relative RMS per expert tensor
+and 0.73 nats at depth 48 against the model's own llama.cpp logits
+(DESIGN §7.0.2bz; `docs/design-routing-aware-expert-execution.md`
+§2.3a–d). The serving-shape emitter carries each expert weight in the
+fused op's rank-4 group-32 layout — IQ4_NL / IQ4_XS as u4 codes plus an
+f16 per-32 scale (a 16-entry table decode), IQ3_XXS as u8 grid indices
+plus u8 sign indices in the zero-point slot plus the f16 scale, Q8_0 as i8
+codes plus the f16 scale — and decodes them in standard ops. This patch:
+(1) three pattern blocks (`pattern_blocks/native_expert_block.*`) and a
+pass `ConvertTiledMoeBlockNativeToMoeCompressed` beside the stock tiled
+matcher, lowering the three chains straight to `MOECompressed` with a
+`weight_format` per projection in the config (visited, so it serialises;
+the shape checks relax at the weight's last dimension and the zero-point's
+under a native format); (2) the tier executes every routed expert under a
+native format (`_native_tier_only`: the batched-GEMV path forced, every
+expert a sentinel, the fused kernels never launched) with three row
+decoders in `moe_cpu_expert.cpp` (the tables verbatim from llama.cpp's
+ggml-common.h, pinned in arcint's `src/core/gguf_dequant.cpp` against
+gguf-py on the real shards); (3) the new source is listed in the
+transformations library's `sources.cmake` (no glob there — a source not
+listed is silently not built); (4) three host-only cells in
+`tests/unit/test_cases/moe_cpu_expert_test.cpp` (`moe_cpu_expert_native.*`)
+pin the three row decoders to hand-built blocks through
+`compute_stage_f32` (declared for them, outside the anonymous namespace).
+Reviewed before packaging (2026-09-18): the first form had the three
+native-format members missing from `clone()`'s field list (the executing
+impl would have run affine on native bytes — patch 0038's defect one
+patch earlier) and read `_native_tier_only` before assigning it; both
+fixed, the format is read off the primitive's config at the top of the
+constructor. The cells run without `ENABLE_TESTS`: compile the test file
+with `moe_cpu_expert*.cpp`, gtest from `thirdparty/gtest`,
+`-DOV_MOE_CPU_TIER_HAVE_AVX2 -mavx2 -mfma -mf16c`, the source tree's
+`src/inference/dev_api` on the include path, linked against the built
+`libopenvino` (8 cells, all green on the dev host). The OpenCL decode in
+the fused and per-expert kernels is the next patch.
+
+Two more relaxations found on the card: the impl's static
+`validate_impl` refused an f16 zero-point slot (IQ4_NL / Q8_0 gate-up: no
+impl, "No layout format available"), and the offload runtime's payload
+transpose asserted one byte per group in the zero-point slot (IQ3_XXS: four
+sign indices per group) — under a native format that slot is neither
+type-checked nor transposed; only the tier reads it, from the file.
+
+**MEASURED (2026-09-18, `tests/python/test_native_lowering_gpu.py`, tree
+dffd272, plugin 5a6968ec):** on BOTH cards — Arc A770 (GPU.1) and Arc Pro
+B60 (GPU.0) — the stock-affine control fuses (`moe_router_fused` +
+`moe_3gemm_fused_compressed`, corr 0.999999 against the CPU plugin) and
+the two native pairs (IQ3_XXS/IQ4_NL, IQ4_XS/Q8_0) lower to
+`MOECompressedNative`, run every routed expert through the tier and match
+the CPU plugin at corr 1.000000, max diff at 0.19 / 0.15 of the band the
+control's f16 noise calibrates; peaks vram0 94 MiB. The first form of this
+patch (before the review's clone-list fix) had wedged the B60 at the
+process's first job — with that form the executing impl ran the fused GEMV
+over native-layout bytes; the wedge has not recurred since the fix on
+either card (three legs), which is consistent with, not proof of, that
+mechanism. Owed: the served depth-4 and depth-48 native artifacts through
+the tier, the KLD gate's native reading.
+
+### 0044-moe-otd-routing-trace.patch
+
+A per-call routing TRAIL beside patch 0013's aggregate histogram, so the
+0.5.2 VENICE census can be taken from the SERVED path (campaign
+`docs/campaigns/expert-hot-set-lru.md`, design
+`docs/design-expert-hot-set-lru.md` §4b). Patch 0013 answers "which experts
+route" but not "in what order", so it cannot feed the per-layer LRU replay;
+an aggregate is not a trace. This patch adds an opt-in env
+`MOE_OTD_ROUTING_TRACE=<path>`: each `OffloadExpertWeightProvider` reads it
+once at construction (same per-provider, construction-time discipline as
+`MOE_OTD_ROUTING_HIST`), and `try_acquire_simultaneous` appends one line
+
+    <call_seq> <layer_key> <top_k> <expert id...>
+
+at the SAME point patch 0013 counts (before the dedup/hit-miss split, so it
+records what the router picked, not what the pool served). `<call_seq>` is a
+process-wide atomic counter under a mutex, and each line is flushed
+immediately so a `SIGKILL`'d window keeps every record already written (the
+aggregate dump only runs at exit). `layer_key` is the structural weight-file
+offset (patch 0018's key), so the trace is independent of the
+construction-order `layer_seq_id`.
+
+The offline half is `tools/hot_set_census.py`: `parse_call_trace`,
+`split_topk_chunks`, `layer_key_index_map`, `call_trace_to_v1` and the
+`from-call-trace` subcommand. Both silent-if-wrong assumptions have
+red-first cells in `tools/test_hot_set_census.py`: a call carrying two
+tokens' ids splits into the right `top_k` chunks and a mis-sized call is
+REFUSED, not truncated; and the `layer_key` -> decoder index map is the
+ascending export order by default, while an exported map with a duplicate
+index or a missing key is refused. A call carrying more than one token's
+ids is refused by the decode converter (per-token `token_idx` is undefined
+for a batched/prefill call in this trace), which is the stated caveat;
+`from-call-trace --skip-batched` skips and COUNTS the opening prefill call
+instead (an all-batched trace is still refused, never an empty census), and
+the CLI requires a `--provenance` file with a non-empty `artifact_sha256=`
+(or `artifact=`) and `card=` -- the artifact/card part of §2's header is
+enforced, the rest is not machine-checked here.
+
+MEASURED (2026-09-21, dev build host): applied on top of the 41 patches
+against pin `71640275` and built (`ninja openvino_intel_gpu_plugin`); the
+third-prefix install reports plugin version
+`2026.4.0-22849-71640275d29-marfrit-p19` and carries the `routing_trace`
+string. NOTE: that stamp is deliberately left at `p19`, which the packaging
+record already uses for patches 0003-0043, so the stamp alone cannot tell a
+0044 build from a 0043 one; the trace build is identified by its
+`routing_trace` symbol, and a future window must cite the symbol, not only
+the version string. The offline cells are 66 green (`tools/test_hot_set_census.py`,
+including the corpus-split census and the raw-`layer_key` join).
+OWED: the served card window (the census's own authority) and its
+stability statement; the measurement plugin and the debug-caps install are
+untouched, the new plugin lives in its own prefix.
+
+### 0045-native-expert-ocl-decode.patch
+
+The OpenCL decode of the checkpoint's own expert blocks, inside the per-expert
+kernel (campaign `docs/campaigns/sub4bit-vram-kernel.md`; design
+`docs/design-routing-aware-expert-execution.md` §2.3a–d, step 3). Patch 0043
+carried IQ3_XXS / IQ4_NL / Q8_0 experts into the fused op and ran every routed
+expert on the scalar CPU tier, with an in-code assert that did so "until the
+OpenCL decode exists"; this is that decode.
+
+`moe_expert_swiglu.cl` gains the three decode tables (the ones of the
+repository's `src/core/gguf_dequant.cpp` / `tools/q4e/native_blocks.py`,
+llama.cpp `ggml-common.h` pinned clone 56b9eb28) as `__constant` arrays and two
+entry points, `expert_gate_up_native` and `expert_down_native`, with the same
+dispatch geometry and argument list as patch 0040's `expert_gate_up` /
+`expert_down`. The weight bytes are decoded per element inside the K-loop — no
+dequantised row is ever written to memory. The per-tensor slot strides are the
+tensor bytes divided by the expert count (`expert_tensor_span`), i.e.
+`INTERMEDIATE_SIZE*HIDDEN_SIZE/{2,4,1,8}` by role and format; the scales arrive
+transposed to `[groups, oc]` by `maybe_transpose_scale_zp` exactly as the
+affine path's do, while the IQ3_XXS sign indices are copied row-major (0043
+skips the native zero-point transpose).
+
+`moe_3gemm_swiglu_opt.cpp` compiles those stages for a native config, lifts
+0043's "native + per-expert dispatch not combined" refusal, and dispatches the
+native stages for the resident experts while the misses keep going to the CPU
+tier (patches 0011/0012) exactly as before — the routing-aware split patch 0040
+built. A gate/up projection is refused at stage compile unless its format is
+IQ4_NL (1) or IQ3_XXS (2), rather than silently running the IQ4_NL decode over
+Q8_0 bytes.
+
+The same arithmetic is pinned device-free in the arcint repository before any
+card: `tools/q4e/native_expert.py` is the CPU reference (decode fused with the
+dot) and `tests/python/test_native_expert_gemv.py` its ladder — block-scale
+application per format, the fused-vs-materialised equality, a K that is not a
+multiple of 32 REFUSED, an unknown format REFUSED, and a deliberately wrong
+(affine) reading of IQ4_NL's bytes that must be caught rather than silently
+absorbed.
+
+MEASURED (2026-09-21, dev build host): applied on top of the 44 patches
+against pin `71640275` and built (`ninja openvino_intel_gpu_plugin`, clean);
+the plugin carries the `expert_gate_up_native` / `expert_down_native` symbols
+and the native tables. The version stamp stays deliberate at `marfrit-p19`
+(0003–0043's stamp), so the 0045 build is identified by its
+`expert_gate_up_native` symbol, not only the version string. The device-free
+cells are **16 green** (`tests/python/test_native_expert_gemv.py`).
+
+The per-expert `.cl` also had a **pre-existing** build blocker, found on the
+card: the plugin compiles a primitive's kernels into ONE program, so the
+`.cl` body appears once per kernel and its file-scope helpers
+(`expert_gate_up_gemv_u4`, `expert_down_gemv_u4`, `load_x_interleaved`)
+were defined twice -> `clBuildProgram` `CL_BUILD_PROGRAM_FAILURE` on xe2.
+That is why patch 0039/0040's per-expert kernel had never built on a card
+(the 2026-09-17 record). 0045 wraps every file-scope helper in a persistent
+`#ifndef` guard so the concatenated copies define them once; the native
+kernel then compiles (`lgc load: language model ready`, device-resident
+8.06 GiB).
+
+MEASURED (2026-09-21, 24 GB card GPU.0 = PCI 8086:e211, native d48n, ratio
+99 and 80, per-expert dispatch): the model **loads and compiles**, but the
+served per-expert path then **faults before the HTTP server comes up** --
+`xe ... Faulted Address 0x0000d556aa740000, Fault response: Unsuccessful
+-ENOENT` on the blit engine (`EngineClass: 3 bcs`), engine reset, and an
+`arcint` `segfault ... in libc.so.6` (memcpy) at the same instant; no
+`per_expert_gpu_invocations` was measured. The fault is a finding to
+localise (the upload/gather/sentinel path, not the decode arithmetic,
+which the device-free cells pin), recorded in the campaign status and the
+handoff.
+
+OWED: the served native per-expert reading -- a fix for the card fault,
+then the GPU-dispatch counter, rate and correctness.
+
 ## Deliberately NOT applied
+
+> [CORRECTED 2026-09-23: only **0001** and **0002** below are genuinely not
+> applied — they live at the repository top level and not in this directory,
+> so `build-openvino.sh`'s `patches/*.patch` glob skips them. **0046**, **0047**
+> and **0048** are in this directory and ARE applied by that glob, in numeric
+> order. The heading above is stale for those three entries; they are kept in
+> place with this date rather than moved, so the correction stays visible.]
 
 These live in the arcint repository's `patches/` as records of measurements.
 They are listed here so that nobody re-derives the decision by trying them.
@@ -818,6 +1043,243 @@ They are listed here so that nobody re-derives the decision by trying them.
   (its fourth member is the width-1 `shared_expert_gate`), and with the bound
   restricted to the GDN sets the gain is 66.6 against 66.4 t/s — inside the
   noise. DESIGN records it as "not carried".
+
+### 0046-moe-cpu-tier-census-seed.patch
+
+The census-seeded static partition for the MoE host compute tier (campaign
+`docs/campaigns/expert-hot-set-lru.md`, design
+`docs/design-expert-hot-set-lru.md` §5.1). Patch 0018 chooses a layer's
+resident expert set with a frequency-FREE `splitmix64(seed, layer_key,
+expert)` rank, measured (`tools/expert_policy_compare.py`) to sit at CHANCE at
+every budget (0.92–1.10× `slots/512`). This patch replaces that ranking with a
+measured-frequency rank from a served-routing census, so the pinned half is
+the hot half, while keeping DESIGN §3.4: the seed is a pure function of the
+RECORDED census, not of run history.
+
+New file `census_seed.hpp` (deliberately OpenVINO-free): a parser for the
+"hot-set seed v2" format, one data line per layer
+
+    <layer_key> <expert> <expert> ...
+
+with a MANDATORY `# space=layer_key` header. Malformed lines, duplicate
+`layer_key`s, duplicate expert ids, a missing or wrong `space=` header, and an
+empty file are REFUSED (`std::runtime_error`), not defaulted. The consumer
+half, `census_seed_resident_experts()`, validates one layer against the model:
+the `layer_key` must be present, the expert count must equal the pool
+capacity (a budget that moved since the census is a mismatch), and every
+expert id must be `< num_expert`.
+
+`expert_weight_providers.{hpp,cpp}` gains `set_census_seed()` /
+`census_seed_active()`; `bind()` pins the census set when active, else patch
+0018's splitmix64 rank. `moe_3gemm_swiglu_opt.cpp` reads the per-run env
+`MOE_CPU_TIER_SEED=<path>` once per process (cached across the 48 layers),
+validates THIS layer's entry at construction -- so a mismatched seed REFUSES
+THE LOAD before any request is served -- and logs
+`seed_source=census|census_seed_fp=0x...` beside the existing
+seed/`resident_checksum` fields. With the env var unset, patch 0018's
+behaviour is unchanged.
+
+`tools/hot_set_census.py`'s `select` now emits this format: `--census
+<layer,expert,count CSV>` (the CORPUS census a hot set is seeded from, not the
+decode-only v1 rows), `--layer-keys <JSON decoder-index -> layer_key>` to key
+the seed by the structural `layer_key`, and a `# space=layer_key` header. A
+seed with no layer-key map declares `# space=layer` and is refused by the
+plugin parser -- a decoder-index seed can no longer be silently consumed.
+
+MEASURED (2026-09-22, dev build host): applied on top of the 43 carried
+patches (0003-0045) against pin `71640275` and built (`ninja
+openvino_intel_gpu_plugin`, clean); the plugin carries the
+`MOE_CPU_TIER_SEED` / `seed_source=` / `census seed: layer_key` strings. The
+version stamp stays at `marfrit-p19` (disclosed: `p19` is also the 0003-0043
+stamp, so the 0046 build is identified by its env/parse symbols, not the
+stamp). Device-free cells: **14 green** in `tools/test_census_seed.py`
+(compile `census_seed.hpp` with g++ and exercise every malformed/mismatched
+case; each refusal goes RED when its check is removed) plus **76 green** in
+`tools/test_hot_set_census.py`.
+
+MEASURED (2026-09-22, A770 GPU.1 / PCI 8086:56a0): the served quality row is
+PASS, no V4. Native d48n artifact, `--offload-ratio 99 --moe-cpu-tier`, KV u8,
+chunk 512; incumbent `splitmix64` seed and the corpus census seed, same
+256-token prompt and greedy 32 tokens, both produced greedy sha256
+`2169836b33e8bc74d7965fff867b13c1d3637388a4b52f11f639f381ce7cc36f` --
+byte-identical, because under the native artifact every routed expert runs on
+the host tier (patch 0043), so residency moves bytes, not arithmetic. The
+corpus S = 6 seed (one slot over the pool) was run first and REFUSED the load
+(`census seed: layer_key ... lists 6 experts but the pool has 5 slots
+(mismatched budget)`). Finding: the plugin's pool at ratio 99 is 5 slots/layer
+(integer division) while the fit ledger prices 6 (`ceil`); the served seed is
+the corpus top-5. The speed row stays EMPTY and G UNPINNED.
+
+### 0047-moe-per-expert-slot-pool-size.patch
+
+The per-expert dispatch path's slot pool must be resident-sized, not a
+1-expert placeholder (campaign `docs/campaigns/sub4bit-vram-kernel.md`,
+DESIGN §7.0.2cd). [code] Patch 0041, when `MOE_PER_EXPERT_DISPATCH` is on,
+gives
+every routed-expert Constant a 1-expert placeholder (`moe_offload_constant.cpp`:
+`upload_shape[0] = 1`, reinterpreted to the full constant layout) so that the
+data primitive exists and no mmap page is faulted. But the per-expert
+dispatch path uses that same buffer as its weight storage: the provider builds
+an LRU pool of `lru_expert_num` slots in it and `fill_weights_memory()` copies
+each resident expert to `dst_offset = slot × (tensor bytes / num_expert)`
+(`moe_otd_runtime.cpp`), while patches 0043/0045's per-expert OpenCL kernels
+index it by `slot_index` (`set_otd_weight_pointers` → `exec_batched_gemv`).
+The first slot with index ≥ 1 therefore ran past the 1-expert allocation.
+
+MEASURED (2026-09-22, 24 GB card / PCI 8086:e211): the served native `d48n`
+with `--moe-per-expert-dispatch` faulted before the HTTP server started —
+`arcint … segfault … error 6 in libc.so.6` (the memcpy vector) and, at the
+same instant, `xe 0000:0f:00.0 … Faulted Address 0x0000d556aa740000, Fault
+response: Unsuccessful -ENOENT` on the blit engine (`engine_class=bcs`, engine
+reset). A gdb attach localises the host crash to `paged_forward → load_paged`
+→ `libopenvino_intel_gpu_plugin.so` → `libigdrcl.so` →
+`__memcpy_avx_unaligned_erms`, i.e. the slot upload.
+
+**The engine/plugin slot-count off-by-one is disproven.** The fit ledger
+(`src/exec/fit.h expert_slot_bytes`) prices `ceil(512*(100-r)/100)` = 6 at
+ratio 99 while the plugin (`ops/moe.cpp`) integers to 5. The discriminating
+run is the ratio where both agree: ratio 75, both 128. The same segfault and
+the same fault address recurred there, so the divergence is not the mechanism;
+the fixed 1-expert placeholder is, and it is ratio-independent. The engine's
+ceiling only ever sizes the reservation/ledger, never a plugin buffer
+(`MOE_OTD_DEVICE_POOL_BYTES` is an env-set byte budget).
+
+Fix: allocate the resident slot pool exactly as the ordinary OTD path does
+(`upload_shape[0] = min(num_expert, resident_expert_num)`), while keeping the
+compile-time behaviour: `upload_bytes = 0` (deferred to runtime), `skip_evict`
+true (no mmap page faulting / VMA churn) and no device pool budget charged.
+A defensive `OPENVINO_ASSERT` states the (min()-guaranteed) pool ≤ full-layout
+invariant; it is not a runtime guard.
+
+MEASURED (2026-09-22, 24 GB card): the fault is gone, the plateau probe settles
+at `0.37 GiB` (`probe-static`), and the served path answers. On the native
+`d48n` at ratio 75 + tier, KV u8, chunk 128, one lane:
+`[OTD_PERF] … per_expert_dispatches=24676, per_expert_gpu_invocations=135874,
+gpu_hits=3623, gpu_misses=21053, gpu_hit_rate=14.6823%, cpu_tier_pairs=187903,
+created_onednn_kernels=0`; prefill 5 tokens 14.72 s, decode 16 tokens 28.21 s
+(0.6 t/s), answer ` Paris. Paris is the most populous city in France and one
+of the most visited`. The 16 GiB card serves the same cell too: load 675 s,
+16 tokens 36.5 s (0.44 t/s on the request wall, prefill + decode; the B60's
+0.6 t/s is decode-only), `per_expert_gpu_invocations=135634`,
+`per_expert_dispatches=24697`, hit 14.89%, `cpu_tier_pairs=188023`. The load
+takes 845 s on the 24 GB card — the residual stall is the CPU
+tier's scalar native decode during the load-time probe (seven
+`moe_cpu_expert` threads at ~90% CPU), not a JIT (no `ocloc`/`llvm-spirv`
+child) and not a deadlock; it terminates.
+
+### 0048-moe-otd-pinned-nvme-fill.patch
+
+The load-time pinned NVMe fill's schedule, wired into the static partition
+(campaign `docs/campaigns/nvme-direct-expert-tier.md`, design note
+`docs/design-nvme-direct-expert-tier.md` D2/D3). Membership is the pinned set
+patch 0018/0046 already fixes at `bind()`; the fetch is arcwell's batch
+surface (`AW_IOC_SUBMIT_BATCH` / `AW_IOC_BATCH_WAIT`), one batch per MoE
+layer, four batches in flight, collected and marked filled before the first
+routed call. There is **no fetch on the decode path**.
+
+New file `pinned_nvme_fill.hpp` (deliberately OpenVINO-free): the schedule —
+an injected `Transport` with setup/submit/collect and no synchronous read
+primitive, a `Scheduler` at depth 4 that fills the window before collecting
+the oldest, retries a short batch once, and REFUSES the load (never a silent
+demotion to the host tier) if a pinned expert is still not landed. It is the
+byte-identical twin of arcint's tracked `src/exec/pinned_nvme_fill.h`, checked
+by `tests/test_pinned_nvme_fill.cpp`, which is the one the device-free ladder
+tests.
+
+`expert_weight_providers.{hpp,cpp}`: the env opt-in `MOE_OTD_PINNED_NVME_FILL`
+(read once at construction, inert when unset); `reserve_static_partition()`
+factorised out of `bind()` so the coordinator can reserve every layer's slots
+before it marks them filled; `pinned_nvme_fill_batch()` (this layer's pinned
+membership as one batch); and `apply_pinned_nvme_fill_slot()` (the cache
+`set_filled(slot)` the note's §3.4 requires on collect). A translation-unit
+global coordinator starts at the first layer's `bind()`, enumerates the live
+providers in structural `layer_key` order, and runs the barrier. A failure
+anywhere in setup or the barrier throws — a load failure, per D3.
+
+`require_no_sync_read()` is the campaign's own red-first guard: a would-be
+synchronous `AW_IOC_READ_BLOCKS` is refused once serving has begun, so the
+losing configuration cannot be reached.
+
+MEASURED (2026-09-23, device-free): the patch applies cleanly to a pristine
+checkout of the pin **through the full sequential series 0003–0047**
+(`git apply --check` + apply, 45/45 then 0048), and compiles clean against the
+0047 tree (`ninja openvino_intel_gpu_plugin`, rc 0; only
+`expert_weight_providers.cpp` and `moe_3gemm_swiglu_opt.cpp` rebuilt). The
+schedule's ladder is 8 cells green in `tests/test_pinned_nvme_fill.cpp`; three
+mutants (guard removed, refusal replaced by a silent fill, depth ignored) each
+fail their named cell — raw output in the campaign's evidence packet. The
+version stamp stays at `marfrit-p19` (disclosed, the same as 0046/0047): the
+0048 plugin is identified by its `MOE_OTD_PINNED_NVME_FILL` / `pinned NVMe fill`
+symbols, not the stamp.
+
+**OWED, stated not faked.** The `Transport` has no production implementation
+in this patch: under the static partition the expert slot pool is host-mapped
+(`MOE_OTD_PERF_LOG` reports `device_slot_buffers=0`), and arcwell requires a
+dma-buf from an xe VRAM BO, so there is no destination a byte-transparent fill
+can land in yet. The per-expert dma-buf BO the artifact-format step named as
+the D2/D3 contract, the arcwell ioctl transport, and the card validation are
+OWED. Until they exist, an ENABLED `MOE_OTD_PINNED_NVME_FILL` refuses the load
+with that reason — exactly the note's "arcwell cannot be set up at all is a
+load failure" rule. With the env unset, patch 0018/0046/0047 behaviour is
+unchanged.
+
+## 0049 — the arcwell transport and the OpenCL slot import
+
+`0049-moe-otd-pinned-nvme-transport.patch` supplies the production `Transport`
+0048 injected empty, and the OpenCL import that makes the BO-backed slot the
+destination the resident expert is read from. Two new files:
+
+- `moe/pinned_nvme_transport.hpp` — `lgc::nvme_fill::ArcwellTransport`, the
+  `Transport` implementation. It owns the `/dev/arcwell` fd and the Arc render
+  node fd, creates one 64 KiB-rounded xe VRAM BO per (layer, tensor)
+  (`DRM_IOCTL_XE_GEM_CREATE` with VRAM placement + `NEEDS_VISIBLE_VRAM` +
+  `CPU_CACHING_WC`), exports the dma-buf (`DRM_IOCTL_PRIME_HANDLE_TO_FD`),
+  registers it peer-to-peer (`AW_IOC_MAP_BUFFER`, asserting
+  `AW_MAP_F_REQUIRE_P2P`), and drives `AW_IOC_SUBMIT_BATCH` /
+  `AW_IOC_BATCH_WAIT`, checking `out_submitted`/`out_err` (the ioctl return
+  alone is not enough; an unaligned geometry returns 0 with submitted=0,
+  err=-22). It expands one expert into THREE page-aligned requests — the store
+  record is `gate|up|down` concatenated and the plugin's device layout is
+  three per-tensor regions — with the store ordinal `dense_layer * capacity +
+  slot` and `expert_%04u.bin` (the ordering was verified layer-major, 0
+  mismatches against the manifest).
+- `moe/aw_uapi.h` — arcwell's uAPI header (BSD-2-Clause), vendored because the
+  plugin build cannot see `~/src/arcwell`.
+
+`expert_weight_providers.*` gains `create_pinned_nvme_pool()` (register the
+three BOs before the barrier), `pinned_nvme_geometry()`, and
+`bind_pinned_nvme_pool()` — which **imports the dma-bufs with
+`engine.import_buffer()`** and **replaces the host-mapped `gate_w`/`up_w`/
+`down_w`** with `reinterpret_buffer()`s of the imported pool, so the fused GEMV
+kernel reads the controller-DMA'd bytes directly. `moe_otd_runtime.*`'
+`fill_weights_memory()` gains `include_weights=false`, used to host-upload only
+the six scale/zp tensors (which the DMA slice excludes: adding them is 623.4375
+pages, not page-aligned, and they need the `[oc][group]`→`[group][oc]`
+transpose), completing each pinned slot at load on the engine's service stream.
+Customisation is opt-in and operator-set: `MOE_OTD_PINNED_NVME_FILL`,
+`MOE_OTD_PINNED_NVME_DRM`, `MOE_OTD_PINNED_NVME_STORE`,
+`MOE_OTD_PINNED_NVME_PART_START`.
+
+MEASURED (2026-09-24, device-free + one B60 leg): the patch, sha256
+`d6d3498d20fddf22b2972ba128c7b719dd8b759e4378a4b16f838296b54a630f`, reverse-
+applies and re-applies cleanly on the 0048 tree and compiles clean
+(`ninja openvino_intel_gpu_plugin`, `ninja_rc=0`); the apply transcript
+(`apply-check-0049.txt`) and the complete build log (`build-0049.log`) are in
+the packet. The mechanism was proven on the B60 end-to-end by the tracked
+non-arcint client `tools/arcwell_cl_slot_proof.c`: three per-tensor VRAM BOs,
+two real store experts DMA'd as six requests, imported into OpenCL, read back
+through the OpenCL queue **byte-identical** (sha256 `d463d1d5…`),
+`via_host_bounce` delta 0, `max_inflight` 6. All five red legs fail as required
+(`rc=1`, named failure, one transcript each in `mut-*.txt`): unaligned
+geometry, dropped partition offset, system-memory BO, corrupted readback,
+OpenCL corruption.
+
+**OWED, stated not faked.** The integrated served number — the fill running
+inside the serving loop and the depth-4 gate rows — is NOT measured here; the
+plugin was built and the mechanism proven, but the acceptance gate's three
+rows (`docs/window-053.md`) stay OPEN. The store ordering used by the
+transport is the store's own layer-major ordinal; a run against an artifact
+whose layer keys differ from the store's would need the store re-pointed.
 
 ## Not carried either: the measurement instrument
 

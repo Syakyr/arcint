@@ -182,6 +182,8 @@ def serving_config(n_layers, ple_eos_token_id, geometry=None):
         "hc_lowrank": g["hc_lowrank"],
         "full_attention_interval": 4,
         "layer_types": layer_types,
+        "output_gate_type": g["output_gate_type"],
+        "gdn_key_head_map": g["gdn_key_head_map"],
         # the n-gram table declaration artifact.cpp reads (FIX D)
         "ngram_size": g["ngram_size"],
         "heads_per_ngram": g["heads_per_ngram"],
@@ -263,6 +265,20 @@ def main(argv=None):
                          "<out>/.arena.bin; the file is removed after the save "
                          "unless --keep-arena)")
     ap.add_argument("--keep-arena", action="store_true")
+    ap.add_argument("--expert-format", choices=("u4", "native"), default="u4",
+                    help="the expert bodies: 'u4' = the plugin's grouped-affine repack "
+                         "(group 128; 0.10-0.13 relative RMS against the checkpoint), "
+                         "'native' = the checkpoint's own IQ4_NL / IQ3_XXS blocks re-laid "
+                         "per role and decoded in standard ops (exact; served through the "
+                         "plugin's native lowering, patch 0043)")
+    ap.add_argument("--ngram-staging-rows", type=int, default=None,
+                    help="declare the n-gram table port as a per-forward STAGING "
+                         "WINDOW of this many rows (campaign ple-disk-backend) "
+                         "instead of ports spanning the whole table: the runtime "
+                         "then preads only the rows a forward names into a small "
+                         "USM-host buffer and the 26.82 GiB pin never happens. "
+                         "The bound is max_tokens x Hn, Hn = (ngram_size - 1) x "
+                         "heads_per_ngram; the table itself still has to be on disk")
     ap.add_argument("--skip-hash", action="store_true",
                     help="do not sha256 the written IR files (the manifest "
                          "then says so)")
@@ -293,7 +309,13 @@ def main(argv=None):
     # ---- the shards, the vocab comparison, the template, the boundary ------
     t0 = time.time()
     feed = gf.GgufFeed(args.shards)
-    filler = ef.ExpertFiller(ef.gguf_expert_source(feed), ss.EXPERT_GROUP_SIZE)
+    if args.expert_format == "native":
+        # the checkpoint's own IQ4_NL / IQ3_XXS blocks, re-laid per role and
+        # decoded in ops (DESIGN 7.0.2bz; design-routing-aware-expert-execution
+        # 2.3a-2.3c); the u4 repack costs 0.10-0.13 relative RMS per tensor
+        filler = ef.NativeExpertFiller(feed)
+    else:
+        filler = ef.ExpertFiller(ef.gguf_expert_source(feed), ss.EXPERT_GROUP_SIZE)
     reader0 = feed._readers[0]
     ple_eos = gguf_field(reader0, PLE_EOS_KEY)
     gen_eos = gguf_field(reader0, GENERATION_EOS_KEY)
@@ -354,7 +376,7 @@ def main(argv=None):
             model, rep = ss.build_serving_shape_ir(
                 arena=arena, n_layers=args.layers, filler=filler, feed=feed,
                 layer_range=None if args.segment_layers is None else (lo, hi),
-                expert_ports=sink)
+                expert_ports=sink, ngram_staging_rows=args.ngram_staging_rows)
         except Exception as exc:                                  # noqa: BLE001
             say("build", f"FAIL segment {k} layers {lo}..{hi - 1}: {type(exc).__name__}: {exc}")
             arena.close()

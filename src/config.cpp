@@ -241,6 +241,8 @@ std::string usage_text() {
         "                            --prefix-cache-mib > 0 is refused at load unless the\n"
         "                            plugin reports a static residency partition, DESIGN §3.4)\n"
         "  --moe-cpu-tier-threads N  worker threads for that tier (0 = auto)\n"
+        "  --moe-per-expert-dispatch dispatch routed experts via per-expert GPU\n"
+        "                            kernels (needs --offload-ratio + --moe-cpu-tier)\n"
         "\n"
         "memory\n"
         "  --n-ctx N                 context length. Omitted: adopts whatever the\n"
@@ -707,6 +709,8 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
             }
         } else if (arg == "--moe-cpu-tier") {
             cfg.moe_cpu_tier = true;
+        } else if (arg == "--moe-per-expert-dispatch") {
+            cfg.moe_per_expert_dispatch = true;
         } else if (arg == "--moe-cpu-tier-threads") {
             if (!value(v) || !parse_int(v, cfg.moe_cpu_tier_threads)) {
                 return fail("--moe-cpu-tier-threads needs an integer");
@@ -858,6 +862,10 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
     if (cfg.moe_cpu_tier && cfg.offload_ratio == 0) {
         return fail("--moe-cpu-tier needs --offload-ratio > 0: with every expert "
                     "resident there is nothing for the host tier to compute");
+    }
+    if (cfg.moe_per_expert_dispatch && !cfg.moe_cpu_tier) {
+        return fail("--moe-per-expert-dispatch needs --moe-cpu-tier: non-resident "
+                    "experts fall back to the CPU tier");
     }
     // The --moe-cpu-tier / --prefix-cache-mib refusal USED to live here
     // (DESIGN §7.0.2ae's F0). Since plugin patch 0018 the answer depends on

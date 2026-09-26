@@ -229,11 +229,13 @@ if(ARCINT_TESTS)
     tests/test_ngram_row_ids.cpp
     tests/test_ngram_lookup.cpp
     tests/test_ngram_ports.cpp
+    tests/test_ngram_staging.cpp
     tests/test_decode_stats.cpp
     tests/test_profile_cycle.cpp
     tests/test_rope_precision.cpp
     tests/test_segments.cpp
     tests/test_segment_runtime.cpp
+    tests/test_pinned_nvme_fill.cpp
   )
   target_link_libraries(arcint-test PRIVATE arcint_core)
   target_include_directories(arcint-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/tests")

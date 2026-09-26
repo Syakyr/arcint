@@ -17,7 +17,218 @@ nightly is a different ABI, and since 0.3.0 floors the patch level within
 it (`>= +pN`, `<<` the next nightly) instead of pinning it exactly: an exact
 pin made apt remove arcint when the runtime was upgraded to +p3.
 
-## Unreleased (qfndev)
+## Unreleased
+
+- **The exact reference at full depth** (`tools/ref_forward_stream.py`,
+  run on a GB10): the pin's own model with every weight from the GGUF,
+  the experts streamed per layer and the n-gram table gathered lazily;
+  writes captures in llama.cpp's own format (`tools/kld_vs_capture.py`,
+  `tools/capture_vs_capture.py` read them). Against the model's own f32
+  arithmetic the native artifact is exact to 0.2% through 24 layers and
+  its short-prompt logits sit at KL 0.017 nats (llama.cpp: 0.053); at long
+  context the served artifact reads mean 0.37 / median 0.18 / argmax 0.83
+  on the capture's window 0 where llama.cpp itself reads 0.34 / 0.065 /
+  0.80. The remaining term is the artifact's own long-context floor, with
+  the f16 recurrent state, the prefill chunks and the long-context f16
+  attention as the candidates; the sparse-attention boundary now shows
+  its dense-for-sparse price (0.28 below, 0.45 above).
+
+### The native expert formats (campaign: sub4bit-vram-kernel)
+
+- **The residual, named**: with the fill's three provenance defects fixed
+  the depth-48 artifact answers Paris and sits at 0.73 nats KLD against the
+  model's own llama.cpp logits; the residual is the u4 grouped-affine
+  repack of the checkpoint's IQ3_XXS / IQ4_NL experts (0.10–0.13 relative
+  RMS per tensor, `measured-here`; finer groups do not help: G16 still
+  0.077). The experts are therefore carried in their own formats.
+- **What the checkpoint ships** (read off all 48 layers, not assumed):
+  43 layers IQ3_XXS gate/up over an IQ4_NL down; layer 2 IQ4_XS gate/up
+  over a Q8_0 down; layers 4, 30, 46, 47 IQ3_XXS gate/up over a Q8_0 down.
+- **Tools**: `q4e.native_blocks` re-lays the GGUF's expert blocks per
+  role (IQ4_NL: u4 codes in linear order + per-32 scale; IQ4_XS: the same
+  layout with the 6-bit sub-block scale folded in; IQ3_XXS: grid indices,
+  7-bit sign indices, per-32 scale; Q8_0: i8 codes + scale), bit-exact
+  against gguf-py on the real shards; `serving_shape._native_expert` emits
+  each as Constants in the fused op's rank-4 group-32 layout decoded in
+  standard ops (exact on the CPU plugin; the block scale an f16 Constant,
+  exact for IQ4_NL / Q8_0, one f16 rounding ≤ 2⁻¹¹ for the two others);
+  `export_serving_artifact.py --expert-format native` fills from them
+  (`NativeExpertFiller`); `src/core/gguf_dequant.cpp` decodes IQ4_NL,
+  IQ3_XXS and IQ4_XS rows, pinned to gguf-py on the real shards.
+- **Runtime dependency: `marfrit-openvino +p19` (patches 0003–0043).**
+  Patch 0043 lowers the native chains straight to `MOECompressed` with a
+  `weight_format` per projection and executes every routed expert on the
+  CPU tier through three row decoders; the fused kernels are never
+  launched under a native format (the OpenCL decode is the next patch).
+  On the card: the pass fires (the compile reached the op translation);
+  the cell that runs its output is owed — the B60 wedged at its first job
+  on the second attempt (a kernel oops in the xe scheduler's timeout path)
+  before any of the patch's device code ran; the stock-affine control cell
+  through the same harness is the first leg after the host is back.
+- **Native artifacts** exported, not registered (the registry entry comes
+  with the served reading): depth 4 (`qwen38-flash-next-d4n`, 9.5 GiB, for
+  the cut ladder against llama.cpp's whole tensors) and depth 48
+  (`qwen38-flash-next-d48n`, 77.5 GB, 144 expert bodies native, built in
+  468 s against the quantising fill's 3,583 s, peak host 39.4 GiB under
+  the 40 GiB fence).
+- **Reviewed** before packaging: the plugin patch's first form had the
+  native-format members missing from the impl's clone field list and read
+  the flag before assigning it — the executing impl would have run affine
+  on native bytes; fixed, with three host-only decoder cells in the
+  plugin's tier tests.
+
+- **The first native serve, and the gate's reading** (B60, ratio 99 +
+  tier, KV u8, f16): the full-depth native artifact answers Paris and
+  continues coherently, at 0.5–0.8 t/s on the scalar tier (every routed
+  expert decoded per token pair on the CPU; the OpenCL decode is the next
+  patch). KLD against the model's own llama.cpp capture, window 0: mean
+  0.42 / median 0.20 nats, argmax 0.79 — the u4 artifact on the same
+  window 0.54 / 0.24 / 0.73; an f16 KV cache changes nothing (0.40 /
+  0.21). The remainder is measured to its mechanism, not a defect: this
+  model's router is nearly flat (the top-10 hold 6–27% of the mass at
+  margins of 1e-4…1e-6), and the ~1% activation difference any forward
+  has against llama.cpp's Q8-activation arithmetic re-routes specific
+  tokens to a different expert — exact experts with llama's own input
+  match llama's routed sums at 1%, a 2% input perturbation moves them
+  15–29% on exactly the tokens the artifact gets wrong. The block-level
+  arithmetic (GDN, hyper-connections, the native experts) sits at that
+  1% floor everywhere; the gate's 0.06-nat bar needs a reference that
+  shares this model's routing noise.
+- **The served per-expert path: the fault, the fix and the first reading**
+  (patch 0047). The native OpenCL decode (patch 0045) compiles, but the
+  served `--moe-per-expert-dispatch` path faulted on the 24 GB card before
+  the HTTP server started — a host memcpy past a buffer end in
+  `libc.so.6` plus a blit-engine page fault (`Faulted Address
+  0x0000d556aa740000`, `-ENOENT`). The localisation is patch 0041: when
+  per-expert dispatch is on it gives each routed-expert Constant a
+  **1-expert placeholder**, but that buffer is the slot pool —
+  `fill_weights_memory` copies each resident expert to `slot × per-expert
+  bytes` and the per-expert kernels index it by `slot_index`, so the first
+  slot past 0 writes out of bounds. The engine/plugin slot-count off-by-one
+  (ceil 6 vs integer 5 at ratio 99) is **disproven**: at ratio 75 both give
+  128 and the same fault recurs. Patch 0047 allocates the resident slot pool
+  in the per-expert branch while still skipping the constant data
+  (`upload_bytes = 0`, `skip_evict`, no device-pool charge). Served on the
+  24 GB card (native `d48n`, ratio 75, KV u8, chunk 128):
+  `per_expert_gpu_invocations=135874`, hit 14.68%, 16 greedy tokens 28.21 s
+  (**0.6 t/s**), answer ` Paris. Paris is the most populous city in France` —
+  the counter and the served native route the campaign owed. The 16 GiB card
+  serves the same cell too (load 675 s, 0.44 t/s,
+  `per_expert_gpu_invocations=135634`, hit 14.89%), so both cards are
+  unblocked. The remaining
+  load-time delay is the CPU tier's scalar native decode (seven
+  `moe_cpu_expert` threads at ~90% CPU during the load probe), not a JIT and
+  not a deadlock; it terminates. The rate win stays open (resident fraction,
+  hot-set/LRU HELD).
+- **The rate leg: V1 at the ratio-99 budget, 1.81x at ratio 75.** The
+  VENICE speed gate (G = 1.10) is measured on the serving native route:
+  at ratio 99 the census-seeded route decodes 0.556 t/s on the 16 GiB card
+  against a 0.579 t/s bar (same-day host-tier comparand 0.526) and
+  0.555 t/s on the 24 GB card against 0.88 — **V1 fires, the speed row
+  stays EMPTY**. The residency sweep locates the win: ratio 75, census
+  top-128, 0.842 t/s against the same-config host control 0.465 t/s =
+  **1.81x** (`rho = 0.073 [derived]`: the card ~13x the host per resident
+  expert pair). The prediction commit's `rho` was corrected in place — the
+  ratio-99 shortfall is a hit-fraction limit, not a per-pair limit. **A new
+  §3.4/V4 finding:** on the dispatch route the greedy answer depends on the
+  resident seed (splitmix64 vs census), because the GPU per-expert kernel
+  and the host tier are not bit-identical — **V4 FIRES (RED) on that
+  route**; the earlier no-V4 quality PASS was measured without the dispatch
+  flag and does not cover this route. The
+  `--fit-ledger-dir` probe skip reproduces the same greedy answers; the
+  affine per-expert path (u4 `d48g`) serves under 0047 with a non-zero
+  counter (rate not comparable: cold disk). Ratio 50 is refused on the
+  16 GiB card and did not return on the 24 GB card.
+- **The V4 divergence, quantified (2026-09-22).** The dispatch route's
+  card-vs-host arithmetic is measured on a one-layer native MoE block
+  (E = 64, top-2): the **affine** per-expert kernels are bit-identical to the
+  host tier (0 elements moved, `per_expert_gpu_invocations=40`), the
+  **native** ones are not (12.5 / 37.5 / 75.0 % of output elements move as
+  the resident fraction grows to 1 / 16 / 32 slots; max |diff| 8.3e-3…1.1e-2,
+  mean |diff| 1.8e-4…1.1e-3 against a reference rms of 3.55e-3), deterministic
+  across compiles and identical on both cards. The served text consequence:
+  the two ratio-99 answers branch at greedy token index 3 of 64 (61 of 64
+  token positions then differ), and each resident seed reproduces its own
+  digest. The block decode and slot indexing are exonerated (IQ4_NL delta
+  GEMV and IQ3_XXS serial dump match `native_expert` exactly; the affine
+  route is bit-identical); the named suspect is the native gate_up's
+  one-stage f16 cast of `up·act(gate)` and its f32 subgroup reduction against
+  the host tier's staged f16 rounding — bounded, not yet confirmed. DESIGN
+  §7.0.2cf. No acceptance row moves: V1 stands, the ratio-75 point stays a
+  sweep point, and the native dispatch route's quality is OPEN. The
+  plugin/engine 5-vs-6 slot divergence is **CLOSED as intentional**: the
+  plugin's integer division (5 slots/layer at ratio 99) is the served truth
+  and the engine's `ceil` (6) is a fit-side ledger ceiling only.
+
+### The serving-shape MoE block fuses (campaign: sub4bit-vram-kernel)
+
+- **Emitter** (`tools/q4e/serving_shape.py`): the MoE block now carries the
+  three anchors the GPU plugin's tiled matcher requires and the fusing
+  35B export has — the two Reshapes around the router-weight Multiply, a
+  one-input Swish (the Python binding's `op.swish` adds a beta input the
+  C++ matcher rejects), and an f16 dequant chain with a trailing Convert
+  so the scale reaches the fused op as a direct Constant. Before this no
+  Flash-Next serving-shape artifact ever compiled to a MoE primitive: the
+  expert layers ran as batched FullyConnected, every expert for every
+  token, at full residency, and the whole offload series was inert.
+- **Measured** (B60, depth-12 artifact, KV u8, f16): 0 → 12
+  `moe_3gemm_fused_compressed`; device residency 17.73 → 3.00 GiB at
+  `--offload-ratio 99 --moe-cpu-tier`; served decode 18.3 → 80.5 t/s at
+  full residency; 26.6 t/s warm at ratio 99 with the tier on the A770.
+  The tier's first forward page-faults on the B60 (a card/driver-side
+  fault, 30-second reproducer with the 35B); it serves on the A770.
+- **Tools**: `tools/moe_tiled_rewrite.py` makes a pre-fix artifact
+  conformant in memory or on disk; `tools/check_tiled_pattern.py` checks
+  argument counts; the boot driver gained `--rewrite-tiled-moe` and
+  `--census` (the runtime graph's primitive types, the loud check for a
+  fusion that silently did not happen); the CPU plugin runs the same
+  tiled pass and serves as a device-free oracle in the suite.
+- **Registry**: `qwen3.8-flash-next-d12r`, the fused-MoE rewrite of the
+  depth-12 rung (a measurement artifact); the 48-layer artifact of the same
+  day (`d48f`) was withdrawn before release — its fill was wrong (below)
+  and `qwen3.8-flash-next-d48g` took its slot.
+- **Runtime dependency: `marfrit-openvino +p18` (patches 0003–0042).**
+  Patch 0042 fixes patch 0037's page fault on the Arc Pro B60: the hybrid
+  prefill's grouped-GEMM gather ran over every token-expert pair while
+  the tables held only the resident pairs, reading through a wrapped
+  offset ~8 GiB past the activation buffer. Bisected on the served binary and measured fixed
+  (the 35B with the CPU tier serves on the B60 at ratio 99, 23.6 t/s decode,
+  KV u8, f16 inference).
+  Patch 0041 measured inert on the fused offload route at compile.
+- **Full depth compiles and serves**: the 48-layer artifact in the fused
+  shape compiles on the 24 GiB card at `--offload-ratio 99 --moe-cpu-tier`
+  with 8.06 GiB device-resident and serves from an NVMe copy; with the
+  corrected fill (`qwen3.8-flash-next-d48g`, below) it answers the Paris
+  line.
+
+
+### The Flash-Next fill, corrected three ways (campaign: serving-shape-logits)
+
+- **Feed** (`tools/q4e/gguf_feed.py`): the GGUF converter's folds are undone
+  at the feed — every plain-RMSNorm gamma is stored as (1 + w) and `ssm_a`
+  as −exp(A_log), and the pin applies both transforms itself. Fed as stored,
+  the first hyper-connection mix was 1.69× too large and the served
+  full-depth logits carried no information about the model (KL 12.4 nats).
+- **Emitter** (`tools/q4e/gdn.py`): the GDN output gate follows the config
+  (`output_gate_type`, sigmoid for this checkpoint as llama.cpp hard-codes
+  it) and the key-head pairing follows `gdn_key_head_map` (tiled: value
+  head h reads key head h % 16, as llama.cpp computes this GGUF; the pin
+  interleaves). Both keys are written into the exported `config.json`.
+- **Instruments**: `tools/ref_forward_real.py` (the pin's modules at the
+  real geometry, fed from the GGUF, tapped per block, with experiment
+  flags for each finding); `boot_serving_shape.py --cut-prune` (a cut keeps
+  only the ports it reaches, so a layer-0 cut binds no 26.8 GiB table).
+- Measured on the dev host against llama.cpp's whole tensors (France ids,
+  layer 0): the three fixes take the layer's output from corr 0.80 to
+  0.9999; the depth-4 re-export agrees at every cut on the card (layer 3
+  corr 0.9987). DESIGN §7.0.2bz.
+- **Registry**: `qwen38-flash-next-d48g-ov` (the full-depth re-export)
+  supersedes d48f. Served on one 24 GB card at `--offload-ratio 99
+  --moe-cpu-tier` it answers the Paris line; its KLD against the model's own
+  llama.cpp capture reads 0.73 nats (from 12.4); the residual is the u4
+  repack of the IQ3_XXS / IQ4_NL experts (0.11–0.13 relative RMS per
+  expert tensor), the `sub4bit-vram-kernel` campaign's premise, not the
+  card, the precision, the KV cache or the route.
 
 ### Fit ledger and pre-warm lever (campaign: static-partition-cold-start)
 
@@ -50,6 +261,102 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
   the host after the GEMM completes. New OTD perf counter:
   `hybrid_prefill_layers`.
 - Requires `marfrit-openvino 2026.4.0~dev20260821+p16` (patches 0003–0037).
+
+### Census-seeded expert residency (campaign: expert-hot-set-lru)
+
+- **Plugin patch 0046**: the static partition's resident expert set can be
+  seeded from a measured served-routing census instead of patch 0018's
+  frequency-free `splitmix64` rank (measured at chance at every budget,
+  0.92–1.10x `slots/512`). A seed file emitted by `tools/hot_set_census.py
+  select --census` — one `<layer_key> <expert> <expert> ...` line per layer,
+  with a mandatory `# space=layer_key` header — is read at provider
+  construction via `MOE_CPU_TIER_SEED=<path>`, validated there (malformed or
+  budget-mismatched seeds REFUSE the load), and applied at `bind()`. With the
+  env var unset, patch 0018's behaviour is unchanged.
+- **Measured quality row (A770, native d48n, `--offload-ratio 99
+  --moe-cpu-tier`)**: incumbent vs census seed on the same 256-token prompt
+  and greedy settings produced byte-identical greedy text (sha256
+  `2169836b…336f`). Under the native artifact every routed expert runs on the
+  host tier (patch 0043), so residency moves bytes, not arithmetic; the
+  quality row reads PASS, no V4.
+- **Finding**: the plugin's pool at ratio 99 is 5 slots/layer (integer
+  division), while the fit ledger prices 6 (`ceil`); the S = 6 seed is
+  therefore refused, and the served seed uses the corpus top-5.
+- The speed row stays EMPTY and G UNPINNED; the resident-compute path is
+  `sub4bit-vram-kernel` step 3. Requires `marfrit-openvino …+p19` (patches
+  0003–0046); note `p19` is ALSO the 0003–0043 stamp (deliberately not
+  renumbered — the 0046 build is identified by its seed env/parse symbols,
+  as `contrib/packaging/marfrit-openvino/patches/README.md` discloses).
+
+### The n-gram table, staged from disk (campaign: ple-disk-backend)
+
+- **The 26.82 GiB pin is off the ledger.** The served path bound the
+  Flash-Next n-gram table as 26.82 GiB of USM host memory for the life of the
+  process. A single `ngram_table.0` port whose row count is BELOW the source
+  tensor's is now recognised as a per-forward STAGING WINDOW:
+  `bind_ngram_ports` validates it (`check_staging_geometry`) and skips the
+  full copy, and `feed_ngram_ports` stages exactly the rows the forward names
+  straight from the GGUF (`pread`), slot `i` = the `i`-th named row. Declared
+  by the emitter via `build_serving_shape_ir(..., ngram_staging_rows=N)`, and
+  exposed as `--ngram-staging-rows N` on
+  `tools/export_serving_artifact.py`.
+- **Measured served gate (A770, ONE binary for both arms, one fresh process
+  per arm, depth 4 of 48)**: staged against a pinned TWIN exported from the
+  same tree (the two `config.json` files identical, so the comparison is the
+  n-gram ports and not the backbone) → answer sha256 `d7f998cd…2ea5b8f` on
+  BOTH arms, byte-identical; n-gram resident 26.82 GiB with a 37.5 s copy →
+  2.884 MiB staging with no copy; container VmRSS peak 19.79 → 4.93 GiB
+  (Δ 14.86); physical MemAvailable min 9.89 → 32.91 GiB (Δ 23.02). A staged
+  repeat reproduced the same digest.
+- **Caveat**: depth 4 of 48 — the mechanism and the freed term are
+  depth-independent, and the full-depth window remains open. The staging bound
+  is `max_tokens × Hn` (33600 rows at the served geometry); the table still
+  exists at full size on disk, which admission owns.
+- **No plugin patch**: the change is arcint-side, and the runtime dependency is
+  unchanged.
+
+### The NVMe expert tier inside the served loop (campaign: nvme-direct-expert-tier)
+
+- **Ships arrive from disk.** The static partition's pinned expert set is now
+  brought onto the card straight from the NVMe expert store at load, through
+  arcwell's batch surface (`AW_IOC_SUBMIT_BATCH` / `AW_IOC_BATCH_WAIT`), one
+  batch per MoE layer, four batches in flight, collected and marked filled
+  before the first routed call. A pinned expert not landed by the load barrier
+  is a **load failure**, never a silent demotion to the host tier. Plugin patch
+  `0049` supplies the transport (`moe/pinned_nvme_transport.hpp`: raw xe VRAM
+  BO, dma-buf export, peer-to-peer mapping) and the OpenCL import that replaces
+  each layer's host-mapped expert memories with the BO; the six scale/zp
+  tensors stay on the transposing host path. There is **no fetch on the decode
+  path**.
+- **Why pinned at load, not a miss tier**: the routing warning horizon is zero
+  layers — a layer's top-k ids become host-visible only inside that layer's own
+  MoE hook — so a router-driven fetch cannot hide arcwell's 1.125 ms (arcwell's
+  number, not ours). The runtime miss tier stays the host hop.
+- **Measured served gate (B60, ONE window, one artifact, ratio 86, depth 4 of
+  48)**: cold TTFT arcwell **92.492 s** vs host-fed **99.679 s** — the arcwell
+  arm is at or below host-fed and both are ≤ the pre-pinned `X = 139.5 s`;
+  prefetch depth **4 batches in flight** (one per layer); `AW_IOC_STATS` arcwell
+  delta `bytes +697,958,400` exactly, `reads +852`, `segments +871`,
+  `batches +4`, `via_host_bounce 0→0`, `max_inflight 220`; host-fed delta
+  `bytes +0`. Decode 4.1 t/s vs 3.4 t/s — no regression. `os.wait4` child
+  `ru_maxrss` **3.697 GiB** both arms (≤ 32 GiB); physical sampler minimum
+  45.86 GiB, 0 watchdog trips.
+- **Restart determinism**: A770 host-fed arm (the bit-readable card), two cold
+  boots byte-identical (`9a7e2e77…9f`). **The arcwell arm's restart
+  determinism is OWED** — `~/src/arcwell` excludes the A770, so arcwell is
+  **B60-only** and no bit-readable card can run it; that arm is governed by the
+  load barrier, not by cross-boot byte-identity.
+- **PLE-disk attachment**: the n-gram table staged from disk (subsection
+  above) is the other half of the 0.5.3 "ships arrive from disk" milestone;
+  both take host memory off the ledger (the LISBON gate reads the PLE term at
+  2.884 MiB staged).
+- **Caveat**: depth 4 of 48 — the byte path is depth-independent, and a
+  full-depth (48-layer) variant remains an operator decision, not assumed.
+- Requires `marfrit-openvino 2026.4.0~dev20260821+p19` (patches 0003–0049);
+  note `p19` is ALSO the 0003–0043 stamp (deliberately not renumbered — the
+  0049 build is identified by its `MOE_OTD_PINNED_NVME_FILL` / `pinned NVMe
+  fill` and `ArcwellTransport` symbols, as
+  `contrib/packaging/marfrit-openvino/patches/README.md` discloses).
 
 ## 0.5.0 — 2026-09-13
 

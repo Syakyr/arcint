@@ -148,3 +148,54 @@ keep passing throughout.
   opened this campaign is resolved; the residual prefill cost is the
   expected price of running half the experts on the host CPU. Pursuing it
   further is a diminishing-returns optimisation, not a defect fix.
+- 2026-09-17 — **patch 0037 page-faults the CPU tier's first forward on
+  the Arc Pro B60** (`measured-here`, bisected on the served binary with
+  the 35B at `--offload-ratio 99 --moe-cpu-tier`, static partition): the
+  +p13 plugin (through 0031) serves; +p16 (through 0037) faults at the
+  slot-pool plateau probe with `CL_OUT_OF_RESOURCES`, the host kernel log
+  showing an xe page fault (`Fault response: Unsuccessful -ENOENT`) and a
+  device coredump (`Timedout job`, compute engine); +p16 rebuilt without
+  0037 serves; +p17 with `MOE_CPU_TIER_PARTITION=lru` (0037's branch is
+  static-partition-only) serves; the A770 serves with 0037 in place.
+  Mechanism (`code`, 0037's own header — to be confirmed in the kernel):
+  non-resident experts are remapped to the sentinel slot index
+  `num_expert`, one past the last valid slot, in the per-token expert
+  index buffer, and the GPU mask-gen kernel is trusted to have "no
+  work-item at that index"; a table indexed with it is read or written
+  one entry past its allocation, which faults where the allocation ends
+  on a page (Xe2) and is silent elsewhere (Xe-HPG). Reproducer: 30 s on
+  the B60. Fix: patch 0042 — size the per-expert tables `num_expert + 1`
+  or clamp the sentinel in the consumer, red-first unit test with the
+  sentinel at the last index, then +p18. Until then the tier on the B60
+  needs the LRU partition or a plugin without 0037.
+- 2026-09-17, night — RETRACTION of the entry above: its mechanism (the
+  sentinel `num_expert` overrunning a per-expert table) and its
+  prescription (size the tables `num_expert + 1` or clamp) were `code`-class
+  inferences from 0037's header and are WRONG — every GPU consumer of the
+  sentinel resolves it by equality and is safe; the reader is the gather
+  launch below. Nothing was sized `num_expert + 1`.
+- 2026-09-17, night — **fixed: patch 0042.** The reader was the grouped
+  prefill's gather: `tokens_per_expert_cpu` is created as
+  `token_num * max_topk` entries of -1, 0037 fills only the resident
+  (token, k) pairs, and the gather kernel was still launched over every
+  pair — each work-group past the fill computed `token_index = -1 *
+  HIDDEN_SIZE` and added it to the kernel's `uint` offset, wrapping to
+  ~2^32 elements, ~8 GiB PAST the buffer (`code`; the B60's faulted
+  address 0x1f0f5e000 ≈ 8.2 GiB is consistent; the A770's silence on the
+  same read is unexplained, `unobserved`) — (`measured-here`: a
+  `stream.finish()` after every stage of the grouped path showed the
+  first synchronisation, after the gather, already throwing; the host
+  dispatch and the micro-GEMM remap eliminated one at a time). The fix
+  sizes the gather and the stages after it by the filled count and hands
+  a zero-resident batch to the per-expert path. `measured-here` (B60,
+  pin + 0003–0037 + 0042): the 35B serves at ratio 99 with the tier,
+  Paris, warm repeat identical, decode 23.6 t/s (KV u8, f16 inference,
+  prefill chunk 512, one lane), the hybrid path active.
+  Ships as `+p18`. Owed: the unit-ladder cell (tables with sentinel
+  entries, filled count against launch size).
+- 2026-09-17, night — **`+p18` built and accepted.** The packaged plugin
+  (the recipe on tree 83701d6, version string `…-marfrit-p18`) serves the
+  35B at ratio 99 with the tier on the B60: Paris, warm repeat identical,
+  decode 23.3 t/s (KV u8, f16 inference, prefill chunk 512, one lane), no
+  fault (`measured-here`). Not installed anywhere by the seat that built
+  it. Owed on this patch: the unit-ladder cell and the cache-key bucketing.

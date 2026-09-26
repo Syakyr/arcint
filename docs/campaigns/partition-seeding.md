@@ -85,6 +85,15 @@ Patch 0013 (`contrib/packaging/marfrit-openvino/patches/
 0013-moe-otd-routing-histogram.patch`) — `OffloadExpertWeightProvider::
 routing_histogram()`/`layer_seq_id()`, `MOE_OTD_ROUTING_HIST`'s CSV dump
 (`layer,expert,count`, one row per nonzero count, in layer-sequence order).
+[CORRECTED 2026-09-21: patch 0013's own round-two header supersedes the
+three-column description — the consumer contract is
+`layer,weight_offset,expert,count` ordered by `weight_offset`, `layer` its
+0-based rank (`patches/0013-moe-otd-routing-histogram.patch:279-281,440`),
+and `weight_offset` is the same structural key as patch 0018's `layer_key`
+(the layer's first OTD weight-file offset), which is what makes the
+histogram pluggable into the seed. The per-token trace added by
+`docs/campaigns/expert-hot-set-lru.md` is the ordering half this CSV never
+carried; see `docs/design-expert-hot-set-lru.md` §3.]
 Patch 0018's `static_partition.hpp`
 (`static_partition_resident_experts`, the `splitmix64(seed, layer_key,
 expert)` rank this campaign's seeding function would replace or extend)

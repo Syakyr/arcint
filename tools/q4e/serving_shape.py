@@ -733,8 +733,11 @@ def _compressed_expert(arena, e, out, inn, name, filler=None,
     """One expert-stacked weight in the tiled lowering's shape.
 
     rank-4 [E, out, groups, group_size] u4 Constant
-      -> Convert(f32) -> Subtract(zero_point) -> Multiply(scale)
-      -> Reshape(rank 4 -> 3)  [E, out, inn]
+      -> Convert(f16) -> Subtract(Convert(u4 zero_point -> f16))
+      -> Multiply(f16 scale Constant) -> Reshape(rank 4 -> 3) [E, out, inn]
+      -> Convert(f32)
+    (the fusing control's chain, since 2026-09-17; the PORTED route below
+    keeps the f32 arithmetic it was measured with, and no trailing Convert)
 
     The trailing Reshape is not cosmetic: verify_moe_lowering.py:33-42 records
     a real GPU compile crashing inside the fusing pass's own rewrite when it
@@ -746,8 +749,9 @@ def _compressed_expert(arena, e, out, inn, name, filler=None,
 
     WITH a `filler` (q4e.expert_fill.ExpertFiller) the same shapes carry the
     real checkpoint: the filler returns packed u4 codes, packed u4
-    zero-points and f32 scales for (layer, kind), and each of the three
-    constants is built OVER pages written first. The graph is structurally
+    zero-points and f32 scales for (layer, kind) -- the scales are carried
+    as f16 Constants, the exact f32 stays in `arena.scales` -- and each of
+    the three constants is built OVER pages written first. The graph is structurally
     identical either way -- same ops, shapes and element types -- which is
     what lets the empty build's contract test speak for the filled one.
     """
@@ -760,6 +764,17 @@ def _compressed_expert(arena, e, out, inn, name, filler=None,
         assert sc.shape == (e, out, groups, 1), (
             f"{name}: filler returned scales {sc.shape}, the constant is "
             f"{(e, out, groups, 1)}")
+    # THE DEQUANT CHAIN'S TYPE IS f16 WITH A TRAILING Convert TO f32 -- the
+    # fusing 35B control's exact shape (walked node by node 2026-09-17), and
+    # not a cosmetic choice: under the plugin's f16 inference precision an
+    # f32 scale Constant feeding the fused MOECompressed gets a Convert
+    # inserted by KeepConstantsPrecisionAndAddConverts, and the offload
+    # series' OTD resolver (moe.cpp, patch 0005 on) demands direct Constants:
+    # "Expected constant input for MOE3GemmFusedCompressed, got: Convert"
+    # (census 2, B60, 2026-09-17). An f16 scale needs no Convert. The PORTED
+    # chain (dead route) keeps its f32 arithmetic; the unpack cell compares
+    # each against its own reference.
+    ct = Type.f32 if port_sink is not None else Type.f16
     if port_sink is not None:
         # SEGMENTED: the codes are a u8 PORT, bound by the runtime; only the
         # zero-points and scales are constants of this segment's graph
@@ -768,35 +783,185 @@ def _compressed_expert(arena, e, out, inn, name, filler=None,
     elif filler is None:
         w = arena.constant([e, out, groups, gs], EXPERT_DECLARED_TYPE)
         w.set_friendly_name(name + "/weight_u4")
-        x = op.convert(w, Type.f32)
+        x = op.convert(w, ct)
     else:
         w = arena.constant([e, out, groups, gs], EXPERT_DECLARED_TYPE,
                            fill=pw, name=name + "/weight_u4")
         w.set_friendly_name(name + "/weight_u4")
-        x = op.convert(w, Type.f32)
+        x = op.convert(w, ct)
     if filler is None:
         zp = arena.constant([e, out, groups, 1], EXPERT_DECLARED_TYPE)
-        scale = op.constant(np.ones((e, out, groups, 1), np.float32))
+        scale = op.constant(np.ones((e, out, groups, 1),
+                                    np.float32 if ct == Type.f32 else np.float16))
     else:
         zp = arena.constant([e, out, groups, 1], EXPERT_DECLARED_TYPE,
                             fill=pzp, name=name + "/zero_point")
-        scale = arena.f32_filled(sc)
-        arena.scales[name + "/scale"] = sc
+        if ct == Type.f32:
+            scale = arena.f32_filled(sc)
+            arena.scales[name + "/scale"] = sc
+        else:
+            sc16 = np.ascontiguousarray(sc, dtype=np.float16)
+            scale = arena.constant(list(sc16.shape), Type.f16, fill=sc16,
+                                   name=name + "/scale")
+            # the EXACT scale the filler quantised with (tests dequantise the
+            # codes against it); the artifact carries its f16 rounding
+            arena.scales[name + "/scale"] = sc
     zp.set_friendly_name(name + "/zero_point")
     scale.set_friendly_name(name + "/scale")
-    x = op.subtract(x, op.convert(zp, Type.f32))
+    x = op.subtract(x, op.convert(zp, ct))
     x = op.multiply(x, scale)
     x = op.reshape(x, op.constant(np.array([e, out, inn], np.int64)),
                    special_zero=False)
     x.set_friendly_name(name + "/dequant_reshape")
+    if ct != Type.f32:
+        x = op.convert(x, Type.f32)
+        x.set_friendly_name(name + "/dequant_f32")
+    return x
+
+
+def swish1(x):
+    """Swish with ONE input. The Python binding's `op.swish(x)` appends a
+    beta Constant (1.0) as a second input; the plugin's tiled MoE matcher
+    declares `Swish({gate_matmul})` with one input and the C++ Matcher
+    rejects a node whose argument count differs (measured 2026-09-17: the
+    fusing 35B control carries Swish/opset4 in=1, this emitter carried in=2,
+    and the census stayed at 0 MoE primitives with the Reshapes in place)."""
+    s = op.swish(x)
+    s.set_arguments([s.input_value(0)])          # drop the beta the binding added
+    s.validate_and_infer_types()
+    return s
+
+
+def _native_expert(arena, e, out, inn, name, fmt, parts):
+    """One expert-stacked weight as the CHECKPOINT'S OWN BLOCKS, decoded in
+    standard ops (design-routing-aware-expert-execution 2.3a/2.3b, DESIGN
+    7.0.2bz): the u4 grouped-affine repack of the IQ3_XXS / IQ4_NL experts
+    costs 0.10-0.13 relative RMS per tensor and 0.73 nats at depth 48, so the
+    experts are carried as q4e.native_blocks lays them out per role, and the
+    decode is expressed in ops the CPU plugin runs exactly (the suite's
+    oracle) and the GPU plugin's matcher will lower to native kernels:
+
+      IQ4_NL   codes u4 [E,out,inn/32,32] -> Convert(i32) -> Gather(table[16] f32)
+               * Convert(f32)(scales f16 [E,out,inn/32,1]) -> Reshape [E,out,inn]
+      IQ4_XS   the IQ4_NL chain over the IQ4_NL layout (sub-block scales folded
+               into the f32 scale by the split)
+      Q8_0     codes i8 [E,out,inn/32,32] -> Convert(f32)
+               * Convert(f32)(scales f16) -> Reshape [E,out,inn]
+      IQ3_XXS  gridix u8 [E,out,inn/32,8] -> Convert(i32) -> Gather(grid[256,4])
+               -> Reshape [E,out,inn/32,32]  (the magnitudes)
+               signix u8 [E,out,inn/32,4] -> Convert(i32) -> Gather(ksigns[128])
+               -> Unsqueeze -> BitwiseAnd(masks[8]) -> Greater(0)
+               -> Select(-1, +1) -> Reshape [E,out,inn/32,32]  (the signs)
+               magnitudes * signs * Convert(f32)(scales f16) -> Reshape [E,out,inn]
+
+    THE CONSTANTS' SHAPES ARE THE FUSED OP'S OWN (design note 2.3c): the
+    plugin's MOECompressed takes every expert weight as rank-4 [E, out,
+    groups, group_size] with a scale [E, out, groups, 1] and an optional
+    zero-point [E, out, groups, 1]. Both formats fit at group 32 -- IQ4_NL
+    as u4 codes plus a table and no zero-point; IQ3_XXS as 8 grid indices
+    per 32 values in the weight slot, 4 sign indices per 32 values in the
+    zero-point slot, and the per-32 scale -- so the plugin patch lowers
+    these Constants as they are, and the offload path copies one expert's
+    bytes exactly as it does for the u4 route.
+
+    The arithmetic is f32 (exact against numpy's decode); the fusing u4 chain
+    is f16 with a trailing Convert because its matcher demands direct f16
+    Constants, and the native matcher variants are the plugin patch's to
+    define. Until that patch, the GPU plugin would constant-fold these
+    chains into dense f16 weights (10 GiB per layer), so a native artifact
+    is measured on the CPU plugin at small geometry and, at depth, through
+    the served binary once the patch exists.
+
+    `parts` are q4e.native_blocks' per-role arrays over [e*out, ...] rows.
+    Returns the [E,out,inn] f32 node.
+    """
+    from q4e import native_blocks as nb
+    from q4e.expert_fill import pack_u4
+    rows = e * out
+    groups = inn // 32
+    g4 = op.constant(np.array([e, out, groups, 32], np.int64))
+    if fmt in ("IQ4_NL", "IQ4_XS"):
+        # IQ4_XS splits to the IQ4_NL layout (its 6-bit sub-block scales are
+        # folded into the per-32 f32 scale, native_blocks.iq4_xs_split), so
+        # the chain -- and the plugin's lowering -- are the IQ4_NL ones
+        codes, scales = parts
+        assert codes.shape == (rows, inn) and scales.shape == (rows, groups), (codes.shape, scales.shape)
+        w = arena.constant([e, out, groups, 32], Type.u4, fill=pack_u4(codes), name=name + "/codes_u4")
+        w.set_friendly_name(name + "/codes_u4")
+        table = op.constant(nb.KVALUES_IQ4NL.astype(np.float32))
+        x = op.gather(table, op.convert(w, Type.i32), op.constant(np.int64(0)))     # [E,out,groups,32]
+        x.set_friendly_name(name + "/iq4nl_table")
+    elif fmt == "IQ3_XXS":
+        gridix, signix, scales = parts
+        assert gridix.shape == (rows, inn // 4) and signix.shape == (rows, inn // 8), (gridix.shape, signix.shape)
+        assert scales.shape == (rows, groups), scales.shape
+        gi = arena.constant([e, out, groups, 8], Type.u8, fill=np.ascontiguousarray(gridix, np.uint8),
+                            name=name + "/gridix_u8")
+        gi.set_friendly_name(name + "/gridix_u8")
+        grid = op.constant(nb.IQ3XXS_GRID.astype(np.float32))                      # [256, 4]
+        mag = op.gather(grid, op.convert(gi, Type.i32), op.constant(np.int64(0)))    # [E,out,groups,8,4]
+        mag = op.reshape(mag, g4, special_zero=False)
+        mag.set_friendly_name(name + "/iq3xxs_grid")
+        si = arena.constant([e, out, groups, 4], Type.u8, fill=np.ascontiguousarray(signix, np.uint8),
+                            name=name + "/signix_u8")
+        si.set_friendly_name(name + "/signix_u8")
+        ks = op.constant(nb.KSIGNS_IQ2XS.astype(np.int32))                          # [128]
+        masks = op.gather(ks, op.convert(si, Type.i32), op.constant(np.int64(0)))    # [E,out,groups,4]
+        bits = op.bitwise_and(op.unsqueeze(masks, op.constant(np.int64(-1))),
+                              op.constant(nb.KMASK_IQ2XS.astype(np.int32)))         # [E,out,groups,4,8]
+        neg = op.greater(bits, op.constant(np.int32(0)))
+        sign = op.select(neg, op.constant(np.float32(-1.0)), op.constant(np.float32(1.0)))
+        sign = op.reshape(sign, g4, special_zero=False)
+        sign.set_friendly_name(name + "/iq3xxs_sign")
+        x = op.multiply(mag, sign)
+    elif fmt == "Q8_0":
+        codes, scales = parts
+        assert codes.shape == (rows, inn) and codes.dtype == np.int8 and scales.shape == (rows, groups), (
+            codes.shape, codes.dtype, scales.shape)
+        w = arena.constant([e, out, groups, 32], Type.i8, fill=np.ascontiguousarray(codes, np.int8),
+                           name=name + "/codes_i8")
+        w.set_friendly_name(name + "/codes_i8")
+        x = op.convert(w, Type.f32)
+    else:
+        raise ValueError(f"{name}: unsupported native expert format {fmt!r} "
+                         f"({sorted(nb.SPLIT)})")
+    # the block scale is an f16 Constant like every stock scale: an f32 scale
+    # Constant is wrapped in a Convert(f16) by the plugin's precision pass,
+    # which the offload series cannot fold (file-backed Constants), and the
+    # op translation then refuses the non-Constant input (measured on GPU.0,
+    # 2026-09-18). IQ4_NL's and Q8_0's d IS an f16, so those stay exact;
+    # IQ3_XXS's d*(0.5+s)*0.5 and IQ4_XS's d*(ls-32) round once to f16
+    # (<= 2^-11 relative, test_native_expert_chain). The exact f32 stays in
+    # arena.scales; the chain's arithmetic stays f32 (Convert after the
+    # Constant), which the plugin's pattern accepts as an optional Convert.
+    sc16 = np.ascontiguousarray(scales, np.float16).reshape(e, out, groups, 1)
+    sc = arena.constant([e, out, groups, 1], Type.f16, fill=sc16, name=name + "/block_scale")
+    sc.set_friendly_name(name + "/block_scale")
+    arena.scales[name + "/block_scale"] = np.ascontiguousarray(scales, np.float32)
+    x = op.multiply(x, op.convert(sc, Type.f32))
+    x = op.reshape(x, op.constant(np.array([e, out, inn], np.int64)), special_zero=False)
+    x.set_friendly_name(name + "/native_f32")
     return x
 
 
 def emit_moe_tiled(hidden_bth, config, state, arena, T, tag, filler=None,
                    layer=None, port_sink=None):
-    """The MoE layer in the shape measured to fuse on the card
-    (export_mtp.py:401 moe_block_tiled), at real geometry, expert bodies
-    slot-referenced. Returns a [1,T,H] node."""
+    """The MoE layer in the shape the GPU plugin's
+    ConvertTiledMoeBlockTo3GatherMatmuls matcher accepts (export_mtp.py:401
+    moe_block_tiled, walked node by node against the pattern source), at real
+    geometry, expert bodies slot-referenced. Returns a [1,T,H] node.
+
+    "Measured to fuse" was inherited from the MTP exporter, not re-measured
+    here, and until 2026-09-17 this function deviated from it in the two
+    Reshapes the matcher anchors on (see the comment at the mixing stage).
+    The contract cell is `test_every_moe_layer_walks_the_plugins_tiled_3gemm_pattern`;
+    the compile that proves it is a card window.
+
+    Contract: `hidden_bth` is rank 3 with dim 0 the batch, statically 1 (the
+    mixing stage reads B off its ShapeOf and the shared-expert Add relies on
+    it). With a `port_sink` the expert bodies are Parameters, and the matcher's
+    CompressedWeightsBlock anchors on a Constant: a ported build cannot fuse
+    by construction, and the contract cell covers the Constant build only."""
     H = config.hidden_size
     E = config.num_experts
     I = config.moe_intermediate_size
@@ -830,21 +995,52 @@ def emit_moe_tiled(hidden_bth, config, state, arena, T, tag, filler=None,
     m_h3 = op.reshape(tiled, op.constant(np.array([E, -1, H], np.int32)),
                       special_zero=False)                              # [E,M,H]
 
-    gate_w = _compressed_expert(arena, E, I, H, f"{tag}/experts_gate",
-                                filler, layer, "gate", port_sink)
-    up_w = _compressed_expert(arena, E, I, H, f"{tag}/experts_up",
-                              filler, layer, "up", port_sink)
-    down_w = _compressed_expert(arena, E, H, I, f"{tag}/experts_down",
-                                filler, layer, "down", port_sink)
+    def _expert(kind, out_, inn_):
+        nm = f"{tag}/experts_{kind}"
+        if filler is not None and hasattr(filler, "native"):
+            # the checkpoint's own blocks, decoded in ops (2026-09-18)
+            fmt, parts = filler.native(layer, kind, E, out_, inn_)
+            return _native_expert(arena, E, out_, inn_, nm, fmt, parts)
+        return _compressed_expert(arena, E, out_, inn_, nm, filler, layer, kind, port_sink)
 
-    g = op.swish(op.matmul(m_h3, gate_w, transpose_a=False, transpose_b=True))
+    gate_w = _expert("gate", I, H)
+    up_w = _expert("up", I, H)
+    down_w = _expert("down", H, I)
+
+    g = swish1(op.matmul(m_h3, gate_w, transpose_a=False, transpose_b=True))
     u = op.matmul(m_h3, up_w, transpose_a=False, transpose_b=True)
     outs = op.matmul(op.multiply(g, u), down_w,
                      transpose_a=False, transpose_b=True)              # [E,M,H]
 
+    # THE TWO RESHAPES THE MATCHER ANCHORS ON. build_3gemm_pattern() in the
+    # plugin's convert_tiled_moe_block_to_gather_matmuls.cpp wants
+    # `end_reshape` = Reshape(down_matmul) and `router_reshape` =
+    # Reshape(Transpose(scatter)) -> optional Unsqueeze, both feeding the
+    # router-weight Multiply. This emitter dropped both until 2026-09-17: the
+    # constraint walker (tools/check_tiled_pattern.py) failed every MoE
+    # candidate of the depth-12 artifact at R4.router_reshape.type and its
+    # compiled graph carried 0 MoE-typed primitives, 230 FullyConnected, every
+    # expert computed for every token. Construction as export_mtp.py:532-537:
+    # B read from ShapeOf, S a runtime -1 -- a target whose every dim is known
+    # is folded away at validate/save on 2026.4.0 (export_mtp.py:515-531).
+    # Here B is statically 1 (asserted), so the targets are the LITERALS
+    # [E,1,-1,H] and [E,1,-1] -- the same construction tools/
+    # moe_tiled_rewrite.py used for every card census on the record (12
+    # fused primitives, 3.00 GiB, the served legs of 2026-09-17); the -1
+    # alone keeps the Reshape alive (M stays dynamic). export_mtp's B is a
+    # genuine runtime value and stays a ShapeOf there.
+    ps = hidden_bth.output(0).get_partial_shape()
+    assert (ps.rank.is_static and ps.rank.get_length() == 3
+            and ps[0].is_static and ps[0].get_length() == 1), (
+        f"{tag}: emit_moe_tiled wants [1,T,H], got {ps}")
+    outs4 = op.reshape(outs, op.constant(np.array([E, 1, -1, H], np.int32)),
+                       special_zero=False)                               # [E,1,S,H]
     wt = op.transpose(weights, op.constant(np.array([1, 0], np.int32)))  # [E,M]
-    wt = op.unsqueeze(wt, i32(-1))                                       # [E,M,1]
-    mixed = op.reduce_sum(op.multiply(outs, wt), i32v(0), keep_dims=False)  # [M,H]
+    wr = op.reshape(wt, op.constant(np.array([E, 1, -1], np.int32)),
+                    special_zero=False)                                  # [E,1,S]
+    wu = op.unsqueeze(wr, i32v(-1))                                      # [E,B,S,1]
+    mixed = op.reduce_sum(op.multiply(outs4, wu), i32v(0), keep_dims=False)  # [B,S,H]
+    mixed.set_friendly_name(f"{tag}/mix")      # the matcher's root, addressable
 
     # the shared expert (pin 986-996) stays dense f32 -- it is one MLP per
     # layer, 0.0183 GiB, and it is CARD tier in the size ledger
@@ -964,7 +1160,8 @@ def _ple_state(arena, config, layer=None, feed=None, census=None):
 def build_serving_shape_ir(config=None, arena=None, n_layers=None,
                            filler=None, feed=None,
                            ngram_chunk_cap_bytes=NGRAM_CHUNK_CAP_BYTES,
-                           rope_span=None, layer_range=None, expert_ports=None):
+                           rope_span=None, layer_range=None, expert_ports=None,
+                           ngram_staging_rows=None):
     """The full-geometry serving-shape backbone as an ov::Model, DYNAMIC IN T
     (feed-the-ports increment): no port, reshape or slice carries the block
     length. `T` below is the runtime token count of a forward.
@@ -1138,7 +1335,16 @@ def build_serving_shape_ir(config=None, arena=None, n_layers=None,
                           if hasattr(cfg, "ngram_total_vocab")
                           else pwe.REAL_GEOMETRY["ngram_total_vocab"])
             row_bytes = ngram_row_bytes(head_dim)
-            table_ports = (ngram_table_ports(ngram_rows, row_bytes,
+            # The port's row count is the STAGING BOUND when the caller asks for
+            # the disk-backed path (campaign `ple-disk-backend`): one port of
+            # `max_tokens x Hn` rows that the runtime fills per forward by
+            # `pread`, instead of one port spanning the whole table. The source
+            # tensor still has to be the full table -- that is admission's
+            # business -- so the port is deliberately SMALLER than the source,
+            # which is exactly how `bind_ngram_ports` recognises staging.
+            port_rows = (int(ngram_staging_rows) if ngram_staging_rows
+                         else ngram_rows)
+            table_ports = (ngram_table_ports(port_rows, row_bytes,
                                              ngram_chunk_cap_bytes)
                            if has_ple else [])
 
@@ -1256,6 +1462,8 @@ def build_serving_shape_ir(config=None, arena=None, n_layers=None,
             # the cap they were cut under. Not counted in graph_const_bytes --
             # it is not a constant any more, which is the point.
             "ngram_table_rows": int(ngram_rows),
+            "ngram_staging_rows": (int(ngram_staging_rows)
+                                   if ngram_staging_rows else None),
             "ngram_row_bytes": int(row_bytes),
             "ngram_chunk_cap_bytes": int(ngram_chunk_cap_bytes),
             "ngram_table_ports": [
@@ -1853,7 +2061,7 @@ def slot_pool_from_ir(model, num_expert, ratio_pct):
 
 
 def _expert_slot_bytes(num_expert, ratio_pct, per_expert_bytes, moe_layers):
-    """src/exec/fit.h:95 -- ceil(num_expert * (100 - ratio) / 100) slots per
+    """src/exec/fit.h:96 -- ceil(num_expert * (100 - ratio) / 100) slots per
     layer, times per-expert bytes, times layers."""
     slots = -((-num_expert * (100 - ratio_pct)) // 100)
     return slots * per_expert_bytes * moe_layers

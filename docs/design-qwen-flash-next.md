@@ -959,7 +959,7 @@ config must pin it; the GPU plugin auto-drops KV to u4 the moment it sees
 | term | params | size | where |
 |---|---|---|---|
 | routed experts (48 layers × gate/up/down) | 120.80 B | **56.25 GiB** int4 | offload pool (device working set + host remainder) |
-| PLE n-gram table | 51.20 B | **26.82 GiB** IQ4_NL | host-resident (mmapped) |
+| PLE n-gram table | 51.20 B | **26.82 GiB** IQ4_NL | host-resident: `NGramLookup`'s mmap path is genuinely lazy (`MADV_RANDOM`, rows paged on demand), but the **SERVED** `bind_ngram_ports` path does an eager full copy of all 26.82 GiB into USM host and retains it — the deviation from the mmap, and one configuration, not a requirement (the reference default is `disk`, `code`: `config.py`:32). **DATED IN PLACE 2026-09-22:** see `docs/campaigns/ple-disk-backend.md`. |
 | attention + GDN projections/state | 3.00 B | 1.40 GiB int4 | device |
 | token_embd + lm_head | 1.27 B | 0.59 GiB int4 | device |
 | shared expert + norms + misc backbone | 0.68 B | 0.31 GiB int4 | device |
@@ -2533,3 +2533,26 @@ its own base-file format; arcint's served logits will need converting into it,
 or the comparison written against the capture's format directly. That format is
 now known (it is documented in the correction above), so this is work, not a
 blocker.
+
+## FIX F — the fill's three provenance corrections (2026-09-18)
+
+Full record: DESIGN §7.0.2bz; campaign `docs/campaigns/serving-shape-logits.md`.
+Evidence class for every row: `code` in llama.cpp's consumer (`src/models/
+qwen4exp.cpp`, the fused `GATED_DELTA_NET` op) and `measured-here` on the dev
+host against llama.cpp's whole tensors of the same GGUF (France ids, layer 0).
+
+| tensor / semantic | as the GGUF stores it | as the pin consumes it | the feed / emitter now |
+|---|---|---|---|
+| every plain `Qwen4ExpTextRMSNorm` gamma (hc norms, PLE norms, attention q/k norms, the output mixer's norm) | folded, (1 + w) | applies (1 + w) itself, zero-init w | `gguf_feed` kind `gamma1`: stored − 1 |
+| `ssm_a` | −exp(A_log) | computes −exp(A_log) from A_log | kind `neglog`: log(−stored) |
+| `ssm_norm` (the GATED norm) | as is (ones-init, multiplied directly) | multiplies directly | `vec`, unchanged — unfolding it is wrong (measured: GDN out corr +0.81 → −0.62) |
+| the GDN output gate | no key in the metadata | `output_gate_type or hidden_act` = silu | `output_gate_type: sigmoid` in the real geometry and the exported config.json (llama.cpp hard-codes sigmoid for qwen4exp) |
+| the key-head pairing (16 key heads, 48 value heads) | — | `repeat_interleave`: value head h ← key head h // 3 | `gdn_key_head_map: tiled`: h ← h % 16 (llama.cpp's `ggml_repeat_4d` and its fused op; 4/48 core heads agreed interleaved, exactly h//3 == h%16; 48/48 tiled) |
+
+With all five rows, layer 0's output matches llama.cpp at corr 0.9999 (max
+|diff| 0.004 over values of mean 0.008 — the Q8-quantised activations on
+llama's side). Whether HF's head order or a converter permutation of the
+value side explains the pairing row is unverified and moot for a fill that
+reads the GGUF. Every parity leg against the pin read 0.0 before and after
+these rows: both sides shared the feed; only a reference outside the pin
+(llama.cpp's tap, the KLD capture) can see a provenance fold.

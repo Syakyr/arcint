@@ -219,6 +219,29 @@ regression not named, and carries twenty-two references filled from its own
 runners' samples (three gated, nineteen report-only). Clean
 under ASan and UBSan on x86_64.
 
+0.5.1 state 2026-09-19 (DESIGN 7.0.2bz-ca, docs/campaigns/sub4bit-vram-kernel.md):
+the fill's three provenance defects are fixed (the GGUF converter's folded
+norm gammas and -exp(A_log) undone at the feed, the GDN's sigmoid output
+gate, the tiled key-head pairing; all config-driven) and the 48-layer
+serving-shape artifact serves Paris on one 24 GB card at --offload-ratio 99
+--moe-cpu-tier in two expert formats: the u4 repack (qwen3.8-flash-next-d48g,
+23.6 t/s decode, marfrit-openvino +p18) and the checkpoint's own IQ3_XXS /
+IQ4_XS / IQ4_NL / Q8_0 blocks (qwen3.8-flash-next-d48n, tools/q4e/native_blocks.py,
+serving_shape._native_expert, export_serving_artifact.py --expert-format
+native; plugin patch 0043 = +p19 lowers them to MOECompressed and runs every
+routed expert on the CPU tier; 0.6 t/s until the OpenCL decode of the native
+formats lands). Quality is measured against the model's own full-depth f32
+forward (tools/ref_forward_stream.py, run on a 128 GB unified-memory host,
+writes captures in llama.cpp's format; tools/kld_vs_capture.py,
+tools/capture_vs_capture.py, tools/kld_position.py read them): the native
+artifact is exact to 0.2% through 24 layers, its short-prompt logits at KL
+0.017 nats (llama.cpp 0.053), and on the 2,735-token capture window it reads
+mean 0.37 / median 0.18 / argmax 0.83 where llama.cpp itself reads 0.34 /
+0.065 / 0.80. The remaining term is a long-context floor (not the experts,
+not the KV precision, not the prefill chunks; the f16 recurrent state or the
+f16 attention over thousands of keys), plus the dense-for-sparse price above
+the 2,051-token sparse-attention boundary.
+
 ## Contracts
 
 - HTTP: POST /v1/chat/completions, POST /v1/completions (OpenAI-compatible,
