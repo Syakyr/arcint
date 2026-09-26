@@ -10686,14 +10686,39 @@ of it.
     over a constant was evidently folded at compile time, leaving only the
     add. The contrast with reading therefore rests on the chain itself: each
     FC follows one that streamed 8–9 MiB of weights, with no slowdown.]
-  - The mechanism is not measured. The two arms differ in bytes written,
-    in bytes read, and in the atomic kernel. 16 MiB is the A770's L2 by
+  - [measured-here, one run per size] A third arm, **multiply-to-output**,
+    drops the atomic kernel. The product becomes one of 20 extra model
+    outputs, and a one-row slice of it feeds the chain.
+    - The FC after it reads 116.0 µs at 16 MiB and 63.0 at 32 MiB (32.8
+      without); the next FC reads 43.1 and 43.6.
+    - In one pair of the 32 MiB run the sequence before the slowed FC is:
+      the multiply (132.5 µs), the slice, a reorder (104.4 µs; 1,510
+      reorder launches per run, their role inferred from the name), and an
+      add.
+    - The run also carries device-to-host copies of the outputs.
+    - So the atomic kernel is not required. Whether the multiply's write,
+      the reorder, or the extra outputs carry the effect is not separated.
+    - The product's device precision under the f16 hint was not read, so the
+      sizes given are those of the f32 graph tensors.
+    - The table's `generic` medians mix the multiply with the residual adds
+      and are not the multiply's own time.
+  - The mechanism is not measured. The arms differ in bytes written and
+    read, in the atomic kernel and, for the third arm, in reorders and
+    output copies. 16 MiB is the A770's L2 by
     Intel's specification (`paper`), but the effect was only located
     between 8 and 32 MiB.
   - The slow FC here is 4096x2048. Its 142 µs beside the served 8192x2048
     input projection's 142.6 is a coincidence across shapes, not a
     reproduction of that launch.
-  - Which served kernel, if any, leaves such a state is not identified. By
+  - Which served kernel, if any, leaves such a state is not identified.
+    - The one served tensor checked by size is the MoE block's output,
+      8 routed (token, expert) pairs x 2048 f16, about 32 KiB (`code`). The
+      MoE's intermediate buffers and the other predecessors were not sized.
+    - [measured-here, read on the dev host] Per-kernel hardware counters
+      (bytes to memory) would settle it. No metrics library was found under
+      the system library path (other prefixes were not searched). GPU
+      observation is restricted to privileged users (`observation_paranoid`
+      1). A privileged run was not tried; enabling one is a host setting. By
     the model's config (`code`, 32 value heads, key and value dims of 128)
     the GDN recurrent state is 524,288 elements: 2 MiB in f32, 1 MiB in
     f16 (its served precision was not checked). In this arm's geometry an
