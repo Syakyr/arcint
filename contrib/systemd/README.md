@@ -38,7 +38,7 @@ Things worth copying rather than re-learning:
   the acceptance task.
 - **`--prefill-chunk 512`** on the agent is a context lever: on a card this
   full the activation reservation grows with the chunk, and 512 is what lets
-  151,552 tokens fit with MTP on (DESIGN §7.5, §7.9). The coder leaves it at
+  151,552 tokens fit with MTP on (DESIGN's fit and served-configuration sections). The coder leaves it at
   the default.
 - **`--cache-host-mib 4096`** on the agent enables the host KV tier (§4.4):
   evicted prefix-cache entries are demoted to host RAM instead of being

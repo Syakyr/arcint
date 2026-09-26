@@ -11,7 +11,7 @@ anything; the invariants in §3.4/§3.8 and the gates in §5 are not negotiable.
 Claude Code identically. Before the first substantive tool call of any turn
 that touches a design decision, a mechanism, a milestone or a campaign:
 
-1. Read `docs/campaigns/README.md`, and the campaign document covering the
+1. Read `docs/campaigns/README.md` (on `qfndev`), and the campaign document covering the
    work. Each is written to be sufficient on its own. (The campaign, design,
    milestone and window documents live on the development branch, `qfndev`;
    `main` carries the current state only — work from `qfndev`.)

@@ -35,7 +35,8 @@ Other measured configurations:
   verbatim over IQ3_XXS/IQ4_NL down, dense projections u8 group-16),
   --offload-ratio 0 --moe-per-expert-dispatch, u8 KV, chunk 1024: 13.11 GiB
   device-resident, max ctx 112,288 per lane, prefill ~960 t/s at 4,096 and
-  779 t/s at 32,768, decode 28.1 t/s after 4,096, 10/10.
+  779 t/s at 32,768 (chunk 2048; 781 at 1024), decode 28.1 t/s after 4,096,
+  10/10.
 - Qwen3.6-35B-A3B stock int4 on the A770 via expert offload (ratio 50, 8 GiB
   device pool) + host CPU tier: decode 18.2 t/s (12.5 without the tier),
   prefill 27.9 t/s. On the B60 resident: 62.7 t/s decode at 53.5k, 1,584 t/s

@@ -25,8 +25,8 @@ narrated mechanism that was not measured is retracted, not edited (§7.0.1).
 **Hardware named in this document.** "The 16 GiB card" is an Intel Arc A770
 (Xe-HPG, ACM-G10, PCI `8086:56a0`, 15.11 GiB usable to OpenVINO), "the 24 GB
 card" an Intel Arc Pro B60 (Xe2, BMG-G21, PCI `8086:e211`, 22.71 GiB usable).
-On the dev hardware OpenVINO's `GPU.0` is the B60 and `GPU.1` the A770; DRM
-numbering is inverted against that, so card identity is established by PCI id.
+OpenVINO's device order and the DRM card numbering need not agree, so card
+identity is established by PCI id.
 
 ## 1. The one idea
 
@@ -963,7 +963,7 @@ Standing numbers, the 24 GB card, the dense Qwen3.8-27B int4, greedy
 - **DFlash2** is the public block-diffusion head `incoai/Qwen3.8-27B-DFlash2`
   (`tools/export_dflash.py`), seven drafts per verify pass. It wins at depth;
   MTP, capped at two tokens per cycle, does not beat plain decoding at any
-  measured depth on this artifact — serve deep contexts without MTP, or with
+  measured long-context depth on this artifact (77k: 4.9 against 15.3 t/s) — serve deep contexts without MTP, or with
   DFlash2.
 - **On a GGUF-opened model** the template's MTP head drafts at 73.0% (§7.7).
 - **On the MoE** (Qwen3.6-35B stock int4) the head pairs (93.9% / 75.4%) and,

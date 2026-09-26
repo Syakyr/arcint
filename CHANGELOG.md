@@ -6,7 +6,8 @@ entry per built package) and the plugin patch record in
 `contrib/packaging/marfrit-openvino/patches/README.md`; this file names the
 same releases by tag and adds what a reader upgrading needs first: the
 runtime dependency. Every number here was measured; the measurement
-protocol and the retractions are in `DESIGN.md` §7.
+protocol and the retractions are in `DESIGN.md` §7. A `docs/` path named
+below that is absent on `main` is on the development branch, `qfndev`.
 
 Runtime dependency throughout: `marfrit-openvino`, a source build of OpenVINO
 at the pinned upstream commit `71640275` (the 2026.4.0 nightly of 2026-08-21)

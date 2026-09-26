@@ -1,5 +1,9 @@
 # window-050 — the 0.5.0 prediction window, operating manifest
 
+> Kept on `main` because a test reads this manifest by path. It is a dated
+> record of the 0.5.0 window, not current state (DESIGN.md is). Other
+> `docs/` documents it links to live on the development branch, `qfndev`.
+
 Recorded 2026-09-12. This file is the manifest a window operator executes: the
 holds, the stop order, where the logs go, which suites run on which device with
 which compile config, and the PREDICTION TEMPLATE that must be filled in BEFORE
