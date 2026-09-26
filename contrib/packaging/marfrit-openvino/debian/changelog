@@ -1,3 +1,32 @@
+marfrit-openvino (2026.4.0~dev20260821+p20-1) bookworm trixie; urgency=medium
+
+  * Twenty-four more patches on top of +p19, same upstream commit
+    (71640275), same smallest-sufficient-divergence numbering; the series
+    is now 0003-0067 (65 patches). The native expert formats get their
+    OpenCL decode and the all-resident pool its fast paths:
+    - patches/0044-0058: the routing trace (0044) and census seed (0046);
+      the native experts' OpenCL decode (0045); the per-expert slot pool
+      size (0047); the pinned NVMe fill and its transport (0048-0049); the
+      IQ2_S format, its packed layout and their decode fixes (0050, 0052,
+      0054, 0055); the fully resident native pool (0051), filled at bind
+      (0058); OpenCL load diagnostics (0053); the dispatch's scale alias and
+      down strides (0056); native blocks accepting compressed value
+      constants (0057).
+    - patches/0059-0062: per-expert dispatch batched, then grouped by
+      expert; several output rows per activation load; no speculative
+      readback on the all-resident pool.
+    - patches/0063-0064: a weight-rounding emulation arm, and IQ2_S-packed
+      gate/up on the matrix unit with exact operands.
+    - patches/0065-0066: the CPU tier decodes a native expert once per
+      call and runs its dots one job per AVX2 lane (same bytes).
+    - patch 0067: decode on the all-resident pool routes on the device (no
+      per-layer top-k readback).
+    Full depth on the A770 (the 35B native packed u8, all-resident): prefill
+    12.5 -> 960 t/s at 4096, decode about 20 -> 28 t/s; the fused
+    (non-native) route is unchanged. See patches/README.md.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Sat, 26 Sep 2026 23:00:00 +0200
+
 marfrit-openvino (2026.4.0~dev20260821+p19-1) bookworm trixie; urgency=medium
 
   * One more patch on top of +p18, same upstream commit (71640275), same
