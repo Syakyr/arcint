@@ -35,9 +35,18 @@ ARG OV_PIN=71640275d29692354223572e77ef717e92b891d9
 ARG OV_PIN_SHORT=71640275d29
 # The version string must parse for ov_parse_ci_build_number: the build-number
 # FIELD stays numeric, the patch level rides in the free-form tail.
-# marfrit-p15 = the deployed level: measured from git (b0ccd47), the +p15
-# deb was built from patches 0003-0033 (31 patches), matching README.md.
-ARG PATCHLEVEL=marfrit-p15
+#
+# WARNING: the marfrit-pN stamp does NOT identify a patch set from 0046 on.
+# The upstream patch README discloses this four times -- "the version stamp
+# stays at marfrit-p19 (disclosed: p19 is also the 0003-0043 stamp, so the
+# 0046 build is identified by its env/parse symbols, not the stamp)". The
+# same p19 string therefore covers 0003-0043, 0003-0049 and beyond. Never
+# tag an image by patch level alone; tag by the arcint tree SHA plus the
+# explicit ceiling carried in CEILING below.
+ARG PATCHLEVEL=marfrit-p19
+# The honest identity: the highest patch actually applied. Carried into the
+# image label so a running container can say what it really contains.
+ARG CEILING=0049
 ARG OV_UPSTREAM=https://github.com/openvinotoolkit/openvino.git
 
 # Shallow fetch of the exact commit (GitHub serves reachable SHAs). If the
@@ -55,14 +64,19 @@ COPY contrib/packaging/marfrit-openvino/patches /opt/patches
 
 # Same gate as build-openvino.sh: a patch that does not apply to the pin is
 # a bug in patches/, not a reason to move the pin.
-# PATCH_MAX: apply only patches numbered up to this. The investigation
-# builds the deployed +p15 set (0003-0033). 0034-0036 came later and were
-# never stamped into a deb; 0037 (+p16 per its commit ae620e3) is TRUNCATED
-# in this repo AND upstream marfrit/arcint — last hunk declares new=82/
-# old=6, the file has 79/4, corrupt at line 436 — and fails the project's
-# own build-openvino.sh identically. Needs re-export by the patch author;
-# bump PATCH_MAX when it lands. (INVESTIGATION.md §5.1/§8.)
-ARG PATCH_MAX=0033
+# PATCH_MAX: apply only patches numbered up to this. Ceiling is 0049, the
+# last commit on the tracked line that declares its own dependency
+# ("Requires marfrit-openvino 2026.4.0~dev20260821+p19, patches 0003-0049").
+# Patches 0050-0066 (IQ2_S-packed, native dispatch, matrix unit) are held
+# back deliberately: measured on the A770 only, and window-054 still
+# carries BLOCKED legs with the failing kernel unnamed.
+#
+# Historical note, kept because it explains the shape of this file: 0037 as
+# published on upstream/main is corrupt -- last hunk declares new=82/old=6,
+# the file carries 78/3, and `git apply` refuses it outright ("corrupt patch
+# at line 436"). That is why this build sat at PATCH_MAX=0033. The author
+# re-exported it on qfndev in ab19b09; this tree carries the fixed blob.
+ARG PATCH_MAX=0049
 RUN cd /opt/ov && shopt -s nullglob && \
     for p in /opt/patches/*.patch; do \
       n=$(basename "$p" | cut -d- -f1); \
@@ -132,8 +146,18 @@ RUN dnf -y --nodocs --setopt=install_weak_deps=False install \
       intel-compute-runtime intel-level-zero oneapi-level-zero ocl-icd \
   && dnf clean all && rm -rf /var/cache/dnf/*
 
-ARG PATCHLEVEL=marfrit-p15
+ARG PATCHLEVEL=marfrit-p19
+ARG CEILING=0049
 ARG OV_PREFIX=/usr/lib/marfrit-openvino
+
+# The stamp is ambiguous by design upstream (p19 covers several patch sets),
+# so the image records the ceiling it was actually built to. `docker inspect`
+# answers "which patch set is this"; the version string alone cannot.
+LABEL org.opencontainers.image.title="marfrit-openvino (patched)" \
+      org.opencontainers.image.source="https://github.com/marfrit/arcint" \
+      ai.arcint.ov.pin="71640275d29692354223572e77ef717e92b891d9" \
+      ai.arcint.ov.patchlevel="${PATCHLEVEL}" \
+      ai.arcint.ov.patchceiling="${CEILING}"
 
 # The wheel's INTERNAL LAYOUT IS LOAD-BEARING (OpenVINOTargets-release.cmake
 # resolves ${_IMPORT_PREFIX}/openvino/libs/<soname>). Copy openvino/ and
