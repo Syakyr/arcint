@@ -10605,7 +10605,11 @@ of it.
       29.8 µs comparand.
     - The patched runtime was not measured isolated on these two shapes, so
       the runtime and patch set remain a variable for them. Only 8192x2048
-      has a patched isolated figure (57.2 µs, above).
+      has a patched isolated figure (57.2 µs, above). [Measured the same
+      evening: the same chain (with the residual) through the C++ runner on
+      the 0067 runtime reads 33.2 µs (4096x2048) and 29.9 µs (2048x4096)
+      device time, with the same geometry. The patch set is not the
+      variable.]
   - **The deterministic attribute in the served graph.**
     - The arm: a measurement-only build drops the attribute under an
       environment switch, `ARCINT_FC_NONDET` (not a patch; the source was
@@ -10641,6 +10645,55 @@ of it.
     range. The pointers were not mapped to their allocations, and the range
     cannot tell host from shared USM. [arithmetic] 15 of 22,810 pointers
     cannot move a per-launch median.
+- [measured-here, A770; the same evening] **A neighbour kernel slows the
+  next FC in isolation.**
+  - The configuration:
+    - stock Python OV (2026.4 dev), an f32 model with
+      `INFERENCE_PRECISION_HINT` f16, u8 group-16 weights with a scalar zero
+      point, M = 1;
+    - 20 pairs of FC(2048->4096) and FC(4096->2048) with the residual;
+    - 20 warm and 50 timed infers, device time from the intercept;
+    - medians over all 2,800 launches of a run, warm infers included.
+  - Before each pair runs one of two arms:
+    - **reduce-over-constant**: a sum-reduction of an R x 2048 f32 constant,
+      its result added to the chain (a `generic` kernel);
+    - **multiply+atomic**: a multiply of an R x 2048 f32 constant by the
+      chain's vector, then a max-reduction that reads the product back.
+      Going by the kernel names, the plugin runs a `generic` kernel and an
+      `atomic` one; this arm reads about twice what it writes.
+
+    | arm, R x 2048 f32 | runs | generic | atomic | FC after it (4096x2048) | next FC (2048x4096) |
+    |---|---|---|---|---|---|
+    | none | 1 | – | – | 32.8 | 29.5 |
+    | reduce, 16 MiB | 1 | 5.0 | – | 31.2 | 30.6 |
+    | reduce, 32 MiB | 2 | 5.0 | – | 31.2 | 30.6–30.7 |
+    | multiply+atomic, 2 MiB | 1 | 7.7 | 5.4 | 31.6 | 30.9 |
+    | multiply+atomic, 8 MiB | 1 | 14.7 | 8.9 | 32.8 | 35.3 |
+    | multiply+atomic, 16 MiB | 3 | 29.1–29.5 | 9.7 | **141.5 / 142.0 / 142.1** | 39.1–39.2 |
+    | multiply+atomic, 32 MiB | 2 | 68.0 | 73.5 | 68.4 / 68.5 | 31.7 |
+
+  - At 16 MiB the FC after the multiply+atomic arm runs 4.3x its time
+    without it ([arithmetic] 142/32.8), in three runs; the next FC rises
+    too.
+  - At 32 MiB the atomic kernel itself is slow (73.5 µs) and the FC less so.
+  - [arithmetic] Either way, about 90–110 µs more than the unperturbed
+    kernels' sum lands on what runs after the multiply. At 16 MiB the
+    atomic is fast, so the time is not only moving between adjacent
+    kernels' timestamps.
+  - The reduce-over-constant arm has no effect at 16 or 32 MiB.
+  - The mechanism is not measured. The two arms differ in bytes written,
+    in bytes read, and in the atomic kernel. 16 MiB is the A770's L2 by
+    Intel's specification (`paper`), but the effect was only located
+    between 8 and 32 MiB.
+  - The slow FC here is 4096x2048. Its 142 µs beside the served 8192x2048
+    input projection's 142.6 is a coincidence across shapes, not a
+    reproduction of that launch.
+  - Which served kernel, if any, leaves such a state is not identified. By
+    the model's config (`code`, 32 value heads, key and value dims of 128)
+    the GDN recurrent state is 524,288 elements: 2 MiB in f32, 1 MiB in
+    f16 (its served precision was not checked). In this arm's geometry an
+    effect appeared only at 16 MiB and above, though 8 MiB already moved the
+    next FC (35.3 against 29.5).
 - Open: what separates a slow served launch from the same oneDNN
   implementation and launch geometry in isolation. Up to 3.7x
   ([arithmetic], the 2048x4096 output projection); 1.9x for 4096x2048.
@@ -10648,10 +10701,11 @@ of it.
   - [measured-here, n = 1] One launch of layer 0's 8192x2048 input
     projection read 45 µs in one step. Its predecessors are the step's input
     copies, reorders, gathers and norm, not another layer's kernels.
-  - Candidates, none measured: the GPU caches, TLB and page placement; the
+  - Candidates, none measured in the served graph: the state the
+    multiply+atomic arm leaves (shown in isolation above; its served source
+    unidentified); the GPU caches, TLB and page placement; the
     memory clock; overlap of launches on the plugin's queue; the kernel
-    binary behind the shared geometry (program hashes were not compared);
-    and, for 2048x4096 and 4096x2048, the patched runtime.
+    binary behind the shared geometry (program hashes were not compared).
   - Tested and not the cause, each at its own scope:
     - dynamic quantisation: off in the served decode (verbose), and flat in
       isolation (8192x2048);
@@ -10662,7 +10716,10 @@ of it.
     - card fill to 12.65 GiB: in isolation, 8192x2048, below the served
       fill;
     - the GT clock: in isolation, 8192x2048;
-    - host-resident arguments: by address range.
+    - host-resident arguments: by address range;
+    - the patched runtime: in isolation, all three shapes (the runner also
+      differed: the patched figures ran through the C++ runner, the stock
+      ones through Python).
 - [Correction 2026-09-26, `code`] Patch 0031's comment says the
   deterministic attribute "pins the k-parallel-local work-group count to
   one". In oneDNN's selector (`kernel_evaluator.cpp`) the attribute scores
