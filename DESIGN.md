@@ -10665,8 +10665,8 @@ of it.
     | arm, R x 2048 f32 | runs | generic | atomic | FC after it (4096x2048) | next FC (2048x4096) |
     |---|---|---|---|---|---|
     | none | 1 | – | – | 32.8 | 29.5 |
-    | reduce, 16 MiB | 1 | 5.0 | – | 31.2 | 30.6 |
-    | reduce, 32 MiB | 2 | 5.0 | – | 31.2 | 30.6–30.7 |
+    | reduce, 16 MiB (folded, see below) | 1 | 5.0 | – | 31.2 | 30.6 |
+    | reduce, 32 MiB (folded, see below) | 2 | 5.0 | – | 31.2 | 30.6–30.7 |
     | multiply+atomic, 2 MiB | 1 | 7.7 | 5.4 | 31.6 | 30.9 |
     | multiply+atomic, 8 MiB | 1 | 14.7 | 8.9 | 32.8 | 35.3 |
     | multiply+atomic, 16 MiB | 3 | 29.1–29.5 | 9.7 | **141.5 / 142.0 / 142.1** | 39.1–39.2 |
@@ -10680,7 +10680,12 @@ of it.
     kernels' sum lands on what runs after the multiply. At 16 MiB the
     atomic is fast, so the time is not only moving between adjacent
     kernels' timestamps.
-  - The reduce-over-constant arm has no effect at 16 or 32 MiB.
+  - The reduce-over-constant arm has no effect at 16 or 32 MiB. [Corrected
+    the same evening: that arm is no read arm. Its kernel took 5.0 µs at 16
+    and at 32 MiB, over 3 TB/s, which the card cannot read. The reduction
+    over a constant was evidently folded at compile time, leaving only the
+    add. The contrast with reading therefore rests on the chain itself: each
+    FC follows one that streamed 8–9 MiB of weights, with no slowdown.]
   - The mechanism is not measured. The two arms differ in bytes written,
     in bytes read, and in the atomic kernel. 16 MiB is the A770's L2 by
     Intel's specification (`paper`), but the effect was only located
