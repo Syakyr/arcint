@@ -1,3 +1,18 @@
+arcint (0.5.0.1-1) trixie; urgency=medium
+
+  * 0.5.0.1: served-performance release on the 0.5.0 line. No 0.5.x dot's
+    acceptance gate closes here; the dots keep their numbers. The native
+    per-expert route of the MoE artifacts, fed by marfrit-openvino +p20
+    (patches 0003-0067), is fast now: the full-depth Qwen3.6-35B-A3B native
+    packed u8 artifact serves all-resident on the 16 GiB card at about
+    960 t/s prefill (4096 tokens) and 28 t/s decode; Flash-Next's hybrid
+    route (ratio 75 + CPU tier) prefills 32k tokens in 36 min. arcint
+    itself: the logits slice finds a serving-shape IR's token axis, and the
+    CPU embedding table is read into host memory at load. The fused int4
+    route and the dense path are unchanged. Runtime floor raised to +p20.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Sun, 27 Sep 2026 09:00:00 +0200
+
 arcint (0.5.0-1) trixie; urgency=medium
 
   * 0.5.0: the MECHANISM release of the Qwen3.8 Flash-Next (qwen4_exp)

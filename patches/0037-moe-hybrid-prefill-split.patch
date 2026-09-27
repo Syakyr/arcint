@@ -47,7 +47,7 @@
 #
 
 diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp
-index b4928d065f..53aaa28e21 100644
+index b4928d065f..834283c417 100644
 --- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp
 +++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_3gemm_swiglu_opt.cpp
 @@ -33,6 +33,7 @@ using ov::intel_gpu::ocl::moe::OffloadExpertWeightProvider;
@@ -193,10 +193,10 @@ index b4928d065f..53aaa28e21 100644
          set_otd_weight_pointers(instance, scratch);
          return true;
      }
-@@ -2102,12 +2154,21 @@ public:
+@@ -2102,11 +2154,20 @@ public:
          std::vector<int32_t> buf(max_topk * max_tokens);
          mem->copy_to(stream, buf.data(), 0, 0, buf.size() * sizeof(int32_t), true);
-
+ 
 +        // arcint (patch 0037). Under the hybrid prefill path, batch_mem_ptr
 +        // may contain sentinel entries (== num_expert) for non-resident
 +        // experts. Skip the exact sentinel; anything else is corruption
@@ -214,8 +214,7 @@ index b4928d065f..53aaa28e21 100644
                      OPENVINO_THROW("expert_no ", expert_no, " exceed max_expert_num ", max_expert_num);
                  }
  
-                 expert_mask.batch[expert_no].push_back(b);
-@@ -2121,7 +2178,7 @@ public:
+@@ -2121,7 +2182,7 @@ public:
              for (int no = 0; no < max_expert_num; no++) {
                  count += static_cast<int>(expert_mask.batch[no].size());
              }
@@ -224,7 +223,7 @@ index b4928d065f..53aaa28e21 100644
                              "With max_expert_num=",
                              max_expert_num,
                              ",max_topk=",
-@@ -2373,11 +2430,15 @@ public:
+@@ -2373,11 +2434,15 @@ public:
          {
              auto topk_count = token_num * static_cast<size_t>(max_topk);
              bool needs_fallback = false;
@@ -241,7 +240,7 @@ index b4928d065f..53aaa28e21 100644
          }
  
          // step 1: generate 4 mask data for following kernel execution
-@@ -2613,6 +2674,14 @@ public:
+@@ -2613,6 +2678,14 @@ public:
                                        true /*instance.needs_completion_event()*/);
          }
  
@@ -256,7 +255,7 @@ index b4928d065f..53aaa28e21 100644
          return ret_event;
      }
  
-@@ -2892,7 +2961,8 @@ public:
+@@ -2892,7 +2965,8 @@ public:
      cldnn::event::ptr exec_prefill_onednn(const std::vector<cldnn::event::ptr>& events,
                                            cldnn::stream& stream,
                                            typed_primitive_inst<moe_3gemm_fused_compressed>& instance,
@@ -266,7 +265,7 @@ index b4928d065f..53aaa28e21 100644
          // The expert-mask subbuffers are created lazily: prepare_internal_buffers
          // skips them below the batched-GEMV threshold, where only the OTD
          // fallback can reach this path.
-@@ -2948,6 +3018,12 @@ public:
+@@ -2948,6 +3022,12 @@ public:
              // relies on.
              const ExpertWeightsSide side = on_load_expert_weights(expert_no, instance, dnn_stream);
  
@@ -279,7 +278,7 @@ index b4928d065f..53aaa28e21 100644
              // expert_mask
              expert_mask_gpu& expert_mask_mem = scratch.expert_masks[expert_no];
              copy_expert_mask_to_gpu(stream, expert_mask, expert_no, expert_mask_mem);
-@@ -3103,6 +3179,9 @@ public:
+@@ -3103,6 +3183,9 @@ public:
          // This is the s32 format expected by dnnl::memory::desc::grouped().
          std::vector<int32_t> grouped_offsets_cpu(num_grouped_experts, 0);
  
@@ -289,7 +288,7 @@ index b4928d065f..53aaa28e21 100644
          if (!build_grouped_mask_otd(stream,
                                      instance,
                                      scratch,
-@@ -3115,7 +3194,8 @@ public:
+@@ -3115,7 +3198,8 @@ public:
                                      experts_id_cpu,
                                      grouped_offsets_cpu,
                                      num_actually_used_experts,
@@ -299,7 +298,7 @@ index b4928d065f..53aaa28e21 100644
              if (_weight_provider->is_offloaded()) {
                  // OTD: unique experts > capacity → explicit fallback to per-expert loop
                  return exec_prefill_onednn(events, stream, instance, scratch);
-@@ -3320,6 +3400,14 @@ public:
+@@ -3320,6 +3404,14 @@ public:
                                        true /*needs_completion_event*/);
          }
  
@@ -315,7 +314,7 @@ index b4928d065f..53aaa28e21 100644
      }
  
 diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_perf.hpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_perf.hpp
-index 5b9cc071b0..e42d547960 100644
+index 5b9cc071b0..50a2ae6900 100644
 --- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_perf.hpp
 +++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/moe/moe_otd_perf.hpp
 @@ -29,6 +29,11 @@ struct OtdPerfCounters {
@@ -343,21 +342,22 @@ index a621660ccd..36a1d78b70 100644
                     // arcint M9 (patches/0004-0006): eviction/acquisition accounting, the
                     // compile-time device/host slot-tier split and its fallback count, and
 diff --git a/src/plugins/intel_gpu/tests/unit/test_cases/moe_3gemm_gpu_test.cpp b/src/plugins/intel_gpu/tests/unit/test_cases/moe_3gemm_gpu_test.cpp
-index 9f9ac16fa0..ac2cdc874d 100644
+index 05dda45c16..ac2cdc874d 100644
 --- a/src/plugins/intel_gpu/tests/unit/test_cases/moe_3gemm_gpu_test.cpp
 +++ b/src/plugins/intel_gpu/tests/unit/test_cases/moe_3gemm_gpu_test.cpp
-@@ -1532,6 +1532,7 @@ INSTANTIATE_TEST_SUITE_P(smoke,
+@@ -1531,6 +1531,8 @@ INSTANTIATE_TEST_SUITE_P(smoke,
+                                            Moe3GemmTestParams{1, false, 128, 256, 4, 2, 64, true},
                                             Moe3GemmTestParams{1, true, 256, 512, 4, 2, 64, true}));
-
-
+ 
++
 +
  // ----- get_expert_mask_from_gpu buffer overflow regression test -----
  // Reproduces the bug where shape predictor flattens topk_id layout [N, top_k] → [N*top_k*1.1]
  // and shape[0] is incorrectly used as token count, causing N*top_k*1.1 * top_k read overflow.
-@@ -1560,6 +1561,82 @@ TEST(moe_expert_mask, get_expert_mask_buffer_overflow) {
+@@ -1559,6 +1561,82 @@ void build_expert_mask_cpu(const int32_t* topk_id_buf, int max_tokens, int max_t
  }
  }  // namespace
-
+ 
 +// ----- arcint (patch 0037). Red-first: get_expert_mask_from_gpu sentinel skip -----
 +// Under the hybrid prefill path, batch_mem_ptr may contain sentinel entries
 +// (expert_no >= max_expert_num) for non-resident experts. Before this patch,
@@ -433,3 +433,7 @@ index 9f9ac16fa0..ac2cdc874d 100644
 +    perf.hybrid_prefill_layers.fetch_add(42, std::memory_order_relaxed);
 +    ASSERT_EQ(perf.hybrid_prefill_layers.load(), 42u);
 +}
++
+ // arcint M14 (patches/0012, §8 T2). The kernel sentinel skip, tested in
+ // isolation from the redirect policy (§2) and the CPU compute tier (§4/§5):
+ // no OTD/LRU provider is involved here at all. The provider is RESIDENT
