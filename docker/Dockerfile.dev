@@ -52,12 +52,22 @@ FROM ${OV_BASE} AS dev
 #   gcc / gcc-c++ / make / cmake / ninja   build arcint and microbenchmarks
 #   git / openssh-clients                  source control, runtime repo clones
 #   binutils / strace / lsof / procps      the card-window debugging set
+#   clinfo                                 verify the GPU userspace actually sees
+#                                         the cards -- the cheap check that the
+#                                         container's level-zero/ocl-icd agrees
+#                                         with the host kernel driver
+#   psmisc (fuser)                         `fuser -v /dev/dri/renderD*` is how
+#                                         you find who else is on the GPU when a
+#                                         measurement looks like a regression
+#   numactl                                record NUMA/NPS topology; a different
+#                                         NPS makes measurements incomparable
 #   gh                                     GitHub CLI (auth via GH_TOKEN at run)
 #   nodejs / npm                           pi agent runtime
 RUN dnf -y --nodocs --setopt=install_weak_deps=False install \
       gcc gcc-c++ make cmake ninja-build \
       git openssh-clients \
       binutils strace lsof procps-ng \
+      clinfo psmisc numactl \
       gh \
       nodejs npm \
       jq file which \
@@ -109,6 +119,9 @@ RUN echo "--- dev image self-check ---" \
       && echo "level-zero userspace present ($(ldconfig -p | grep -oE 'libze_[a-z_]+\.so[0-9.]*' | sort -u | tr '\n' ' '))" \
       || echo "WARN: no libze_loader/libze_intel_gpu in ldconfig cache — GPU dispatch will fail") \
  && (ls /usr/lib64/libze_* /usr/lib/libze_* 2>/dev/null | head -4 || true) \
+ && (command -v clinfo >/dev/null && echo "clinfo available: $(clinfo 2>/dev/null | grep -c 'Device Name' || echo 0) device(s) visible at build time (0 is expected -- no GPU in CI)") \
+ && (command -v fuser >/dev/null && echo "fuser available" || echo "WARN: fuser missing -- cannot check who else holds the GPU") \
+ && (command -v numactl >/dev/null && echo "numactl available" || echo "WARN: numactl missing -- cannot record NUMA/NPS topology") \
  && echo "self-check complete"
 
 CMD ["/bin/bash"]
