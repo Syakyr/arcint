@@ -105,9 +105,10 @@ RUN echo "--- dev image self-check ---" \
  && pi --version \
  && ls "${OV_PREFIX}/openvino/libs/libopenvino.so.2640" >/dev/null \
  && echo "openvino runtime present at ${OV_PREFIX}" \
- && (ldconfig -p | grep -q level_zero \
-      && echo "level-zero userspace present" \
-      || echo "WARN: level-zero not in ldconfig cache — check the tier-1 base") \
+ && (ldconfig -p | grep -qE 'libze_(loader|intel_gpu)' \
+      && echo "level-zero userspace present ($(ldconfig -p | grep -oE 'libze_[a-z_]+\.so[0-9.]*' | sort -u | tr '\n' ' '))" \
+      || echo "WARN: no libze_loader/libze_intel_gpu in ldconfig cache — GPU dispatch will fail") \
+ && (ls /usr/lib64/libze_* /usr/lib/libze_* 2>/dev/null | head -4 || true) \
  && echo "self-check complete"
 
 CMD ["/bin/bash"]

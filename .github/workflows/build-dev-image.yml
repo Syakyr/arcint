@@ -116,6 +116,9 @@ jobs:
             echo "runtime:"
             test -f "${OV_PREFIX}/openvino/libs/libopenvino.so.2640" \
               && echo "  openvino present"
+            ldconfig -p | grep -E 'libze_(loader|intel_gpu)' \
+              && echo "  level-zero userspace present" \
+              || echo "  WARN: no libze_* — GPU dispatch will fail on the B60"
             echo "no-GPU expectation (should report no devices, not crash):"
             clinfo 2>&1 | head -3 || echo "  clinfo: no OpenCL devices (expected in CI)"
             echo "SMOKE OK"
