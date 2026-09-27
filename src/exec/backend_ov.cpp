@@ -31,6 +31,7 @@
 #include <set>
 
 #include <dirent.h>
+#include <fcntl.h>
 #include <unistd.h>
 #include <limits>
 #include <map>
@@ -74,6 +75,7 @@
 #include "exec/gguf_graph.h"
 #include "exec/graph_rewrites.h"
 #include "exec/ngram_ports.h"
+#include "exec/ngram_staging.h"
 #include "exec/ngram_table.h"
 #include "core/gguf_dequant.h"
 #include "exec/kquant_op.h"
@@ -701,6 +703,16 @@ bool slice_logits_to_last_token(const std::shared_ptr<ov::Model>& model,
     return true;
 }
 
+int64_t paged_logits_token_axis(const std::shared_ptr<ov::Model>& model) {
+    const auto node = find_projection_head(model);
+    if (!node) return 0;
+    const ov::PartialShape& ps = node->input_value(0).get_partial_shape();
+    if (ps.rank().is_static() && ps.rank().get_length() == 3 && ps[0].is_static() &&
+        ps[0].get_length() == 1 && ps[1].is_dynamic())
+        return 1;
+    return 0;
+}
+
 bool expose_hidden_state(const std::shared_ptr<ov::Model>& model) {
     auto node = find_projection_head(model);
     if (!node) {
@@ -898,6 +910,7 @@ public:
         pin_dispatch_         = cfg.pin_dispatch;
         moe_cpu_tier_         = cfg.moe_cpu_tier;
         moe_cpu_tier_threads_ = cfg.moe_cpu_tier_threads;
+        moe_per_expert_dispatch_ = cfg.moe_per_expert_dispatch;
         if (cfg.draft_tokens > 0) {
             drafter_     = std::make_unique<NgramDrafter>(static_cast<size_t>(cfg.draft_ngram),
                                                           static_cast<size_t>(cfg.draft_tokens));
@@ -1056,7 +1069,7 @@ public:
 
         log::info("load", "compiling embeddings graph on %s", device.c_str());
         auto t0    = std::chrono::steady_clock::now();
-        embeddings_ = core_.compile_model(artifact.text_embeddings_xml, device);
+        embeddings_ = compile_embeddings(artifact.text_embeddings_xml, device);
         log::info("load", "embeddings ready in %.1f s", seconds_since(t0));
 
         // One lane: the stateful graph has a single internal state, so this
@@ -1099,10 +1112,17 @@ public:
         // Order matters: the head must see every prompt position, so this runs
         // before the slice rewires the LM head's input.
         offload_ratio_ = cfg.offload_ratio;
-        if (offload_ratio_ > 0) {
-            log::info("load", "expert offload at %d%%: the plugin keeps that share of the MoE "
-                              "expert weights off the card and streams them",
-                      offload_ratio_);
+        offload_ratio_set_ = cfg.offload_ratio_set;
+        expert_format_ = artifact.expert_format;
+        if (offload_active()) {
+            if (offload_ratio_ > 0)
+                log::info("load", "expert offload at %d%%: the plugin keeps that share of the MoE "
+                                  "expert weights off the card and streams them",
+                          offload_ratio_);
+            else
+                log::info("load", "all-resident native expert pool (--offload-ratio 0): every "
+                          "expert stays in the device slots, read through the offload provider's "
+                          "native reader");
             // Measured 2026-09-01 (DESIGN 7.0.2s): the OTD slot buffers commit
             // physical memory lazily, so the residency this reservation reads
             // at load excludes them, and the max-ctx it derives is optimistic
@@ -1177,7 +1197,7 @@ public:
             ov::AnyMap cfg;
             cfg[ov::cache_mode.name()]   = ov::CacheMode::OPTIMIZE_SIZE;
             cfg[ov::weights_path.name()] = artifact.language_model_bin;
-            if (offload_ratio_ > 0) cfg["OFFLOAD_RATIO"] = offload_ratio_;
+            if (offload_active()) cfg["OFFLOAD_RATIO"] = offload_ratio_;
             if (std::getenv("ARCINT_PROFILE") != nullptr) cfg[ov::enable_profiling.name()] = true;
 
             // Was there anything to import, or is this the run that writes the
@@ -1218,7 +1238,7 @@ public:
             auto t_cold  = std::chrono::steady_clock::now();
             ov::AnyMap props;
             if (std::getenv("ARCINT_PROFILE") != nullptr) props[ov::enable_profiling.name()] = true;
-            if (offload_ratio_ > 0) {
+            if (offload_active()) {
                 // Expert offload needs the weights on disk to stream from: the
                 // plugin loads them on demand rather than keeping them resident.
                 props["OFFLOAD_RATIO"]        = offload_ratio_;
@@ -2684,11 +2704,15 @@ private:
         if (cfg.slice_logits) {
             const int64_t keep = static_cast<int64_t>(1 + drafts_max_);
             // Token axis 0: the paged export's hidden state is [tokens, 1, hidden].
-            // Stated here, verified below by the probe's first forward.
-            if (slice_logits_to_last_token(model, keep, 0)) {
+            // A serving-shape IR keeps [1, tokens, hidden] (axis 1; until
+            // 2026-09-26 it refused here and ran under --no-logits-slice, a
+            // [M, vocab] f32 copy per prefill chunk). Stated from the head's
+            // declared shape, verified below by the probe's first forward.
+            const int64_t token_axis = paged_logits_token_axis(model);
+            if (slice_logits_to_last_token(model, keep, token_axis)) {
                 logits_keep_rows_ = static_cast<size_t>(keep);
-                log::info("load", "logits sliced to the last %lld row(s)",
-                          static_cast<long long>(keep));
+                log::info("load", "logits sliced to the last %lld row(s) on token axis %lld",
+                          static_cast<long long>(keep), static_cast<long long>(token_axis));
             } else {
                 log::warn("load", "%s", "logits NOT sliced: every prefill chunk will "
                                         "compute and copy [M, vocab] logits");
@@ -2708,6 +2732,8 @@ private:
         }
 
         offload_ratio_ = cfg.offload_ratio;
+        offload_ratio_set_ = cfg.offload_ratio_set;
+        expert_format_ = artifact_.expert_format;
         ov::AnyMap props;
         // u8 KV is the default, by §7.0.3's protocol run to completion on the
         // C++ endpoint (2026-08-29): 10/10 on the harness at base depth AND at
@@ -2925,7 +2951,7 @@ private:
         } else if (std::getenv("ARCINT_DYN_QUANT_GROUP") != nullptr) {
             log::warn("load", "ARCINT_DYN_QUANT_GROUP is set but dynamic quantization is off (--dyn-quant on turns it on): ignored");
         }
-        if (offload_ratio_ > 0) {
+        if (offload_active()) {
             props["OFFLOAD_RATIO"]        = offload_ratio_;
             props[ov::weights_path.name()] = artifact_.language_model_bin;
             // Experiment knob, ARCINT_FIT_SLOT_BYTES-style: forwards a device
@@ -3007,6 +3033,10 @@ private:
                 log::info("load", "MoE host compute tier enabled (threads=%s)",
                           moe_cpu_tier_threads_ > 0 ? std::to_string(moe_cpu_tier_threads_).c_str() : "auto");
             }
+            if (moe_per_expert_dispatch_) {
+                props["MOE_PER_EXPERT_DISPATCH"] = true;
+                log::info("load", "per-expert GPU kernel dispatch enabled");
+            }
         }
         // The blob cache is off for the paged graph: its import path is
         // unproven and the #37607 class is exactly the kind of thing it would
@@ -3074,7 +3104,7 @@ private:
             lanes_.back()->req   = paged_model_.create_infer_request();
         }
 
-        embeddings_ = core_.compile_model(artifact_.text_embeddings_xml, emb_dev);
+        embeddings_ = compile_embeddings(artifact_.text_embeddings_xml, emb_dev);
         for (auto& lane : lanes_) lane->embed = embeddings_.create_infer_request();
         log::info("load", "embeddings on %s", emb_dev.c_str());
 
@@ -3637,7 +3667,7 @@ private:
         bool        probe_priced_device = false;  // the plateau probe ran and set slot_pool
         uint64_t    slot_host_bytes   = 0;  // host (GTT) estimate -- informational only
         std::string slot_host_source;       // "ir" | "config"
-        if (offload_ratio_ > 0) {
+        if (offload_active()) {
             // §4 "the on-card red case": forces the DEVICE term for an A/B
             // against the exact bug M7 removes. Checked first and, when
             // valid, short-circuits the rest of Phase B entirely -- no
@@ -5780,7 +5810,7 @@ private:
         // fit ledger hitting: when probes ran, their forwards already filled
         // the slots as a side effect; the pre-warm is for the case where
         // probes were skipped.
-        if (offload_ratio_ > 0 && ledger_hit) {
+        if (offload_active() && ledger_hit) {
             Lane& pw_lane = *lanes_[0];
             const size_t pw_tokens = std::min<size_t>(
                 128, static_cast<size_t>(std::max(prefill_chunk_, 1)));
@@ -6205,6 +6235,23 @@ private:
 
     // Embeddings as a host [n, hidden] f32 tensor (the paged graph's input
     // layout, and the head's food -- it crosses host memory either way).
+    // The embeddings model, compiled for `device`; on a CPU device its table is
+    // read into host memory rather than mapped (fit.h,
+    // embeddings_read_into_host_memory: first-use faults, DESIGN §7.0.2cl).
+    ov::CompiledModel compile_embeddings(const std::string& xml, const std::string& device) {
+        if (!embeddings_read_into_host_memory(device)) return core_.compile_model(xml, device);
+        const auto t0 = std::chrono::steady_clock::now();
+        auto model = core_.read_model(xml, std::string(), ov::AnyMap{ov::enable_mmap(false)});
+        log::info("load", "embeddings table read into host memory for %s in %.1f s (not mapped)",
+                  device.c_str(), seconds_since(t0));
+        // No model cache for this compile: the stateful load still has the
+        // core's cache_dir set here, and a cached compile of an in-memory model
+        // hashes the whole table for its key and writes a blob the size of the
+        // table (1 GiB), to import next time instead of this read. An empty
+        // per-call cache_dir turns caching off for this call only.
+        return core_.compile_model(model, device, ov::AnyMap{ov::cache_dir("")});
+    }
+
     ov::Tensor embed_paged(Lane& lane, const std::vector<int>& ids) {
         const size_t n = ids.size();
         lane.last_ids = ids;             // the n-gram feed reads them in paged_forward
@@ -7835,9 +7882,20 @@ private:
     ov::Tensor                     last_hidden_;    // the base model's, this step
     ov::Tensor                     hidden_copy_;    // owned; last_hidden_ points here
     int                            offload_ratio_ = 0;
+    bool                           offload_ratio_set_ = false;  // --offload-ratio given (incl. 0)
+    std::string                    expert_format_;              // artifact's expert_fill.format
+    // Offload machinery is active when the ratio is > 0, OR when an explicit
+    // 0 was given for a NATIVE artifact: there the offload provider owns the
+    // only native reader, so the all-resident pool rides it (plugin patch
+    // 0051). An affine artifact at an explicit 0 stays on the direct resident
+    // Constants -- offload_active() is false, exactly as before.
+    bool offload_active() const {
+        return moe_offload_active(offload_ratio_, offload_ratio_set_, expert_format_);
+    }
     int                            pin_dispatch_ = -1;  // --pin-dispatch; -1 = off
     bool                           moe_cpu_tier_ = false;         // --moe-cpu-tier
     int                            moe_cpu_tier_threads_ = 0;     // --moe-cpu-tier-threads
+    bool                           moe_per_expert_dispatch_ = false; // --moe-per-expert-dispatch
     // --- lanes (§4.1). One per --parallel slot; the stateful reference path
     // uses lane 0 for its embeddings and MTP requests and serialises on
     // mutex_, because it has one graph state and cannot do better.
@@ -8057,6 +8115,16 @@ private:
     // constants are derived once for the IR's PLE layer.
     ngram::PortPlan                 ngram_ports_;
     std::vector<ov::RemoteTensor>   ngram_table_tensors_;
+    // STAGING (campaign `ple-disk-backend`): when the IR's single `ngram_table`
+    // port is SMALLER than the source tensor, it is a per-forward staging
+    // WINDOW, not the pinned table. The table then stays on disk: the port
+    // holds only the rows one forward names, filled by `pread` in
+    // `feed_ngram_ports`, and the 26.82 GiB USM-host copy never happens.
+    bool                          ngram_staging_active_ = false;
+    ngram::StagingGeometry        ngram_staging_geom_{};
+    int                           ngram_staging_fd_     = -1;
+    uint64_t                      ngram_staging_base_   = 0;
+    ov::RemoteTensor              ngram_staging_tensor_;
     std::optional<ngram::HashParams> ngram_hash_;
 
     // Bind the table to the ports, once, after the lanes exist. The source
@@ -8086,6 +8154,15 @@ private:
                     "(a served hybrid carries no n-gram table; the flag is for the serving-shape IR)",
                     gguf_path_.c_str()));
             }
+            // A no-PLE family (qwen3_5_moe) declares no table and no port: that
+            // pair is consistent and the binding stays inert. A config that
+            // DOES declare a table while the IR declares no port is not -- the
+            // PLE would be silently absent -- and is refused by name here,
+            // where before this check it loaded, holding a table nothing read.
+            const std::string declared = ngram::check_declared_table(
+                artifact_.ngram_config.ngram_size, artifact_.ngram_config.ple_embed_dim,
+                ngram_ports_);
+            if (!declared.empty()) throw std::runtime_error(declared);
             return;
         }
 
@@ -8101,8 +8178,39 @@ private:
             throw std::runtime_error(log::format("%s: no %s tensor to bind the ngram_table ports from",
                                                  gguf_path_.c_str(), ngram::kTableTensor));
         }
-        const std::string why = ngram::check_table_source(*t, gguf_file_->bytes(*t), ngram_ports_);
-        if (!why.empty()) throw std::runtime_error("ngram table source refused: " + why);
+        // STAGING (campaign `ple-disk-backend`): ONE port whose row count is
+        // BELOW the source's is a per-forward staging WINDOW, not the pinned
+        // table. The table stays on disk then -- only the rows a forward names
+        // are read -- and the full-table copy below never happens.
+        const bool staging = ngram_ports_.chunks.size() == 1 && t->dims.size() == 2 &&
+                             ngram_ports_.total_rows < static_cast<size_t>(t->dims[1]);
+        if (staging) {
+            ngram_staging_geom_.staging_rows = ngram_ports_.total_rows;
+            ngram_staging_geom_.row_bytes    = ngram_ports_.row_bytes;
+            ngram_staging_geom_.table_rows   = static_cast<uint64_t>(t->dims[1]);
+            const std::string why = ngram::check_staging_geometry(
+                *t, gguf_file_->bytes(*t), ngram_staging_geom_);
+            if (!why.empty())
+                throw std::runtime_error("ngram staging source refused: " + why);
+            ngram_staging_fd_ = ::open(gguf_path_.c_str(), O_RDONLY);
+            if (ngram_staging_fd_ < 0)
+                throw std::runtime_error(log::format(
+                    "ngram staging: cannot open %s for the per-forward row reads",
+                    gguf_path_.c_str()));
+            ngram_staging_base_ = static_cast<uint64_t>(gguf_file_->data_offset()) +
+                                  static_cast<uint64_t>(t->offset);
+            const ov::Shape sh{ngram_staging_geom_.staging_rows,
+                               ngram_staging_geom_.row_bytes};
+            ngram_staging_tensor_ = rctx.create_tensor(
+                ov::element::u8, sh,
+                {{ov::intel_gpu::shared_mem_type.name(), ov::intel_gpu::SharedMemType::USM_HOST_BUFFER}});
+            for (auto& lane : lanes_)
+                lane->req.set_tensor(ngram_ports_.chunks[0].name, ngram_staging_tensor_);
+            ngram_staging_active_ = true;
+        } else {
+            const std::string why = ngram::check_table_source(*t, gguf_file_->bytes(*t), ngram_ports_);
+            if (!why.empty()) throw std::runtime_error("ngram table source refused: " + why);
+        }
         if (device.rfind("GPU", 0) != 0) {
             throw std::runtime_error(log::format(
                 "the ngram_table ports need USM host memory to bind %zu rows x %zu B without a "
@@ -8137,27 +8245,40 @@ private:
         hp.validate();
         ngram_hash_ = std::move(hp);
 
-        const auto     t0   = std::chrono::steady_clock::now();
-        const uint8_t* base = gguf_file_->data(*t);
-        size_t         off  = 0;
-        for (const auto& chunk : ngram_ports_.chunks) {
-            const ov::Shape sh{chunk.rows, ngram_ports_.row_bytes};
-            ov::RemoteTensor rt = rctx.create_tensor(
-                ov::element::u8, sh,
-                {{ov::intel_gpu::shared_mem_type.name(), ov::intel_gpu::SharedMemType::USM_HOST_BUFFER}});
-            void* dst = rt.get_params().at(ov::intel_gpu::mem_handle.name()).as<void*>();
-            std::memcpy(dst, base + off, chunk.rows * ngram_ports_.row_bytes);
-            off += chunk.rows * ngram_ports_.row_bytes;
-            for (auto& lane : lanes_) lane->req.set_tensor(chunk.name, rt);
-            ngram_table_tensors_.push_back(std::move(rt));
+        if (ngram_staging_active_) {
+            log::info("load",
+                      "ngram table STAGED: %zu port(s) of %zu rows x %zu B = %.3f MiB of USM host "
+                      "staging from %s (the %llu-row table stays on disk, read per forward); "
+                      "id ports %s, conv_mask %s; hash ordinal 0",
+                      ngram_ports_.chunks.size(), ngram_ports_.total_rows, ngram_ports_.row_bytes,
+                      static_cast<double>(ngram_ports_.total_rows * ngram_ports_.row_bytes) / (1u << 20),
+                      ngram::kTableTensor,
+                      static_cast<unsigned long long>(ngram_staging_geom_.table_rows),
+                      ngram_ports_.declares_ids ? "declared" : "absent",
+                      ngram_ports_.declares_conv_mask ? "declared" : "absent");
+        } else {
+            const auto     t0   = std::chrono::steady_clock::now();
+            const uint8_t* base = gguf_file_->data(*t);
+            size_t         off  = 0;
+            for (const auto& chunk : ngram_ports_.chunks) {
+                const ov::Shape sh{chunk.rows, ngram_ports_.row_bytes};
+                ov::RemoteTensor rt = rctx.create_tensor(
+                    ov::element::u8, sh,
+                    {{ov::intel_gpu::shared_mem_type.name(), ov::intel_gpu::SharedMemType::USM_HOST_BUFFER}});
+                void* dst = rt.get_params().at(ov::intel_gpu::mem_handle.name()).as<void*>();
+                std::memcpy(dst, base + off, chunk.rows * ngram_ports_.row_bytes);
+                off += chunk.rows * ngram_ports_.row_bytes;
+                for (auto& lane : lanes_) lane->req.set_tensor(chunk.name, rt);
+                ngram_table_tensors_.push_back(std::move(rt));
+            }
+            log::info("load",
+                      "ngram table bound: %zu port(s), %zu rows x %zu B = %.2f GiB of USM host memory "
+                      "from %s in %.1f s; id ports %s, conv_mask %s; hash ordinal 0",
+                      ngram_ports_.chunks.size(), ngram_ports_.total_rows, ngram_ports_.row_bytes,
+                      static_cast<double>(off) / (1u << 30), ngram::kTableTensor, seconds_since(t0),
+                      ngram_ports_.declares_ids ? "declared" : "absent",
+                      ngram_ports_.declares_conv_mask ? "declared" : "absent");
         }
-        log::info("load",
-                  "ngram table bound: %zu port(s), %zu rows x %zu B = %.2f GiB of USM host memory "
-                  "from %s in %.1f s; id ports %s, conv_mask %s; hash ordinal 0",
-                  ngram_ports_.chunks.size(), ngram_ports_.total_rows, ngram_ports_.row_bytes,
-                  static_cast<double>(off) / (1u << 30), ngram::kTableTensor, seconds_since(t0),
-                  ngram_ports_.declares_ids ? "declared" : "absent",
-                  ngram_ports_.declares_conv_mask ? "declared" : "absent");
     }
 
     // The per-forward feeds the ports need: the hashed rows of this chunk's
@@ -8166,6 +8287,18 @@ private:
     // context is eos for a forward at position 0 and the last ngram_size-1
     // tokens fed otherwise. Cheap: T x 16 ids, no table access here.
     void feed_ngram_ports(Lane& lane, size_t past, size_t n) {
+        // conv_mask is NOT part of the n-gram table: it is the GDN/attention
+        // padding mask, and a no-PLE serving-shape IR (qwen3_5_moe) declares it
+        // while declaring NO ngram_table.K port at all. Feed it whenever the
+        // graph declares it, BEFORE the table early return -- the first form
+        // returned on `ngram_ports_.empty()` and left conv_mask unset on
+        // exactly this family, so a no-PLE graph reached its forward with a
+        // required input never written.
+        if (ngram_ports_.declares_conv_mask) {
+            ov::Tensor m(ov::element::f32, ov::Shape{1, n});
+            std::fill_n(m.data<float>(), n, 1.0f);
+            lane.req.set_tensor(ngram::kConvMaskPort, m);
+        }
         if (ngram_ports_.empty()) return;
         if (lane.last_ids.size() != n) {
             throw std::runtime_error(log::format(
@@ -8183,7 +8316,18 @@ private:
         const std::vector<int64_t> global = ngram::row_ids(*ngram_hash_, lane.ngram_ctx, tokens);
         std::vector<int32_t> chunk;
         std::vector<int64_t> local;
-        ngram::split_by_partition(global, ngram_ports_, chunk, local);
+        if (ngram_staging_active_) {
+            // one staging port: fill it with exactly the rows this forward
+            // names, then index it by the slot the plan assigned (local[i] = i)
+            void* dst =
+                ngram_staging_tensor_.get_params().at(ov::intel_gpu::mem_handle.name()).as<void*>();
+            local = ngram::stage_from_file(ngram_staging_fd_, ngram_staging_base_,
+                                           ngram_staging_geom_.row_bytes, global,
+                                           ngram_staging_geom_, static_cast<uint8_t*>(dst));
+            chunk.assign(local.size(), 0);
+        } else {
+            ngram::split_by_partition(global, ngram_ports_, chunk, local);
+        }
         const size_t heads = static_cast<size_t>(ngram_hash_->num_ngram_heads());
         if (ngram_ports_.declares_ids) {
             ov::Tensor ct(ov::element::i32, ov::Shape{1, n, heads});
@@ -8192,11 +8336,6 @@ private:
             std::memcpy(lt.data(), local.data(), local.size() * sizeof(int64_t));
             lane.req.set_tensor(ngram::kChunkIdsPort, ct);
             lane.req.set_tensor(ngram::kLocalIdsPort, lt);
-        }
-        if (ngram_ports_.declares_conv_mask) {
-            ov::Tensor m(ov::element::f32, ov::Shape{1, n});
-            std::fill_n(m.data<float>(), n, 1.0f);
-            lane.req.set_tensor(ngram::kConvMaskPort, m);
         }
         // carry the context: the last ctx_len of (context ++ tokens)
         std::vector<int64_t> packed(lane.ngram_ctx);

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(arcint VERSION 0.5.0 LANGUAGES CXX)
+project(arcint VERSION 0.5.0.1 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -229,11 +229,13 @@ if(ARCINT_TESTS)
     tests/test_ngram_row_ids.cpp
     tests/test_ngram_lookup.cpp
     tests/test_ngram_ports.cpp
+    tests/test_ngram_staging.cpp
     tests/test_decode_stats.cpp
     tests/test_profile_cycle.cpp
     tests/test_rope_precision.cpp
     tests/test_segments.cpp
     tests/test_segment_runtime.cpp
+    tests/test_pinned_nvme_fill.cpp
   )
   target_link_libraries(arcint-test PRIVATE arcint_core)
   target_include_directories(arcint-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/tests")
@@ -246,11 +248,15 @@ if(ARCINT_TESTS)
   # --allow-skip <case> (tests/harness.h's SKIP_UNLESS). Local, filtered runs
   # (`./build/arcint-test some_filter`) are unaffected; this only binds ctest's
   # own invocation.
-  # gguf_real_file_spot_check (docs/design-gguf-native.md stage 0) is the one
-  # named exception: it only runs with ARCINT_GGUF_REAL=<path> set to a real
-  # GGUF file not shipped with the repo, so it skips in every default build.
+  # gguf_real_file_spot_check (docs/design-gguf-native.md stage 0) and
+  # gguf_iq_decoders_match_gguf_py_on_the_real_shard are the named exceptions:
+  # both run only with ARCINT_GGUF_REAL=<path> set to a real GGUF file not
+  # shipped with the repo, so they skip in every default build. (The second
+  # was added without its name here, so `ctest -L unit` failed in every build
+  # without the shard -- found by the 0.5.0.1 acceptance's sanitizer cell.)
   add_test(NAME unit COMMAND arcint-test --max-skips 0
-           --allow-skip gguf_real_file_spot_check)
+           --allow-skip gguf_real_file_spot_check
+           --allow-skip gguf_iq_decoders_match_gguf_py_on_the_real_shard)
   set_tests_properties(unit PROPERTIES LABELS unit)
 
   add_test(NAME roundtrip
