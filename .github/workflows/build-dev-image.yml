@@ -102,6 +102,11 @@ jobs:
       # the agent CLI and the OpenVINO userspace are present and loadable — i.e.
       # that the image is usable, not that a card works. Card verification happens
       # on the B60 host via dev-run.sh --check.
+      # NOTE ON QUOTING: this whole block is passed to `bash -c '...'`, so a
+      # single quote anywhere inside it terminates the outer quoting early and the
+      # remainder is parsed unquoted. Use double quotes for any pattern inside.
+      # (A single-quoted grep -E 'libze_(loader|intel_gpu)' here caused a
+      # "syntax error near unexpected token `('" -- run 36327634121.)
       - name: Smoke test the dev image
         run: |
           IMG=${{ env.REGISTRY }}/${{ needs.ns.outputs.owner }}/${{ env.IMAGE }}:dev-${{ github.sha }}
@@ -116,9 +121,9 @@ jobs:
             echo "runtime:"
             test -f "${OV_PREFIX}/openvino/libs/libopenvino.so.2640" \
               && echo "  openvino present"
-            ldconfig -p | grep -E 'libze_(loader|intel_gpu)' \
+            ldconfig -p | grep -E "libze_(loader|intel_gpu)" \
               && echo "  level-zero userspace present" \
-              || echo "  WARN: no libze_* — GPU dispatch will fail on the B60"
+              || echo "  WARN: no libze_loader/libze_intel_gpu — GPU dispatch will fail on the B60"
             echo "no-GPU expectation (should report no devices, not crash):"
             clinfo 2>&1 | head -3 || echo "  clinfo: no OpenCL devices (expected in CI)"
             echo "SMOKE OK"
