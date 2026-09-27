@@ -1,0 +1,137 @@
+# Build the arcint DEV image for the dual-B60 host-tier experiment.
+#
+# This workflow requires NO SECRETS beyond the built-in GITHUB_TOKEN needed to
+# push to GHCR. That is the whole point of the design: because no credential is
+# consumed at build time, nothing credential-shaped can end up in an image layer,
+# and the build is safe to run unattended on a public runner.
+#
+# Secrets (gitAmadeus deploy key, model artifacts, API keys) arrive at RUNTIME:
+# the SSH key is bind-mounted read-only and the API keys are passed as env vars.
+# See docker/dev-run.sh and the wiki page [[Dual-B60-Dev-Setup]].
+#
+# Images produced:
+#   ghcr.io/<owner>/arcint-dev:dev-<sha>    immutable, per-commit
+#   ghcr.io/<owner>/arcint-dev:dev          moving channel
+#
+# RETENTION WARNING: this image is built on the tier-1 OpenVINO base and is large.
+# A per-commit tag on every push accumulates hundreds of GB in GHCR quickly.
+# Set a package retention/cleanup policy in the GHCR package settings from day
+# one, or trim the trigger to workflow_dispatch only if it gets out of hand.
+
+name: Build arcint dev image
+
+"on":
+  workflow_dispatch:
+    inputs:
+      ov_base:
+        description: 'tier-1 base image to build the dev image FROM'
+        required: false
+        default: ghcr.io/syakyr/arcint-ov:2026.4.0-ov71640275d29-ceiling0067
+  push:
+    branches:
+      - exp/dual-b60-host-tier
+    paths:
+      - 'docker/Dockerfile.dev'
+      - '.github/workflows/build-dev-image.yml'
+      - '.dockerignore'
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE: arcint-dev
+
+jobs:
+  ns:
+    runs-on: ubuntu-latest
+    outputs:
+      owner: ${{ steps.ns.outputs.owner }}
+      ov_base: ${{ steps.ns.outputs.ov_base }}
+    steps:
+      - id: ns
+        run: |
+          echo "owner=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
+          # workflow_dispatch can override the base; a push event cannot, so fall
+          # back to the ceiling0067 tier-1 that the parity branch produces.
+          B='${{ github.event.inputs.ov_base }}'
+          [ -z "$B" ] && B="ghcr.io/syakyr/arcint-ov:2026.4.0-ov71640275d29-ceiling0067"
+          echo "ov_base=$B" | tee -a "$GITHUB_STEP_SUMMARY" >> "$GITHUB_OUTPUT"
+
+  build-dev:
+    needs: ns
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      # No secrets: argument. If a future change is tempted to add
+      #   secrets: [...]  or  --build-arg SSH_PRIVATE_KEY=...
+      # stop and re-read the header of docker/Dockerfile.dev first.
+      - name: Build dev image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.dev
+          build-args: |
+            OV_BASE=${{ needs.ns.outputs.ov_base }}
+          tags: |
+            ${{ env.REGISTRY }}/${{ needs.ns.outputs.owner }}/${{ env.IMAGE }}:dev-${{ github.sha }}
+          push: true
+          cache-from: type=gha,scope=arcint-dev
+          cache-to: type=gha,scope=arcint-dev,mode=max
+
+      - name: Publish the moving channel tag
+        run: |
+          IMG=${{ env.REGISTRY }}/${{ needs.ns.outputs.owner }}/${{ env.IMAGE }}
+          docker pull "$IMG:dev-${{ github.sha }}"
+          docker tag  "$IMG:dev-${{ github.sha }}" "$IMG:dev"
+          docker push "$IMG:dev"
+
+      # Post-build smoke. There is no GPU on a GitHub runner, so device
+      # enumeration is EXPECTED to find nothing. This checks that the toolchain,
+      # the agent CLI and the OpenVINO userspace are present and loadable — i.e.
+      # that the image is usable, not that a card works. Card verification happens
+      # on the B60 host via dev-run.sh --check.
+      - name: Smoke test the dev image
+        run: |
+          IMG=${{ env.REGISTRY }}/${{ needs.ns.outputs.owner }}/${{ env.IMAGE }}:dev-${{ github.sha }}
+          docker run --rm --entrypoint bash "$IMG" -c '
+            set -e
+            echo "toolchain:"
+            gcc --version  | head -1
+            cmake --version | head -1
+            gh --version   | head -1
+            node --version
+            pi --version
+            echo "runtime:"
+            test -f "${OV_PREFIX}/openvino/libs/libopenvino.so.2640" \
+              && echo "  openvino present"
+            echo "no-GPU expectation (should report no devices, not crash):"
+            clinfo 2>&1 | head -3 || echo "  clinfo: no OpenCL devices (expected in CI)"
+            echo "SMOKE OK"
+          '
+
+      - name: Record what was built
+        run: |
+          IMG=${{ env.REGISTRY }}/${{ needs.ns.outputs.owner }}/${{ env.IMAGE }}
+          {
+            echo "## arcint-dev built"
+            echo ""
+            echo "- base: \`$OV_BASE\`"
+            echo "- immutable: \`$IMG:dev-${{ github.sha }}\`"
+            echo "- channel: \`$IMG:dev\`"
+            echo ""
+            echo "Pull and run with \`docker/dev-run.sh\` on the B60 host."
+          } >> "$GITHUB_STEP_SUMMARY"
+        env:
+          OV_BASE: ${{ needs.ns.outputs.ov_base }}

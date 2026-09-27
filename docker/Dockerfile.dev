@@ -1,0 +1,113 @@
+# syntax=docker/dockerfile:1
+# ---------------------------------------------------------------------------
+# Dev image for the dual-B60 host-tier experiment.
+#
+# WHAT THIS IS: a pull-and-run development environment. It contains the tier-1
+# patched-OpenVINO runtime, a full C/C++ toolchain, the GitHub CLI, and the pi
+# agent CLI — everything needed to compile, run and iterate on arcint against a
+# local Arc B60 without setting any of it up by hand.
+#
+# WHAT THIS IS NOT, and this is deliberate and load-bearing:
+#
+#   * NO SECRETS. No SSH keys, no API tokens, no .env files. Nothing in this
+#     file takes a credential as a build ARG or COPYs one in. Docker layers are
+#     permanent: a secret added at build time stays recoverable from the layer
+#     store forever, even if a later RUN deletes it. Anyone who can pull this
+#     image would hold the credential.
+#
+#     Credentials arrive at RUNTIME instead — the SSH key is bind-mounted read-
+#     only and the API keys are passed as environment variables. See
+#     docker/dev-run.sh and the wiki page [[Dual-B60-Dev-Setup]].
+#
+#   * NO PI EXTENSIONS. The operator's pi-audit protocol gates `pi install`,
+#     `pi -e` and `pi update` on APPROVED pinned refs with a recorded
+#     snapshotSha256. Baking extensions into an image sidesteps that entirely
+#     and produces a running agent whose extension set nobody approved and
+#     cannot be verified against the registry. `~/.pi` is bind-mounted instead,
+#     so the audited state and the audit trail both stay intact.
+#
+#   * NO MODEL WEIGHTS. Tens of GB per artifact: slow pulls, registry size
+#     limits, and a forced re-pull on every rebuild. Bind-mounted at runtime.
+#
+# Build: CI only (.github/workflows/build-dev-image.yml). It needs no secrets,
+# which is the point — the whole build is safe to run unattended.
+# ---------------------------------------------------------------------------
+
+# The tier-1 base: patched OpenVINO at ceiling 0067 (+p20), carrying the Intel
+# GPU userspace stack (intel-compute-runtime, intel-level-zero, oneapi-level-zero,
+# ocl-icd) that every card measurement depends on.
+#
+# PREFER PINNING BY DIGEST over the tag. A tag can be re-pointed by a later
+# tier-1 rebuild; a digest cannot. If you are bisecting a regression, a floating
+# base makes it undiagnosable. Find the digest with:
+#   docker buildx imagetools inspect \
+#     ghcr.io/syakyr/arcint-ov:2026.4.0-ov71640275d29-ceiling0067
+ARG OV_BASE=ghcr.io/syakyr/arcint-ov:2026.4.0-ov71640275d29-ceiling0067
+
+FROM ${OV_BASE} AS dev
+
+# The tier-1 runtime stage deliberately ships no compiler. Everything below is
+# additive; nothing in the runtime stack is touched or replaced.
+#
+#   gcc / gcc-c++ / make / cmake / ninja   build arcint and microbenchmarks
+#   git / openssh-clients                  source control, runtime repo clones
+#   binutils / strace / lsof / procps      the card-window debugging set
+#   gh                                     GitHub CLI (auth via GH_TOKEN at run)
+#   nodejs / npm                           pi agent runtime
+RUN dnf -y --nodocs --setopt=install_weak_deps=False install \
+      gcc gcc-c++ make cmake ninja-build \
+      git openssh-clients \
+      binutils strace lsof procps-ng \
+      gh \
+      nodejs npm \
+      jq file which \
+  && dnf clean all && rm -rf /var/cache/dnf/*
+
+# Assert the Node version rather than trusting the distro. pi requires >= 22.19.0;
+# a distro nodejs that is too old fails here, loudly, at build time — not three
+# weeks later as an inexplicable runtime error.
+RUN node --version \
+ && node -e 'const [maj,min]=process.versions.node.split(".").map(Number); \
+      if (maj < 22 || (maj === 22 && min < 19)) { \
+        console.error("FATAL: pi requires Node >= 22.19.0, this image has " + process.versions.node); \
+        process.exit(1); \
+      } \
+      console.log("node " + process.versions.node + " satisfies pi (>= 22.19.0)");'
+
+# The pi CLI only — NOT extensions (see the header). Pinned so the image is
+# reproducible and an upstream release cannot silently change the agent under us.
+ARG PI_VERSION=0.85.1
+RUN npm install -g "@earendil-works/pi-coding-agent@${PI_VERSION}" \
+ && pi --version
+
+# git inside a container against a bind-mounted repo owned by a host uid otherwise
+# refuses to operate ("dubious ownership"). Mark the work tree safe so the agent
+# can run git without the operator hand-editing config every session.
+RUN git config --global --add safe.directory '*' \
+ && git config --global --add safe.directory /work/arcint
+
+# The OV runtime lives here in the base image; RPATH already resolves it, but the
+# dev loop wants the path handy for CMake and for ldd checks.
+ENV OV_PREFIX=/usr/lib/marfrit-openvino \
+    WORKDIR=/work
+
+WORKDIR /work
+
+# Build-time self-check. Catches a broken base or a missing userspace component
+# before the image is ever pulled onto the card box. There is no GPU in CI, so
+# device enumeration is EXPECTED to find nothing here — this checks that the
+# libraries exist and load, not that a device is present.
+RUN echo "--- dev image self-check ---" \
+ && gcc --version | head -1 \
+ && cmake --version | head -1 \
+ && gh --version | head -1 \
+ && node --version \
+ && pi --version \
+ && ls "${OV_PREFIX}/openvino/libs/libopenvino.so.2640" >/dev/null \
+ && echo "openvino runtime present at ${OV_PREFIX}" \
+ && (ldconfig -p | grep -q level_zero \
+      && echo "level-zero userspace present" \
+      || echo "WARN: level-zero not in ldconfig cache — check the tier-1 base") \
+ && echo "self-check complete"
+
+CMD ["/bin/bash"]
