@@ -879,9 +879,12 @@ every one of them lives under.
    prefill** (0037, fixed by 0042) runs the resident experts through the
    grouped GEMM and the rest on the host tier. Standing, 16 GiB card, 35B
    int4, ratio 50, 8 GiB pool, u8 KV (`measured-here`, the tier reference
-   cell): decode 18.2 t/s tier ON against 12.5 OFF (ratio 1.46, gated at 1.17);
-   prefill 27.9 against 87.2 t/s — the host dispatch of non-resident experts
-   serialises and owns the gap (§7.10). On the 24 GB card at ratio 99 with the
+   cell, 0.5.0.1 run): decode 18.3 t/s and prefill 27.7 t/s tier ON. Tier OFF
+   depends on the host page cache holding the expert bytes: 12.5 t/s decode
+   and 87.2 t/s prefill with them cached (misses read at 52 µs), 0.9 and
+   12.6 t/s when misses read from disk (about 2.3 ms each, a 16 GiB host
+   cache). The tier removes that dependence. With the tier, the host dispatch
+   of non-resident experts serialises and owns the prefill gap (§7.10). On the 24 GB card at ratio 99 with the
    tier: 23.6 t/s decode.
 3. **Native per-expert dispatch** (`--moe-per-expert-dispatch`, patches
    0038–0041, 0045, 0047, 0050–0067): the fused kernels are bypassed and only
