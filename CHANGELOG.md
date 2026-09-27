@@ -40,6 +40,13 @@ speed of the native MoE route and the fixes that made it measurable:
   prefills in 36 minutes (LYON row 1);
 - the served coder (fused int4) and agent (dense) routes are unchanged.
 
+Known: the expert-offload route without the CPU tier (`--offload-ratio`
+without `--moe-cpu-tier`) reads missed experts from disk unless the host
+page cache holds them. On a host whose cache cannot hold the artifact, the
+35B int4 decodes at about 1 t/s at ratio 50 (12.5 t/s with the bytes
+cached); use `--moe-cpu-tier` (18.3 t/s) or the all-resident native route.
+`ctest -L unit` now names the second real-shard case as an allowed skip.
+
 ### Changes
 
 - **The exact reference at full depth** (`tools/ref_forward_stream.py`,

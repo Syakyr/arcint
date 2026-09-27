@@ -10788,6 +10788,40 @@ of it.
   that. The comment's clause is wrong; the patch's effect on the global
   strategies stands.
 
+#### 7.0.2cu The 0.5.0.1 acceptance run: the tier-off offload rate depends on the host cache; a ctest allow-list gap (2026-09-27)
+
+- [measured-here, release tree 965b60c, marfrit-openvino +p20-1 installed,
+  both cards] `tests/acceptance/run.py --all`: 12 of 16 cells passed. Three
+  failed. `pruefstand` counts as skipped (its harness is not configured),
+  though its score check also failed, and `package-build` needs the tag
+  tarball.
+- **The tier-off offload arm.** `tier-reference-cell` (A770, 35B int4,
+  `--offload-ratio 50`, 8 GiB device pool, u8 KV) passed its gates. Tier on
+  read 18.3 t/s warm decode (recorded 18.2). Tier off read 0.9 t/s warm
+  decode and 12.6 t/s prefill, against the recorded 12.5 and 87.2; the
+  outputs stayed byte-identical across processes.
+  - [measured-here] By hand, the same arm reads a 79 % expert hit rate,
+    8,358 evictions and 117,900 tensor loads, at about 2.3 ms each, from
+    disk.
+  - The same thrash appears with the 0.5.0 binary on +p20 and with the
+    0.5.0.1 build on the +p17 GPU plugin. So neither arcint's changes nor
+    the plugin patches cause it.
+  - [code, host configuration] The recorded reference (2026-09-16) read
+    tensors at 52 µs each: the expert bytes sat in the host's ZFS ARC. The
+    host's ARC was capped at 16 GiB on 2026-09-17, below the 15 GB artifact
+    plus everything else. So misses now go to disk.
+  - The tier-off rate always depended on that cache; the cap stays (it was
+    set as a host memory safety measure).
+  - `coder-offload-1lane` (the same no-tier offload route, ratio 20) timed
+    out at 3,600 s, most likely for the same reason; it is rerun on the
+    final tree.
+- **ctest.** `gguf_iq_decoders_match_gguf_py_on_the_real_shard` (b07470b)
+  skips without `ARCINT_GGUF_REAL`, but was missing from ctest's
+  `--allow-skip` list. So `ctest -L unit` failed in every build without the
+  real shard: the sanitizer cell's device-free build, and the package
+  recipe's own gate. It is added (e21ddf9); `ctest -L unit` is 5/5 in a
+  device-free build.
+
 #### 7.0.3 KV precision on the paged path — u8 is the lever, u4 is a tax
 
 The plugin accepts f16/u8/i8/u4/i4 for `KV_CACHE_PRECISION` on the paged path,
