@@ -6,7 +6,7 @@ refusal, which reads:
 
     "(3) RESIDENCY, and only then: this emitter materialises every weight as an
      f32 ov Constant. Measured over the shipped tensor list at that assumption,
-     the mapped set is 659.1 GiB ... No local card holds that and neither does
+     the mapped set is 659.2 GiB ... No local card holds that and neither does
      the export host's RAM -- so full-size needs a different weight strategy
      (quantised constants, and a gather for the n-gram table), not a bigger
      window."

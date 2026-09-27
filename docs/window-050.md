@@ -263,6 +263,7 @@ five coordinates, now enumerated and held by
 | `Q4E_GGUF_SHARDS` | unset → every real-weight cell skips **by name** |
 | `Q4E_SERVING_FULL` | `1` → runs the 48-layer keystone build (off by default on purpose) |
 | `Q4E_GDN_UT_MODE` | read by `tools/q4e/gdn.py`, so it is a switch the suite obeys through an imported module rather than through a test file; its effect on the split is a row of the close-out matrix like any other |
+| `Q4E_GDN_CORE`, `Q4E_GDN_CHUNK` | *[added 2026-09-27]* read by `tools/q4e/serving_shape.py` (the LYON chunked GDN core and its chunk); unset, the sequential core, as served |
 | **a git work tree** | *not* an env var: a `git archive` extract has no `.git`, so the two cells gated on `git ls-files` (`test_citations` LEG 2 and `test_window_manifest`'s sha resolution) skip |
 
 So a clone and a tarball of the same commit differ by exactly **two** passes,
