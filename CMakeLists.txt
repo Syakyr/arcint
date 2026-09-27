@@ -248,11 +248,15 @@ if(ARCINT_TESTS)
   # --allow-skip <case> (tests/harness.h's SKIP_UNLESS). Local, filtered runs
   # (`./build/arcint-test some_filter`) are unaffected; this only binds ctest's
   # own invocation.
-  # gguf_real_file_spot_check (docs/design-gguf-native.md stage 0) is the one
-  # named exception: it only runs with ARCINT_GGUF_REAL=<path> set to a real
-  # GGUF file not shipped with the repo, so it skips in every default build.
+  # gguf_real_file_spot_check (docs/design-gguf-native.md stage 0) and
+  # gguf_iq_decoders_match_gguf_py_on_the_real_shard are the named exceptions:
+  # both run only with ARCINT_GGUF_REAL=<path> set to a real GGUF file not
+  # shipped with the repo, so they skip in every default build. (The second
+  # was added without its name here, so `ctest -L unit` failed in every build
+  # without the shard -- found by the 0.5.0.1 acceptance's sanitizer cell.)
   add_test(NAME unit COMMAND arcint-test --max-skips 0
-           --allow-skip gguf_real_file_spot_check)
+           --allow-skip gguf_real_file_spot_check
+           --allow-skip gguf_iq_decoders_match_gguf_py_on_the_real_shard)
   set_tests_properties(unit PROPERTIES LABELS unit)
 
   add_test(NAME roundtrip
