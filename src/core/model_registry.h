@@ -136,6 +136,21 @@ struct ValidationResult {
 const std::vector<ModelEntry>& registry();
 const ModelEntry*              find_model(std::string_view id);
 const ModelEntry*              find_by_artifact(std::string_view artifact_dir);
+
+// Reverse lookup by the pinned architecture hash — the language-model xml
+// sha256 prefix, or the segment chain hash for a segmented export.
+//
+// Every match, not the first: two entries can legitimately share one
+// language model (`qwen3.6-35b-a3b` and `qwen3.6-35b-a3b-mtp` are the same
+// lm xml, 21fe4d57d6d016f5, and differ only in the MTP head files beside
+// it). A refusal that named one of the two would be a guess, so it names
+// both and lets the operator say which head they put beside the bytes.
+//
+// This is what turns "that directory name is unknown" into "that directory
+// HOLDS this artifact, under a name no entry uses" — see
+// `unknown_directory_error` in core/artifact.h.
+std::vector<const ModelEntry*> find_all_by_arch_hash(std::string_view arch_hash);
+
 std::vector<std::string>       model_ids();
 
 ValidationResult validate_artifact(const ModelEntry& entry, const ArtifactInfo& seen);

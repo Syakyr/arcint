@@ -987,3 +987,27 @@ TEST(config_dflash_topk_rejects_out_of_range) {
     CHECK(run({"--stub", "--dflash", "/d", "--dflash-topk", "64"}, hi).ok);
     CHECK_EQ(hi.dflash_topk, 64);
 }
+
+// The entry id and the artifact directory name are disjoint namespaces by
+// design (DESIGN.md §3.1: the allowlist keys on the directory name). The
+// alias is a real row in the same table, so --model-id given an alias must
+// name its entry instead of reporting a name that exists as unknown.
+TEST(config_model_id_given_a_directory_alias_names_the_entry) {
+    Config         cfg;
+    const ArgParse r = run({"--stub", "--model-id", "qwen36-coder-b5-ov"}, cfg);
+    CHECK(!r.ok);
+    CHECK(r.error.find("DIRECTORY name, not an entry id") != std::string::npos);
+    CHECK(r.error.find("qwen3.6-27b-a3b-coder") != std::string::npos);
+    CHECK(r.error.find("--model-id qwen3.6-27b-a3b-coder") != std::string::npos);
+}
+
+// A name in neither namespace keeps the old message: the known-ids list is the
+// useful part of that refusal, and the alias hint must not crowd it out.
+TEST(config_model_id_outside_both_namespaces_keeps_the_known_list) {
+    Config         cfg;
+    const ArgParse r = run({"--stub", "--model-id", "qwen9.9-not-a-thing"}, cfg);
+    CHECK(!r.ok);
+    CHECK(r.error.find("is not in the allowlist") != std::string::npos);
+    CHECK(r.error.find("qwen3.6-27b-a3b-coder") != std::string::npos);  // the known list
+    CHECK(r.error.find("DIRECTORY name") == std::string::npos);
+}

@@ -902,6 +902,18 @@ const ModelEntry* find_by_artifact(std::string_view artifact_dir) {
     return nullptr;
 }
 
+std::vector<const ModelEntry*> find_all_by_arch_hash(std::string_view arch_hash) {
+    std::vector<const ModelEntry*> hits;
+    if (arch_hash.empty()) return hits;
+    for (const ModelEntry& e : registry()) {
+        // An empty pin means "not pinned", and must never match a probe that
+        // also came back empty — the caller's empty string means "nothing to
+        // hash", not "any entry will do".
+        if (!e.arch_hash.empty() && e.arch_hash == arch_hash) hits.push_back(&e);
+    }
+    return hits;
+}
+
 std::vector<std::string> model_ids() {
     std::vector<std::string> ids;
     ids.reserve(registry().size());

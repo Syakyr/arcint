@@ -511,3 +511,28 @@ TEST(registry_validation_rejects_a_foreign_id) {
     const ModelEntry* e = find_model("qwen3.8-27b");
     CHECK(!validate_artifact(*e, good_coder_artifact()).ok);
 }
+
+// Reverse lookup by pinned arch_hash: what a refusal uses to say which
+// allowlisted artifact a mislabelled directory holds.
+TEST(registry_find_all_by_arch_hash) {
+    const auto coder = find_all_by_arch_hash("6745cfe3d57e3f0f");
+    CHECK_EQ(coder.size(), static_cast<size_t>(1));
+    if (!coder.empty()) CHECK_EQ(coder[0]->id, std::string("qwen3.6-27b-a3b-coder"));
+
+    // The 35B and its MTP variant are the same language model, distinguished
+    // only by the head files beside it, so the hash must return both rather
+    // than the first it finds.
+    const auto shared = find_all_by_arch_hash("21fe4d57d6d016f5");
+    CHECK(shared.size() >= static_cast<size_t>(2));
+    bool plain = false, mtp = false;
+    for (const ModelEntry* e : shared) {
+        if (e->id == "qwen3.6-35b-a3b") plain = true;
+        if (e->id == "qwen3.6-35b-a3b-mtp") mtp = true;
+    }
+    CHECK(plain);
+    CHECK(mtp);
+
+    CHECK(find_all_by_arch_hash("deadbeefdeadbeef").empty());
+    // An empty probe means "nothing to hash", not "any unpinned entry".
+    CHECK(find_all_by_arch_hash("").empty());
+}

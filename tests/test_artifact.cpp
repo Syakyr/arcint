@@ -23,7 +23,9 @@ namespace {
 // hashes them, it does not parse the IR graph.
 class TempArtifactDir {
 public:
-    TempArtifactDir() {
+    // The alias defaults to the coder artifact's real directory name; pass a
+    // different one to stand in for a mislabelled directory.
+    explicit TempArtifactDir(std::string alias = "qwen36-coder-b5-ov") {
         const char* tmpdir = std::getenv("TMPDIR");
         std::string tmpl_s = std::string(tmpdir && *tmpdir ? tmpdir : "/tmp") + "/arcint-test-artifact-XXXXXX";
         std::vector<char> tmpl(tmpl_s.begin(), tmpl_s.end());
@@ -31,7 +33,7 @@ public:
         const char* base = ::mkdtemp(tmpl.data());
         if (base == nullptr) throw std::runtime_error("mkdtemp failed");
         parent_ = base;
-        dir_    = parent_ + "/qwen36-coder-b5-ov";
+        dir_    = parent_ + "/" + alias;
         if (::mkdir(dir_.c_str(), 0700) != 0) throw std::runtime_error("mkdir failed");
 
         write("openvino_language_model.xml", "<xml/>");
@@ -154,4 +156,79 @@ TEST(artifact_reports_every_present_vision_ir_file) {
     // Three ".xml" files at 6 bytes ("<xml/>") each, plus the three sized
     // ".bin" files.
     CHECK_EQ(total, static_cast<uint64_t>(3 * 6 + 100 + 200 + 300));
+}
+
+// ---------------------------------------------------------------------------
+// The directory name SELECTS the allowlist entry and the hashes PROVE it
+// (DESIGN.md §3.1). When the name selects nothing, the refusal has to say what
+// the bytes are: the entry id and the directory alias are disjoint namespaces,
+// and a bare "not an allowlisted artifact directory" cannot tell a mislabelled
+// artifact from one that has never been pinned.
+//
+// The fixture's bytes are throwaway, so end to end it lands on the "new
+// artifact" branch; the branch that NAMES an entry is covered against the real
+// pinned hashes below.
+
+TEST(artifact_probe_arch_hash_matches_what_the_loader_computes) {
+    TempArtifactDir d;
+    const std::string probed = probe_arch_hash(d.dir());
+    CHECK(!probed.empty());
+    CHECK_EQ(probed.size(), static_cast<size_t>(16));  // the pinned prefix form
+
+    Artifact a;
+    CHECK(!load_artifact(d.dir(), a, /*require_allowlisted=*/false).has_value());
+    CHECK_EQ(probed, a.arch_hash);
+}
+
+TEST(artifact_probe_arch_hash_is_empty_without_anything_to_hash) {
+    char        tmpl[] = "/tmp/arcint-probe-empty-XXXXXX";
+    const char* base   = ::mkdtemp(tmpl);
+    CHECK(base != nullptr);
+    if (base != nullptr) {
+        CHECK(probe_arch_hash(base).empty());
+        ::rmdir(base);
+    }
+}
+
+TEST(artifact_unknown_directory_error_names_the_entry_behind_a_pinned_hash) {
+    // The coder's pinned lm-xml sha (models/allowlist-raw.json, and the
+    // registry entry transcribed from it).
+    const std::string msg = unknown_directory_error("qwen36-27b-a3b-coder", "6745cfe3d57e3f0f");
+    CHECK(msg.find("not an allowlisted artifact directory") != std::string::npos);
+    CHECK(msg.find("qwen3.6-27b-a3b-coder") != std::string::npos);
+    CHECK(msg.find("qwen36-coder-b5-ov") != std::string::npos);
+    CHECK(msg.find("bytes are allowlisted and the name is not") != std::string::npos);
+}
+
+TEST(artifact_unknown_directory_error_names_every_entry_on_a_shared_hash) {
+    // The 35B and its MTP variant share one language model (21fe4d57d6d016f5)
+    // and differ only in the head files beside it. Naming one would be a guess.
+    const std::string msg = unknown_directory_error("qwen36-35b-a3b-copy", "21fe4d57d6d016f5");
+    CHECK(msg.find("qwen3.6-35b-a3b (") != std::string::npos);
+    CHECK(msg.find("qwen3.6-35b-a3b-mtp (") != std::string::npos);
+    CHECK(msg.find("qwen36-35b-a3b-int4-ov") != std::string::npos);
+    CHECK(msg.find("qwen36-35b-a3b-mtp-ov") != std::string::npos);
+}
+
+TEST(artifact_unknown_directory_error_calls_a_new_artifact_new) {
+    const std::string msg = unknown_directory_error("brand-new-export", "0123456789abcdef");
+    CHECK(msg.find("matches no allowlisted entry either") != std::string::npos);
+    CHECK(msg.find("new artifact, not a mislabelled one") != std::string::npos);
+}
+
+TEST(artifact_mislabelled_directory_refusal_carries_its_hash) {
+    TempArtifactDir wrong_named("qwen36-27b-a3b-coder");  // real layout, wrong name
+    const std::string hash = probe_arch_hash(wrong_named.dir());
+    CHECK(!hash.empty());
+
+    Artifact        a;
+    const auto      err = load_artifact(wrong_named.dir(), a);
+    CHECK(err.has_value());
+    if (err.has_value()) {
+        CHECK(err->find("not an allowlisted artifact directory") != std::string::npos);
+        CHECK(err->find(hash) != std::string::npos);
+        // Throwaway fixture bytes: the honest answer is "nothing here is
+        // pinned", not a confident name.
+        CHECK(err->find("new artifact, not a mislabelled one") != std::string::npos);
+    }
 }

@@ -153,6 +153,11 @@ hash, the layer geometry, the trained context and the **weight byte count**
 hash). A field the raw metadata does not carry is left unpinned and reported
 as `null` on `/props`, never invented. The allowlist keys on the artifact's
 directory name; a download has to land in the directory the entry names.
+When a directory name selects no entry, the refusal now hashes the language
+model the way the load path hashes it and names the entry that owns those
+bytes — or says the hash matches nothing either, which is the difference
+between a mislabelled artifact and one that has never been pinned. The gate
+is unchanged: the name still selects, the hashes still prove.
 
 Artifact provenance is part of the contract because calibration is: scale
 estimation degenerates greedy decoding on the dense Qwen3.8 (0/10) while

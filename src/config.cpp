@@ -746,6 +746,18 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
     if (!cfg.model_id.empty()) {
         entry = find_model(cfg.model_id);
         if (entry == nullptr) {
+            // The entry id and the artifact directory name are two disjoint
+            // namespaces by design (DESIGN.md §3.1: the allowlist keys on the
+            // directory name). A directory alias on --model-id is a real row
+            // in the same table, so name its entry instead of sending the
+            // operator to grep the registry for a string that IS there.
+            if (const ModelEntry* by_dir = find_by_artifact(cfg.model_id); by_dir != nullptr) {
+                return fail(log::format(
+                    "'%s' is an artifact DIRECTORY name, not an entry id. Its entry is '%s': "
+                    "pass --model-id %s, or omit --model-id entirely and let --model's "
+                    "directory name select the entry",
+                    cfg.model_id.c_str(), by_dir->id.c_str(), by_dir->id.c_str()));
+            }
             std::string known;
             for (const std::string& id : model_ids()) {
                 if (!known.empty()) known += ", ";

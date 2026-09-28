@@ -20,6 +20,31 @@ pin made apt remove arcint when the runtime was upgraded to +p3.
 
 ## Unreleased
 
+### The allowlist refusals name the artifact, not just the missing name
+
+The entry id and the artifact directory name are two disjoint namespaces by
+design (§3.1: the allowlist keys on the directory name), and both refusals
+reported a name that exists as simply unknown. `--model-id
+qwen36-coder-b5-ov` said "not in the allowlist" while that string is that
+entry's own directory alias, and a directory named with the entry id said
+"not an allowlisted artifact directory" while its bytes were on the
+allowlist under the other name.
+
+- `--model-id` given a directory alias now names the entry behind it and
+  says which id to pass (`src/config.cpp`).
+- A directory whose name selects nothing is hashed the way the load path
+  hashes it — `probe_arch_hash`, the single-file sha256 prefix or the
+  segment chain hash, the XML only and never the `.bin` — and the refusal
+  names the entry that owns those bytes, or says the hash matches nothing
+  either, which is the difference between a rename and a pin that has to
+  be written (`src/core/artifact.cpp`, `find_all_by_arch_hash` in
+  `src/core/model_registry.cpp`). Every match is named: the 35B and its
+  MTP variant share one language model and differ only in the head files
+  beside it, so naming one of the two would be a guess.
+- Admission is unchanged. Nothing here admits an artifact that was refused
+  before: the directory name still selects the entry and the hashes still
+  prove it. Only the diagnosis got better.
+
 ## 0.5.0.1 — 2026-09-27
 
 Requires `marfrit-openvino 2026.4.0~dev20260821+p20` (patches 0003–0067).

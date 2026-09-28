@@ -183,6 +183,80 @@ ArtifactInfo Artifact::to_info(Quant quant) const {
     return info;
 }
 
+std::string probe_arch_hash(const std::string& dir) {
+    std::vector<std::string> xml_shas;
+    bool                     from_manifest = false;
+
+    const std::string shape_path = dir + "/serving-shape.json";
+    if (file_exists(shape_path)) {
+        json shape;
+        try {
+            shape = json::parse(read_file(shape_path));
+        } catch (const json::exception&) {
+            return {};  // unreadable manifest: no claim to make about the bytes
+        }
+        if (shape.is_object()) {
+            from_manifest = !shape.value("segment_layers", json()).is_null();
+            if (shape.contains("segments") && shape.at("segments").is_array()) {
+                int position = 0;
+                for (const json& row : shape.at("segments")) {
+                    ArtifactSegment seg;
+                    if (!resolve_segment(dir, row, position++, seg).empty()) return {};
+                    const std::string sha = sha256_file(seg.language_model_xml);
+                    if (sha.empty()) return {};  // unreadable: do not guess a hash
+                    xml_shas.push_back(sha);
+                }
+            }
+        }
+    }
+
+    if (xml_shas.empty()) {
+        const std::string sha = sha256_file(dir + "/openvino_language_model.xml");
+        if (sha.empty()) return {};
+        xml_shas.push_back(sha);
+    }
+
+    // The same rule the loader uses (Artifact::segmented()): more than one
+    // segment, or a manifest that declares a chain even at one segment.
+    const bool segmented = xml_shas.size() > 1 || from_manifest;
+    return segmented ? segplan::chain_arch_hash(xml_shas) : hash_prefix(xml_shas.front());
+}
+
+std::string unknown_directory_error(const std::string& dir, const std::string& arch_hash) {
+    std::string msg = log::format(
+        "'%s' is not an allowlisted artifact directory (see models/allowlist-raw.json)",
+        dir.c_str());
+    if (arch_hash.empty()) return msg;
+
+    const std::vector<const ModelEntry*> hits = find_all_by_arch_hash(arch_hash);
+    if (hits.empty()) {
+        return msg + log::format(
+                       "; its language-model hash %s matches no allowlisted entry either, so "
+                       "this is a new artifact, not a mislabelled one",
+                       arch_hash.c_str());
+    }
+
+    std::string names;
+    for (const ModelEntry* e : hits) {
+        if (!names.empty()) names += ", ";
+        names += e->id;
+        if (!e->artifact_aliases.empty()) {
+            names += " (directory ";
+            for (size_t i = 0; i < e->artifact_aliases.size(); ++i) {
+                if (i != 0) names += " or ";
+                names += e->artifact_aliases[i];
+            }
+            names += ")";
+        }
+    }
+    return msg + log::format(
+                   "; its language-model hash %s IS the arch_hash of %s. The bytes are "
+                   "allowlisted and the name is not: point --model at a directory named as "
+                   "that entry names it (the directory name selects the entry; the hashes "
+                   "then prove it)",
+                   arch_hash.c_str(), names.c_str());
+}
+
 std::optional<std::string> load_artifact(const std::string& dir, Artifact& out,
                                        bool require_allowlisted) {
     Artifact          a;
@@ -191,9 +265,11 @@ std::optional<std::string> load_artifact(const std::string& dir, Artifact& out,
 
     const ModelEntry* entry = find_by_artifact(a.directory_name);
     if (entry == nullptr && require_allowlisted) {
-        return log::format(
-            "'%s' is not an allowlisted artifact directory (see models/allowlist-raw.json)",
-            a.directory_name.c_str());
+        // Name the bytes, not just the missing name. Hashing the language-model
+        // xml costs milliseconds and turns "unknown folder" into either "that is
+        // <entry> under the wrong name" or "nothing here is allowlisted", which
+        // is the difference between a rename and a pin that has to be written.
+        return unknown_directory_error(a.directory_name, probe_arch_hash(dir));
     }
     // --inspect-artifact reaches here with no entry: the id stays empty and the
     // sampler keeps its unset family-card state rather than claiming a family.

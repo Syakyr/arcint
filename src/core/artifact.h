@@ -213,6 +213,25 @@ std::string admit_ngram_table_from_disk(const Artifact& artifact,
                                         uint64_t margin_bytes,
                                         uint64_t& out_payload_bytes);
 
+// The arch_hash the load path would compute for this directory's language
+// model, without loading it: `hash_prefix(sha256_file(xml))` for a plain
+// export, `segplan::chain_arch_hash` over every segment's xml sha when
+// serving-shape.json declares a chain (the same rule as `segmented()`, so
+// a declared chain of one hashes as a chain). Returns "" when there is
+// nothing to hash — no language-model xml, an unreadable one, a manifest
+// whose segments do not resolve.
+//
+// Deliberately cheap: the XML only, never the .bin. It exists so a refusal
+// can say what the bytes ARE, which the directory name alone cannot.
+std::string probe_arch_hash(const std::string& dir);
+
+// The refusal for a directory whose name is no allowlist entry. With a
+// hash from `probe_arch_hash` it names the entry that owns those bytes (or
+// says the hash matches nothing either, which is the difference between a
+// mislabelled artifact and a genuinely new one). An empty `arch_hash` left
+// it as the bare unknown-name message.
+std::string unknown_directory_error(const std::string& dir, const std::string& arch_hash);
+
 // Returns an error message on failure. The directory basename decides which
 // allowlist entry the artifact claims to be; a name outside the allowlist is
 // refused here rather than after a two-minute compile.

@@ -658,3 +658,23 @@ TEST(serve_gate_says_nothing_about_a_non_segmented_artifact) {
     ::unlink((d.dir() + "/openvino_language_model.xml").c_str());
     ::unlink((d.dir() + "/openvino_language_model.bin").c_str());
 }
+
+// The refusal path probes a directory it will not load, so the probe has to
+// agree with the loader on what the hash IS -- including the chain rule, where
+// a declared chain hashes the concatenated hex digests and not the file
+// bytes. A probe that took the cheap single-file path would name the wrong
+// entry (or none) for every segmented artifact.
+TEST(segments_probe_arch_hash_matches_the_chain_the_loader_computes) {
+    TempSegmentedArtifactDir d;
+    const std::string        probed = probe_arch_hash(d.dir());
+    CHECK(!probed.empty());
+
+    Artifact a;
+    CHECK(!load_artifact(d.dir(), a, /*require_allowlisted=*/false).has_value());
+    CHECK(a.segmented());
+    CHECK_EQ(probed, a.arch_hash);
+
+    const std::string single =
+        hash_prefix(sha256_file(d.dir() + "/segment0/openvino_language_model.xml"));
+    CHECK(probed != single);
+}
