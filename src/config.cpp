@@ -241,6 +241,8 @@ std::string usage_text() {
         "                            --prefix-cache-mib > 0 is refused at load unless the\n"
         "                            plugin reports a static residency partition, DESIGN §3.4)\n"
         "  --moe-cpu-tier-threads N  worker threads for that tier (0 = auto)\n"
+        "  --moe-per-expert-dispatch dispatch routed experts via per-expert GPU\n"
+        "                            kernels (needs --offload-ratio + --moe-cpu-tier)\n"
         "\n"
         "memory\n"
         "  --n-ctx N                 context length. Omitted: adopts whatever the\n"
@@ -698,6 +700,7 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
             if (!value(v) || !parse_int(v, cfg.offload_ratio)) {
                 return fail("--offload-ratio needs an integer");
             }
+            cfg.offload_ratio_set = true;
         } else if (arg == "--mtp") {
             if (!value(v)) return fail("--mtp needs a value");
             cfg.mtp = std::string(v);
@@ -707,6 +710,8 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
             }
         } else if (arg == "--moe-cpu-tier") {
             cfg.moe_cpu_tier = true;
+        } else if (arg == "--moe-per-expert-dispatch") {
+            cfg.moe_per_expert_dispatch = true;
         } else if (arg == "--moe-cpu-tier-threads") {
             if (!value(v) || !parse_int(v, cfg.moe_cpu_tier_threads)) {
                 return fail("--moe-cpu-tier-threads needs an integer");
@@ -855,9 +860,26 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
         return fail("--moe-cpu-tier-threads needs --moe-cpu-tier: without the tier "
                     "there is no pool to size");
     }
-    if (cfg.moe_cpu_tier && cfg.offload_ratio == 0) {
-        return fail("--moe-cpu-tier needs --offload-ratio > 0: with every expert "
-                    "resident there is nothing for the host tier to compute");
+    if (cfg.moe_cpu_tier && cfg.offload_ratio == 0 && !cfg.moe_per_expert_dispatch) {
+        return fail("--moe-cpu-tier needs --offload-ratio > 0 (or an explicit 0 with "
+                    "--moe-per-expert-dispatch, the all-resident native route): with "
+                    "every expert resident and no dispatch there is nothing for the "
+                    "host tier to compute");
+    }
+    if (cfg.moe_per_expert_dispatch && !cfg.moe_cpu_tier && cfg.offload_ratio > 0) {
+        return fail("--moe-per-expert-dispatch needs --moe-cpu-tier while experts are "
+                    "offloaded: non-resident experts fall back to the CPU tier");
+    }
+    if (cfg.moe_per_expert_dispatch && cfg.offload_ratio == 0) {
+        // Ergonomics (operator 2026-09-25). The all-resident native route is
+        // reachable as `--offload-ratio 0 --moe-per-expert-dispatch`; the
+        // plugin's dispatch path hoists the tier's x/routing-weight host
+        // buffers (moe_3gemm_swiglu_opt.cpp:1141), so the tier must be ON
+        // internally even though, with every expert resident, it computes
+        // nothing (measured: cpu_tier_pairs=0). Enable it here rather than
+        // making the operator pass a flag that does no work. Stated, not
+        // silent: backend_ov.cpp logs "MoE host compute tier enabled".
+        cfg.moe_cpu_tier = true;
     }
     // The --moe-cpu-tier / --prefix-cache-mib refusal USED to live here
     // (DESIGN §7.0.2ae's F0). Since plugin patch 0018 the answer depends on

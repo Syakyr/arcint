@@ -552,7 +552,19 @@ def test_each_ab69ea9_defect_is_attributed_on_its_own(cfg, attn_state,
     ratio must land on the archived orphan's own measured figure (964999.3x at
     T=64, 469606.6x at T=96, re-measured at 692c0a6 with the orphan file
     swapped in), which is what makes the permutation a faithful stand-in for a
-    file this repository does not track."""
+    file this repository does not track.
+
+    ARCHIVAL CONVENTION (2026-09-18): those two ratios were measured while
+    the feed handed the q/k norm gammas over as the GGUF stores them, (1 + w)
+    -- a converter fold the feed undoes since gguf_feed's kind `gamma1`
+    (DESIGN 7.0.2bz). The cross-check against the archived figures needs the
+    same numbers, so this cell re-folds the two gammas for every row; the
+    attribution itself (each defect alone catastrophic, the clean emitter at
+    the floor) does not depend on the convention -- both the pin and the
+    emitter read the same state."""
+    attn_state = dict(attn_state)
+    for k in ("q_norm.weight", "k_norm.weight"):
+        attn_state[k] = np.asarray(attn_state[k], np.float32) + np.float32(1.0)
     hidden = _hidden(cfg, T)
     pid = np.arange(T, dtype=np.int64).reshape(1, T)
     heads = cfg.num_attention_heads
